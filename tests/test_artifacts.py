@@ -682,6 +682,118 @@ def test_open_commits_matching_marker_after_process_dies_before_abort_intent(
         resumed.stage("validate-data", now=FIXED_NOW)
 
 
+def test_publication_lock_rejects_symlink_and_hardlink_without_mutating_target(
+    tmp_path: Path,
+) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    lock = store.root / ".publication.lock"
+    outside = tmp_path / "outside.lock"
+    outside.write_bytes(b"do not touch")
+
+    try:
+        lock.symlink_to(outside)
+    except OSError:
+        pass
+    else:
+        with pytest.raises(OSError, match=r"unsafe|lock"):
+            RunStore.open(store.root)
+        assert outside.read_bytes() == b"do not touch"
+        lock.unlink()
+    os.link(outside, lock)
+    with pytest.raises(OSError, match=r"unsafe|lock"):
+        RunStore.open(store.root)
+    assert outside.read_bytes() == b"do not touch"
+
+
+def test_stage_revalidates_input_hashes_immediately_before_publication(
+    tmp_path: Path,
+) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    input_path = store.write_text("mutable-input.txt", "before")
+
+    with pytest.raises(ValueError, match=r"input.*changed"), store.stage(
+        "validate-data", input_paths=["mutable-input.txt"], now=FIXED_NOW
+    ) as transaction:
+        transaction.write_text("validated.csv", "output")
+        input_path.write_text("after", encoding="utf-8")
+
+    assert not (store.root / "validate-data/validated.csv").exists()
+    assert not (store.root / "validate-data/stage_manifest.json").exists()
+
+
+def test_open_fails_closed_when_publication_recovery_cannot_settle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    output = store.root / "validate-data/validated.csv"
+    marker = store.root / "validate-data/stage_manifest.json"
+    original_publish = store._publish_temp
+    original_rename = os.rename
+
+    def replace_output_before_marker(
+        source: Path,
+        destination: Path,
+        publications: list[Any] | None = None,
+    ) -> None:
+        if destination == marker:
+            output.unlink()
+            output.write_text("quarantined foreign", encoding="utf-8")
+            raise KeyboardInterrupt
+        original_publish(source, destination, publications)
+
+    def occupy_destination(source: Any, destination: Any) -> None:
+        original_rename(source, destination)
+        if Path(source) == output:
+            output.write_text("concurrent foreign", encoding="utf-8")
+
+    monkeypatch.setattr(store, "_publish_temp", replace_output_before_marker)
+    monkeypatch.setattr(os, "rename", occupy_destination)
+    with (
+        pytest.raises(KeyboardInterrupt),
+        store.stage("validate-data", now=FIXED_NOW) as transaction,
+    ):
+        transaction.write_text("validated.csv", "owned")
+
+    monkeypatch.setattr(os, "rename", original_rename)
+    with pytest.raises(RuntimeError, match=r"recover|settle|publication"):
+        RunStore.open(store.root)
+    assert output.read_text(encoding="utf-8") == "concurrent foreign"
+    assert any(path.name.startswith(".rollback-") for path in output.parent.iterdir())
+
+
+def test_open_removes_stale_stage_tree_but_preserves_live_lease(tmp_path: Path) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    stale = store.root / ".stage-validate-data-stale"
+    stale.mkdir()
+    (stale / ".lease").write_bytes(b"\0")
+    (stale / "large.bin").write_bytes(b"stale")
+
+    live = store.root / ".stage-validate-data-live"
+    live.mkdir()
+    lease_path = live / ".lease"
+    lease_path.write_bytes(b"\0")
+    (live / "large.bin").write_bytes(b"live")
+    with lease_path.open("r+b") as lease:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(lease.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl: Any = __import__("fcntl")
+
+            fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            RunStore.open(store.root)
+            assert not stale.exists()
+            assert live.is_dir()
+        finally:
+            lease.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(lease.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lease.fileno(), fcntl.LOCK_UN)
+
+
 def test_downstream_rejects_tampered_prerequisite_manifest_chain(tmp_path: Path) -> None:
     store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
     with store.stage("validate-data", now=FIXED_NOW) as transaction:

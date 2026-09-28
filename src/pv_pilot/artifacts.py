@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import shutil
+import stat
 import subprocess
 import tempfile
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -16,7 +17,7 @@ from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal, Self
+from typing import Any, BinaryIO, Literal, Self
 from uuid import uuid4
 
 from .config import LoadedPilotConfig
@@ -325,6 +326,7 @@ class RunStore:
         store = cls(root, config_hash)
         with store._publication_lock():
             store._recover_publication_journals()
+            store._cleanup_stale_stage_directories()
         store._verify_base(expected_config_hash=expected_config_hash)
         return store
 
@@ -349,30 +351,92 @@ class RunStore:
             raise ValueError("artifact path would escape the run directory")
         return resolved
 
+    @staticmethod
+    def _validate_lock_identity(path: Path, descriptor: int) -> None:
+        path_stat = path.lstat()
+        descriptor_stat = os.fstat(descriptor)
+        unsafe = (
+            path.is_symlink()
+            or not stat.S_ISREG(path_stat.st_mode)
+            or not stat.S_ISREG(descriptor_stat.st_mode)
+            or path_stat.st_nlink != 1
+            or descriptor_stat.st_nlink != 1
+            or (path_stat.st_dev, path_stat.st_ino)
+            != (descriptor_stat.st_dev, descriptor_stat.st_ino)
+        )
+        getuid = getattr(os, "getuid", None)
+        if getuid is not None:
+            unsafe = unsafe or path_stat.st_uid != getuid()
+        if unsafe:
+            raise OSError(f"unsafe lock file: {path}")
+
+    @classmethod
+    def _open_safe_lock(cls, path: Path) -> BinaryIO:
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+        created = False
+        try:
+            descriptor = os.open(path, flags, 0o600)
+            created = True
+        except FileExistsError:
+            existing_flags = os.O_RDWR
+            existing_flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, existing_flags)
+        try:
+            cls._validate_lock_identity(path, descriptor)
+            stream = os.fdopen(descriptor, "r+b")
+            descriptor = -1
+            if created:
+                stream.write(b"\0")
+                stream.flush()
+                os.fsync(stream.fileno())
+                stream.seek(0)
+            return stream
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    @staticmethod
+    def _lock_stream(stream: BinaryIO, *, blocking: bool) -> bool:
+        stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+            try:
+                msvcrt.locking(stream.fileno(), mode, 1)
+            except OSError:
+                if not blocking:
+                    return False
+                raise
+        else:
+            fcntl: Any = __import__("fcntl")
+            mode = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+            try:
+                fcntl.flock(stream.fileno(), mode)
+            except BlockingIOError:
+                return False
+        return True
+
+    @staticmethod
+    def _unlock_stream(stream: BinaryIO) -> None:
+        stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl: Any = __import__("fcntl")
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
     @contextmanager
     def _publication_lock(self) -> Iterator[None]:
         lock_path = self.root / ".publication.lock"
-        with lock_path.open("a+b") as stream:
-            stream.seek(0, os.SEEK_END)
-            if stream.tell() == 0:
-                stream.write(b"\0")
-                stream.flush()
-            stream.seek(0)
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
-            else:
-                fcntl: Any = __import__("fcntl")
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        with self._open_safe_lock(lock_path) as stream:
+            self._lock_stream(stream, blocking=True)
             try:
                 yield
             finally:
-                stream.seek(0)
-                if os.name == "nt":
-                    msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                self._unlock_stream(stream)
 
     def _publication_record(self, ownership: PublicationOwnership) -> dict[str, object]:
         record = ownership.record
@@ -537,20 +601,44 @@ class RunStore:
             (journal_root / ".ownership.tmp").unlink(missing_ok=True)
             journal_root.rmdir()
         recovery_error = RuntimeError("recovering interrupted artifact publication")
+        recovery_failures: list[BaseException] = []
         for transaction_id, group in groups.items():
             if decisions[transaction_id]:
                 self._release_publications(group)
             else:
-                self._rollback_publications(group, recovery_error)
+                recovery_failures.extend(
+                    self._rollback_publications(group, recovery_error)
+                )
             if not any(publication.quarantine_root.exists() for publication in group):
                 self._clear_batch_abort(transaction_id)
         for transaction_id in aborted_transactions - groups.keys():
             self._clear_batch_abort(transaction_id)
+        if recovery_failures:
+            for failure in recovery_failures:
+                recovery_error.add_note(f"publication recovery failed: {failure}")
+            raise recovery_error
+
+    def _cleanup_stale_stage_directories(self) -> None:
+        for stage_root in sorted(self.root.glob(".stage-*")):
+            is_junction = getattr(stage_root, "is_junction", lambda: False)()
+            if stage_root.is_symlink() or is_junction or not stage_root.is_dir():
+                raise ValueError(f"unsafe stage lease directory: {stage_root.name}")
+            lease_path = stage_root / ".lease"
+            if not lease_path.is_file() or lease_path.is_symlink():
+                raise ValueError(f"invalid stage lease: {stage_root.name}")
+            stale = False
+            with self._open_safe_lock(lease_path) as lease:
+                if not self._lock_stream(lease, blocking=False):
+                    continue
+                self._unlock_stream(lease)
+                stale = True
+            if stale:
+                shutil.rmtree(stage_root)
 
     @staticmethod
     def _rollback_publications(
         publications: Iterable[PublicationOwnership], error: BaseException
-    ) -> None:
+    ) -> tuple[BaseException, ...]:
         cleanup_errors: list[BaseException] = []
         for publication in reversed(tuple(publications)):
             try:
@@ -565,6 +653,7 @@ class RunStore:
                     cleanup_errors.append(cleanup_error)
         for recorded_cleanup_error in cleanup_errors:
             error.add_note(f"publication cleanup failed: {recorded_cleanup_error}")
+        return tuple(cleanup_errors)
 
     @staticmethod
     def _release_publications(
@@ -744,6 +833,16 @@ class RunStore:
             raise ValueError(f"prerequisite stage {stage!r} has an invalid SUCCESS marker")
         if manifest.get("prerequisite_manifest_hashes") != prerequisite_hashes:
             raise ValueError(f"prerequisite manifest hash mismatch for stage {stage!r}")
+        input_hashes = manifest.get("input_hashes")
+        if not isinstance(input_hashes, dict) or any(
+            not isinstance(relative_path, str) or not isinstance(expected, str)
+            for relative_path, expected in input_hashes.items()
+        ):
+            raise ValueError(f"prerequisite stage {stage!r} has invalid input hashes")
+        for relative_path, expected in input_hashes.items():
+            target = self._validated_target(relative_path)
+            if not target.is_file() or sha256_file(target) != expected:
+                raise ValueError(f"prerequisite input checksum mismatch: {relative_path}")
         outputs = manifest.get("outputs")
         if not isinstance(outputs, list):
             raise ValueError(f"prerequisite stage {stage!r} has invalid outputs")
@@ -777,6 +876,7 @@ class RunStore:
             raise ValueError(f"unknown pipeline stage: {stage!r}")
         with self._publication_lock():
             self._recover_publication_journals()
+            self._cleanup_stale_stage_directories()
         self._verify_base(expected_config_hash=config_hash)
         marker = self.root / stage / "stage_manifest.json"
         if marker.exists() or marker.is_symlink():
@@ -822,14 +922,34 @@ class StageTransaction:
         self._clock = clock
         self._started_at: datetime | None = None
         self._temporary_root: Path | None = None
+        self._lease_stream: BinaryIO | None = None
         self._outputs: dict[str, Path] = {}
 
     def __enter__(self) -> Self:
-        self._started_at = self._clock()
-        self._temporary_root = Path(
-            tempfile.mkdtemp(prefix=f".stage-{self.stage}-", dir=self._store.root)
-        )
+        with self._store._publication_lock():
+            self._started_at = self._clock()
+            temporary_root = Path(
+                tempfile.mkdtemp(prefix=f".stage-{self.stage}-", dir=self._store.root)
+            )
+            try:
+                lease = self._store._open_safe_lock(temporary_root / ".lease")
+                if not self._store._lock_stream(lease, blocking=False):
+                    lease.close()
+                    raise RuntimeError("could not acquire private stage lease")
+            except BaseException:
+                shutil.rmtree(temporary_root, ignore_errors=True)
+                raise
+            self._temporary_root = temporary_root
+            self._lease_stream = lease
         return self
+
+    def _release_lease(self) -> None:
+        lease = self._lease_stream
+        if lease is None:
+            return
+        self._store._unlock_stream(lease)
+        lease.close()
+        self._lease_stream = None
 
     def _temporary_target(self, relative_path: str | Path) -> tuple[str, Path]:
         if self._temporary_root is None:
@@ -883,6 +1003,7 @@ class StageTransaction:
         if temporary_root is None or self._started_at is None:
             raise RuntimeError("stage transaction was not entered")
         if exception_type is not None:
+            self._release_lease()
             shutil.rmtree(temporary_root, ignore_errors=True)
             return False
         output_records = [
@@ -902,6 +1023,10 @@ class StageTransaction:
         try:
             with self._store._publication_lock():
                 self._store._recover_publication_journals()
+                for relative_path, expected in self._input_hashes.items():
+                    target = self._store._validated_target(relative_path)
+                    if not target.is_file() or sha256_file(target) != expected:
+                        raise ValueError(f"stage input changed: {relative_path}")
                 marker = self._store._validated_target(marker_relative)
                 if marker.exists() or marker.is_symlink():
                     raise FileExistsError(f"stage {self.stage!r} is already completed")
@@ -947,6 +1072,7 @@ class StageTransaction:
                         self._store._clear_batch_abort(published.transaction_id)
             raise
         finally:
+            self._release_lease()
             shutil.rmtree(temporary_root, ignore_errors=True)
         return False
 
