@@ -9,8 +9,8 @@ import platform
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Callable, Iterable, Mapping
-from contextlib import suppress
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
@@ -56,6 +56,8 @@ _PACKAGE_NAMES = (
     "typer",
     "xgboost",
 )
+_PUBLICATION_JOURNAL = "ownership.json"
+_PUBLICATION_JOURNAL_SCHEMA = "1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +68,7 @@ class PublicationOwnership:
     source_device: int
     source_inode: int
     quarantine_root: Path
+    record: dict[str, object] | None = None
 
     @property
     def quarantine(self) -> Path:
@@ -73,8 +76,18 @@ class PublicationOwnership:
 
     def prepare(self) -> None:
         self.quarantine_root.mkdir()
+        if self.record is None:
+            return
+        temporary = self.quarantine_root / ".ownership.tmp"
+        with temporary.open("xb") as stream:
+            stream.write(_canonical_json(self.record).encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, self.quarantine_root / _PUBLICATION_JOURNAL)
 
     def release(self) -> None:
+        (self.quarantine_root / ".ownership.tmp").unlink(missing_ok=True)
+        (self.quarantine_root / _PUBLICATION_JOURNAL).unlink(missing_ok=True)
         self.quarantine_root.rmdir()
 
     def _is_owned(self, path: Path) -> bool:
@@ -109,18 +122,35 @@ class PublicationOwnership:
         """Atomically acquire the destination before deciding whether to delete it."""
 
         quarantine = self.quarantine
+        self.quarantine_root.mkdir(exist_ok=True)
+        if self._settle_quarantine(quarantine):
+            self.release()
+            return
         try:
-            self.quarantine_root.mkdir(exist_ok=True)
-            if self._settle_quarantine(quarantine):
-                return
-            try:
-                os.rename(self.destination, quarantine)
-            except FileNotFoundError:
-                return
-            self._settle_quarantine(quarantine)
-        finally:
-            with suppress(OSError):
-                self.release()
+            os.rename(self.destination, quarantine)
+        except FileNotFoundError:
+            self.release()
+            return
+        self._settle_quarantine(quarantine)
+        self.release()
+
+
+class PublicationBatch(list[PublicationOwnership]):
+    """One stage publication group sharing a durable commit marker."""
+
+    def __init__(
+        self,
+        *,
+        transaction_id: str,
+        stage: str,
+        marker_relative: str,
+        output_hashes: Mapping[str, str],
+    ) -> None:
+        super().__init__()
+        self.transaction_id = transaction_id
+        self.stage = stage
+        self.marker_relative = marker_relative
+        self.output_hashes = dict(output_hashes)
 
 
 def sha256_file(path: str | Path) -> str:
@@ -292,6 +322,8 @@ class RunStore:
         if not isinstance(config_hash, str):
             raise ValueError("run manifest has no valid config hash")
         store = cls(root, config_hash)
+        with store._publication_lock():
+            store._recover_publication_journals()
         store._verify_base(expected_config_hash=expected_config_hash)
         return store
 
@@ -316,6 +348,167 @@ class RunStore:
             raise ValueError("artifact path would escape the run directory")
         return resolved
 
+    @contextmanager
+    def _publication_lock(self) -> Iterator[None]:
+        lock_path = self.root / ".publication.lock"
+        with lock_path.open("a+b") as stream:
+            stream.seek(0, os.SEEK_END)
+            if stream.tell() == 0:
+                stream.write(b"\0")
+                stream.flush()
+            stream.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                fcntl: Any = __import__("fcntl")
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                stream.seek(0)
+                if os.name == "nt":
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+    def _publication_record(self, ownership: PublicationOwnership) -> dict[str, object]:
+        record = ownership.record
+        if record is None:
+            raise ValueError("publication journal has no ownership record")
+        return record
+
+    def _journal_group_committed(
+        self, publications: list[PublicationOwnership]
+    ) -> bool:
+        first = self._publication_record(publications[0])
+        marker_relative = first["marker"]
+        if not isinstance(marker_relative, str):
+            raise ValueError("publication journal marker is invalid")
+        marker = self._validated_target(marker_relative)
+        if not marker.exists() and not marker.is_symlink():
+            return False
+        marker_publications = [
+            publication
+            for publication in publications
+            if self._publication_record(publication).get("kind") == "marker"
+        ]
+        if len(marker_publications) != 1 or marker.is_symlink() or not marker.is_file():
+            raise ValueError("ambiguous publication success marker")
+        marker_publication = marker_publications[0]
+        if not marker_publication._is_owned(marker):
+            raise ValueError("publication success marker has foreign identity")
+        manifest = self._read_json_file(marker)
+        transaction_id = first["transaction_id"]
+        stage = first["stage"]
+        if (
+            manifest.get("transaction_id") != transaction_id
+            or manifest.get("stage") != stage
+            or manifest.get("config_hash") != self.config_hash
+            or manifest.get("schema_version") != SCHEMA_VERSION
+            or manifest.get("status") != "SUCCESS"
+        ):
+            raise ValueError("publication success marker does not match journal")
+        expected_outputs = {
+            self._publication_record(publication)["destination"]: self._publication_record(
+                publication
+            )["sha256"]
+            for publication in publications
+            if self._publication_record(publication).get("kind") == "output"
+        }
+        manifest_outputs = manifest.get("outputs")
+        if not isinstance(manifest_outputs, list):
+            raise ValueError("publication success marker outputs are invalid")
+        actual_outputs = {
+            item.get("path"): item.get("sha256")
+            for item in manifest_outputs
+            if isinstance(item, dict)
+        }
+        if any(actual_outputs.get(path) != digest for path, digest in expected_outputs.items()):
+            raise ValueError("publication success marker outputs do not match journal")
+        return True
+
+    def _recover_publication_journals(self) -> None:
+        journal_roots = sorted(
+            self.root.rglob(".rollback-*"), key=lambda path: path.as_posix()
+        )
+        if len(journal_roots) > 1024:
+            raise ValueError("too many publication journals")
+        publications: list[PublicationOwnership] = []
+        incomplete: list[Path] = []
+        for journal_root in journal_roots:
+            is_junction = getattr(journal_root, "is_junction", lambda: False)()
+            if (
+                journal_root.is_symlink()
+                or is_junction
+                or not journal_root.is_dir()
+                or not journal_root.resolve().is_relative_to(self.root)
+            ):
+                raise ValueError(f"unsafe publication journal: {journal_root.name}")
+            record_path = journal_root / _PUBLICATION_JOURNAL
+            if not record_path.is_file() or record_path.is_symlink():
+                entries = {path.name for path in journal_root.iterdir()}
+                if entries <= {".ownership.tmp"}:
+                    incomplete.append(journal_root)
+                    continue
+                raise ValueError(f"ambiguous publication journal: {journal_root.name}")
+            record = self._read_json_file(record_path)
+            required_strings = (
+                "config_hash",
+                "destination",
+                "kind",
+                "marker",
+                "run_id",
+                "schema",
+                "sha256",
+                "stage",
+                "transaction_id",
+            )
+            if any(not isinstance(record.get(key), str) for key in required_strings):
+                raise ValueError(f"invalid publication journal: {journal_root.name}")
+            if (
+                record["schema"] != _PUBLICATION_JOURNAL_SCHEMA
+                or record["config_hash"] != self.config_hash
+                or record["run_id"] != self.root.name
+                or record["kind"] not in {"output", "marker"}
+                or not isinstance(record.get("source_device"), int)
+                or not isinstance(record.get("source_inode"), int)
+            ):
+                raise ValueError(f"invalid publication journal: {journal_root.name}")
+            destination = self._validated_target(str(record["destination"]))
+            self._validated_target(str(record["marker"]))
+            publications.append(
+                PublicationOwnership(
+                    destination=destination,
+                    source_device=int(record["source_device"]),
+                    source_inode=int(record["source_inode"]),
+                    quarantine_root=journal_root,
+                    record=record,
+                )
+            )
+        destinations = [publication.destination for publication in publications]
+        if len(destinations) != len(set(destinations)):
+            raise ValueError("conflicting publication journals")
+        groups: dict[str, list[PublicationOwnership]] = {}
+        for publication in publications:
+            transaction_id = self._publication_record(publication)["transaction_id"]
+            assert isinstance(transaction_id, str)
+            groups.setdefault(transaction_id, []).append(publication)
+        decisions = {
+            transaction_id: self._journal_group_committed(group)
+            for transaction_id, group in groups.items()
+        }
+        for journal_root in incomplete:
+            (journal_root / ".ownership.tmp").unlink(missing_ok=True)
+            journal_root.rmdir()
+        recovery_error = RuntimeError("recovering interrupted artifact publication")
+        for transaction_id, group in groups.items():
+            if decisions[transaction_id]:
+                self._release_publications(group)
+            else:
+                self._rollback_publications(group, recovery_error)
+
     @staticmethod
     def _rollback_publications(
         publications: Iterable[PublicationOwnership], error: BaseException
@@ -339,7 +532,14 @@ class RunStore:
     def _release_publications(
         publications: Iterable[PublicationOwnership],
     ) -> None:
-        for publication in publications:
+        ordered = sorted(
+            publications,
+            key=lambda publication: (
+                publication.record is not None
+                and publication.record.get("kind") == "marker"
+            ),
+        )
+        for publication in ordered:
             publication.release()
 
     def _publish_temp(
@@ -351,12 +551,30 @@ class RunStore:
         if destination.exists() or destination.is_symlink():
             raise FileExistsError(f"artifact already exists: {destination}")
         source_stat = source.stat(follow_symlinks=False)
+        record: dict[str, object] | None = None
+        if isinstance(publications, PublicationBatch):
+            relative = destination.relative_to(self.root).as_posix()
+            kind = "marker" if relative == publications.marker_relative else "output"
+            record = {
+                "config_hash": self.config_hash,
+                "destination": relative,
+                "kind": kind,
+                "marker": publications.marker_relative,
+                "run_id": self.root.name,
+                "schema": _PUBLICATION_JOURNAL_SCHEMA,
+                "sha256": sha256_file(source),
+                "source_device": source_stat.st_dev,
+                "source_inode": source_stat.st_ino,
+                "stage": publications.stage,
+                "transaction_id": publications.transaction_id,
+            }
         ownership = PublicationOwnership(
             destination=destination,
             source_device=source_stat.st_dev,
             source_inode=source_stat.st_ino,
             quarantine_root=destination.parent
             / f".rollback-{destination.name}-{uuid4().hex}",
+            record=record,
         )
         local_publication = publications is None
         if publications is None:
@@ -519,6 +737,8 @@ class RunStore:
 
         if stage not in STAGE_PREREQUISITES:
             raise ValueError(f"unknown pipeline stage: {stage!r}")
+        with self._publication_lock():
+            self._recover_publication_journals()
         self._verify_base(expected_config_hash=config_hash)
         marker = self.root / stage / "stage_manifest.json"
         if marker.exists() or marker.is_symlink():
@@ -627,37 +847,61 @@ class StageTransaction:
         if exception_type is not None:
             shutil.rmtree(temporary_root, ignore_errors=True)
             return False
-        published: list[PublicationOwnership] = []
+        output_records = [
+            {"path": logical, "sha256": sha256_file(temporary)}
+            for logical, temporary in sorted(self._outputs.items())
+        ]
+        transaction_id = uuid4().hex
+        marker_relative = f"{self.stage}/stage_manifest.json"
+        published = PublicationBatch(
+            transaction_id=transaction_id,
+            stage=self.stage,
+            marker_relative=marker_relative,
+            output_hashes={
+                str(record["path"]): str(record["sha256"]) for record in output_records
+            },
+        )
         try:
-            output_records = [
-                {"path": logical, "sha256": sha256_file(temporary)}
-                for logical, temporary in sorted(self._outputs.items())
-            ]
-            for logical, temporary in sorted(self._outputs.items()):
-                destination = self._store._validated_target(logical)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                self._store._publish_temp(temporary, destination, published)
-            ended_at = self._clock()
-            manifest = {
-                "config_hash": self._store.config_hash,
-                "details": self._details,
-                "ended_at": _timestamp(ended_at),
-                "input_hashes": self._input_hashes,
-                "outputs": output_records,
-                "prerequisite_manifest_hashes": self._prerequisite_manifest_hashes,
-                "schema_version": SCHEMA_VERSION,
-                "stage": self.stage,
-                "started_at": _timestamp(self._started_at),
-                "status": "SUCCESS",
-            }
-            self._store._write_bytes(
-                f"{self.stage}/stage_manifest.json",
-                _canonical_json(manifest).encode("utf-8"),
-                published,
-            )
-            self._store._release_publications(published)
+            with self._store._publication_lock():
+                self._store._recover_publication_journals()
+                marker = self._store._validated_target(marker_relative)
+                if marker.exists() or marker.is_symlink():
+                    raise FileExistsError(f"stage {self.stage!r} is already completed")
+                for logical in self._outputs:
+                    destination = self._store._validated_target(logical)
+                    if destination.exists() or destination.is_symlink():
+                        raise FileExistsError(f"stage output already exists: {logical}")
+                for logical, temporary in sorted(self._outputs.items()):
+                    destination = self._store._validated_target(logical)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    self._store._publish_temp(temporary, destination, published)
+                ended_at = self._clock()
+                manifest = {
+                    "config_hash": self._store.config_hash,
+                    "details": self._details,
+                    "ended_at": _timestamp(ended_at),
+                    "input_hashes": self._input_hashes,
+                    "outputs": output_records,
+                    "prerequisite_manifest_hashes": self._prerequisite_manifest_hashes,
+                    "schema_version": SCHEMA_VERSION,
+                    "stage": self.stage,
+                    "started_at": _timestamp(self._started_at),
+                    "status": "SUCCESS",
+                    "transaction_id": transaction_id,
+                }
+                self._store._write_bytes(
+                    marker_relative,
+                    _canonical_json(manifest).encode("utf-8"),
+                    published,
+                )
+                self._store._release_publications(published)
         except BaseException as error:
-            self._store._rollback_publications(published, error)
+            with self._store._publication_lock():
+                committed = bool(
+                    published
+                ) and self._store._journal_group_committed(published)
+                if not committed:
+                    self._store._rollback_publications(published, error)
             raise
         finally:
             shutil.rmtree(temporary_root, ignore_errors=True)
