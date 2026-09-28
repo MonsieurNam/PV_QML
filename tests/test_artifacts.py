@@ -295,25 +295,14 @@ def test_publish_return_interruption_uses_pre_registered_ownership(
     assert interruption_injected
     assert list(store.root.rglob("*.tmp")) == []
     assert not any(path.name.startswith(".stage-") for path in store.root.iterdir())
-    if interrupted_publish == "marker":
-        assert output.is_file()
-        assert marker.is_file()
-        RunStore.open(store.root)
-        assert not any(
-            path.name.startswith(".rollback-") for path in output.parent.iterdir()
-        )
-        with pytest.raises(FileExistsError, match="completed"):
-            store.stage("validate-data", now=FIXED_NOW)
-    else:
-        assert not output.exists()
-        assert not marker.exists()
-        assert not any(
-            path.name.startswith(".rollback-") for path in output.parent.iterdir()
-        )
-        with store.stage("validate-data", now=FIXED_NOW) as retry:
-            retry.write_text("validated.csv", "ok")
-        assert output.is_file()
-        assert marker.is_file()
+    assert not output.exists()
+    assert not marker.exists()
+    RunStore.open(store.root)
+    assert not any(path.name.startswith(".rollback-") for path in output.parent.iterdir())
+    with store.stage("validate-data", now=FIXED_NOW) as retry:
+        retry.write_text("validated.csv", "ok")
+    assert output.is_file()
+    assert marker.is_file()
 
 
 def test_publication_rollback_preserves_racing_file_with_different_identity(
@@ -599,7 +588,7 @@ def test_open_recovers_after_rollback_dispatch_interruption(
 
 
 @pytest.mark.parametrize("line_event", range(1, 5))
-def test_open_finishes_committed_journal_release_after_interruption(
+def test_caught_journal_release_interruption_rolls_back_and_reruns(
     tmp_path: Path,
     line_event: int,
 ) -> None:
@@ -631,11 +620,66 @@ def test_open_finishes_committed_journal_release_after_interruption(
         sys.settrace(previous_trace)
 
     assert interruption_injected
-    assert output.is_file()
-    assert marker.is_file()
+    assert not output.exists()
+    assert not marker.exists()
     RunStore.open(store.root)
     RunStore.open(store.root)
     assert not any(path.name.startswith(".rollback-") for path in output.parent.iterdir())
+    with store.stage("validate-data", now=FIXED_NOW) as retry:
+        retry.write_text("validated.csv", "retry")
+    assert output.is_file()
+    assert marker.is_file()
+
+
+def test_open_commits_matching_marker_after_process_dies_before_abort_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    output = store.root / "validate-data/validated.csv"
+    marker = store.root / "validate-data/stage_manifest.json"
+    previous_trace = sys.gettrace()
+    interruption_injected = False
+
+    def die_before_abort_intent(publications: object) -> Path:
+        del publications
+        raise SystemExit("simulated process death")
+
+    def interrupt_marker_return(frame: Any, event: str, argument: object) -> Any:
+        del argument
+        nonlocal interruption_injected
+        if frame.f_code.co_name == "_publish_temp" and event == "return":
+            destination: object = frame.f_locals.get("destination")
+            if (
+                isinstance(destination, Path)
+                and destination == marker
+                and not interruption_injected
+            ):
+                interruption_injected = True
+                sys.settrace(previous_trace)
+                raise KeyboardInterrupt
+        return interrupt_marker_return
+
+    monkeypatch.setattr(store, "_mark_batch_aborted", die_before_abort_intent)
+    sys.settrace(interrupt_marker_return)
+    try:
+        with (
+            pytest.raises(SystemExit, match="simulated process death"),
+            store.stage("validate-data", now=FIXED_NOW) as transaction,
+        ):
+            transaction.write_text("validated.csv", "committed")
+    finally:
+        sys.settrace(previous_trace)
+
+    assert interruption_injected
+    assert output.is_file()
+    assert marker.is_file()
+    assert any(path.name.startswith(".rollback-") for path in output.parent.iterdir())
+    resumed = RunStore.open(store.root)
+    assert output.is_file()
+    assert marker.is_file()
+    assert not any(path.name.startswith(".rollback-") for path in output.parent.iterdir())
+    with pytest.raises(FileExistsError, match="completed"):
+        resumed.stage("validate-data", now=FIXED_NOW)
 
 
 def test_downstream_rejects_tampered_prerequisite_manifest_chain(tmp_path: Path) -> None:

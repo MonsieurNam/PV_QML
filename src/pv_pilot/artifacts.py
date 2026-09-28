@@ -58,6 +58,7 @@ _PACKAGE_NAMES = (
 )
 _PUBLICATION_JOURNAL = "ownership.json"
 _PUBLICATION_JOURNAL_SCHEMA = "1"
+_PUBLICATION_ABORT_PREFIX = ".publication-abort-"
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,6 +380,27 @@ class RunStore:
             raise ValueError("publication journal has no ownership record")
         return record
 
+    def _abort_path(self, transaction_id: str) -> Path:
+        if len(transaction_id) != 32 or any(
+            character not in "0123456789abcdef" for character in transaction_id
+        ):
+            raise ValueError("publication transaction id is invalid")
+        return self.root / f"{_PUBLICATION_ABORT_PREFIX}{transaction_id}"
+
+    def _mark_batch_aborted(self, publications: PublicationBatch) -> Path:
+        path = self._abort_path(publications.transaction_id)
+        try:
+            with path.open("xb") as stream:
+                stream.write(publications.transaction_id.encode("ascii"))
+                stream.flush()
+                os.fsync(stream.fileno())
+        except FileExistsError:
+            pass
+        return path
+
+    def _clear_batch_abort(self, transaction_id: str) -> None:
+        self._abort_path(transaction_id).unlink(missing_ok=True)
+
     def _journal_group_committed(
         self, publications: list[PublicationOwnership]
     ) -> bool:
@@ -430,6 +452,14 @@ class RunStore:
         return True
 
     def _recover_publication_journals(self) -> None:
+        abort_paths = sorted(self.root.glob(f"{_PUBLICATION_ABORT_PREFIX}*"))
+        aborted_transactions: set[str] = set()
+        for abort_path in abort_paths:
+            transaction_id = abort_path.name.removeprefix(_PUBLICATION_ABORT_PREFIX)
+            if abort_path.is_symlink() or not abort_path.is_file():
+                raise ValueError(f"unsafe publication abort record: {abort_path.name}")
+            self._abort_path(transaction_id)
+            aborted_transactions.add(transaction_id)
         journal_roots = sorted(
             self.root.rglob(".rollback-*"), key=lambda path: path.as_posix()
         )
@@ -476,6 +506,7 @@ class RunStore:
                 or not isinstance(record.get("source_inode"), int)
             ):
                 raise ValueError(f"invalid publication journal: {journal_root.name}")
+            self._abort_path(str(record["transaction_id"]))
             destination = self._validated_target(str(record["destination"]))
             self._validated_target(str(record["marker"]))
             publications.append(
@@ -492,11 +523,14 @@ class RunStore:
             raise ValueError("conflicting publication journals")
         groups: dict[str, list[PublicationOwnership]] = {}
         for publication in publications:
-            transaction_id = self._publication_record(publication)["transaction_id"]
-            assert isinstance(transaction_id, str)
-            groups.setdefault(transaction_id, []).append(publication)
+            record_transaction_id = self._publication_record(publication)[
+                "transaction_id"
+            ]
+            assert isinstance(record_transaction_id, str)
+            groups.setdefault(record_transaction_id, []).append(publication)
         decisions = {
-            transaction_id: self._journal_group_committed(group)
+            transaction_id: transaction_id not in aborted_transactions
+            and self._journal_group_committed(group)
             for transaction_id, group in groups.items()
         }
         for journal_root in incomplete:
@@ -508,6 +542,10 @@ class RunStore:
                 self._release_publications(group)
             else:
                 self._rollback_publications(group, recovery_error)
+            if not any(publication.quarantine_root.exists() for publication in group):
+                self._clear_batch_abort(transaction_id)
+        for transaction_id in aborted_transactions - groups.keys():
+            self._clear_batch_abort(transaction_id)
 
     @staticmethod
     def _rollback_publications(
@@ -897,11 +935,16 @@ class StageTransaction:
                 self._store._release_publications(published)
         except BaseException as error:
             with self._store._publication_lock():
-                committed = bool(
-                    published
-                ) and self._store._journal_group_committed(published)
-                if not committed:
+                if published:
+                    self._store._mark_batch_aborted(published)
+                try:
                     self._store._rollback_publications(published, error)
+                finally:
+                    if published and not any(
+                        publication.quarantine_root.exists()
+                        for publication in published
+                    ):
+                        self._store._clear_batch_abort(published.transaction_id)
             raise
         finally:
             shutil.rmtree(temporary_root, ignore_errors=True)
