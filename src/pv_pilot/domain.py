@@ -58,6 +58,16 @@ class VersionedRecord(BaseModel):
 
     schema_version: Literal["1.0"] = "1.0"
 
+    def deterministic_data(self) -> dict[str, Any]:
+        """Return this record in stable JSON-compatible form."""
+
+        return deterministic_data(self)
+
+    def deterministic_json(self) -> str:
+        """Serialize this record with canonical key ordering."""
+
+        return deterministic_json(self)
+
 
 @dataclass(frozen=True, slots=True)
 class DetailEntry:
@@ -274,10 +284,7 @@ def _deterministic_value(value: Any) -> Any:
     if isinstance(value, DetailEntry):
         return {"key": value.key, "value": _deterministic_value(value.value)}
     if isinstance(value, BaseModel):
-        return {
-            key: _deterministic_value(getattr(value, key))
-            for key in sorted(type(value).model_fields)
-        }
+        return _deterministic_value(value.model_dump(mode="json"))
     if isinstance(value, dict):
         return {
             str(key): _deterministic_value(item)
@@ -299,7 +306,7 @@ def _deterministic_value(value: Any) -> Any:
 def deterministic_data(record: VersionedRecord) -> dict[str, Any]:
     """Return record data in stable JSON-compatible form."""
 
-    result = _deterministic_value(record)
+    result = _deterministic_value(record.model_dump(mode="json"))
     if not isinstance(result, dict):
         raise TypeError("record serializer produced a non-object root")
     return result
