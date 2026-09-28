@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -53,6 +54,28 @@ _PACKAGE_NAMES = (
     "typer",
     "xgboost",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationOwnership:
+    """Identity-bound permission to remove one published artifact."""
+
+    destination: Path
+    source_device: int
+    source_inode: int
+
+    def rollback(self) -> None:
+        """Remove the destination only while it is still the source hard link."""
+
+        try:
+            destination_stat = self.destination.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if (
+            destination_stat.st_dev == self.source_device
+            and destination_stat.st_ino == self.source_inode
+        ):
+            self.destination.unlink()
 
 
 def sha256_file(path: str | Path) -> str:
@@ -248,37 +271,53 @@ class RunStore:
             raise ValueError("artifact path would escape the run directory")
         return resolved
 
-    def _publish_temp(self, source: Path, destination: Path) -> None:
+    @staticmethod
+    def _rollback_publications(
+        publications: Iterable[PublicationOwnership], error: BaseException
+    ) -> None:
+        cleanup_errors: list[OSError] = []
+        for publication in reversed(tuple(publications)):
+            try:
+                publication.rollback()
+            except OSError as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        for recorded_cleanup_error in cleanup_errors:
+            error.add_note(f"publication cleanup failed: {recorded_cleanup_error}")
+
+    def _publish_temp(
+        self,
+        source: Path,
+        destination: Path,
+        publications: list[PublicationOwnership] | None = None,
+    ) -> None:
         if destination.exists() or destination.is_symlink():
             raise FileExistsError(f"artifact already exists: {destination}")
         source_stat = source.stat(follow_symlinks=False)
+        ownership = PublicationOwnership(
+            destination=destination,
+            source_device=source_stat.st_dev,
+            source_inode=source_stat.st_ino,
+        )
+        if publications is None:
+            publications = []
+        publications.append(ownership)
         try:
             os.link(source, destination)
             source.unlink()
         except BaseException as error:
-            cleanup_errors: list[OSError] = []
-            try:
-                destination_stat = destination.stat(follow_symlinks=False)
-                if (
-                    destination_stat.st_dev == source_stat.st_dev
-                    and destination_stat.st_ino == source_stat.st_ino
-                ):
-                    destination.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError as destination_cleanup_error:
-                cleanup_errors.append(destination_cleanup_error)
+            self._rollback_publications((ownership,), error)
             try:
                 source.unlink(missing_ok=True)
             except OSError as source_cleanup_error:
-                cleanup_errors.append(source_cleanup_error)
-            for recorded_cleanup_error in cleanup_errors:
-                error.add_note(f"publication cleanup failed: {recorded_cleanup_error}")
+                error.add_note(f"publication cleanup failed: {source_cleanup_error}")
             raise
 
-    def write_bytes(self, relative_path: str | Path, data: bytes) -> Path:
-        """Atomically publish bytes inside the run without overwriting a file."""
-
+    def _write_bytes(
+        self,
+        relative_path: str | Path,
+        data: bytes,
+        publications: list[PublicationOwnership] | None = None,
+    ) -> Path:
         destination = self._validated_target(relative_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists() or destination.is_symlink():
@@ -292,11 +331,19 @@ class RunStore:
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
-            self._publish_temp(temporary, destination)
+            if publications is None:
+                self._publish_temp(temporary, destination)
+            else:
+                self._publish_temp(temporary, destination, publications)
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
         return destination
+
+    def write_bytes(self, relative_path: str | Path, data: bytes) -> Path:
+        """Atomically publish bytes inside the run without overwriting a file."""
+
+        return self._write_bytes(relative_path, data)
 
     def write_text(
         self,
@@ -516,7 +563,7 @@ class StageTransaction:
         if exception_type is not None:
             shutil.rmtree(temporary_root, ignore_errors=True)
             return False
-        published: list[Path] = []
+        published: list[PublicationOwnership] = []
         try:
             output_records = [
                 {"path": logical, "sha256": sha256_file(temporary)}
@@ -525,8 +572,7 @@ class StageTransaction:
             for logical, temporary in sorted(self._outputs.items()):
                 destination = self._store._validated_target(logical)
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                self._store._publish_temp(temporary, destination)
-                published.append(destination)
+                self._store._publish_temp(temporary, destination, published)
             ended_at = self._clock()
             manifest = {
                 "config_hash": self._store.config_hash,
@@ -540,13 +586,13 @@ class StageTransaction:
                 "started_at": _timestamp(self._started_at),
                 "status": "SUCCESS",
             }
-            marker = self._store.write_json(
-                f"{self.stage}/stage_manifest.json", manifest
+            self._store._write_bytes(
+                f"{self.stage}/stage_manifest.json",
+                _canonical_json(manifest).encode("utf-8"),
+                published,
             )
-            published.append(marker)
-        except BaseException:
-            for path in published:
-                path.unlink(missing_ok=True)
+        except BaseException as error:
+            self._store._rollback_publications(published, error)
             raise
         finally:
             shutil.rmtree(temporary_root, ignore_errors=True)

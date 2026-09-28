@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -250,6 +251,87 @@ def test_post_link_interruption_rolls_back_and_stage_can_rerun(
         retry.write_text("validated.csv", "ok")
     assert output.is_file()
     assert marker.is_file()
+
+
+@pytest.mark.parametrize("interrupted_publish", ["output", "marker"])
+def test_publish_return_interruption_uses_pre_registered_ownership(
+    tmp_path: Path,
+    interrupted_publish: str,
+) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    previous_trace = sys.gettrace()
+    interruption_injected = False
+
+    def interrupt_on_publish_return(
+        frame: Any, event: str, argument: object
+    ) -> Any:
+        del argument
+        nonlocal interruption_injected
+        if frame.f_code.co_name == "_publish_temp" and event == "return":
+            destination: object = frame.f_locals.get("destination")
+            if isinstance(destination, Path):
+                is_marker = destination.name == "stage_manifest.json"
+                selected = (
+                    is_marker if interrupted_publish == "marker" else not is_marker
+                )
+                if selected and not interruption_injected:
+                    interruption_injected = True
+                    sys.settrace(previous_trace)
+                    raise KeyboardInterrupt
+        return interrupt_on_publish_return
+
+    sys.settrace(interrupt_on_publish_return)
+    try:
+        with (
+            pytest.raises(KeyboardInterrupt),
+            store.stage("validate-data", now=FIXED_NOW) as transaction,
+        ):
+            transaction.write_text("validated.csv", "ok")
+    finally:
+        sys.settrace(previous_trace)
+
+    output = store.root / "validate-data/validated.csv"
+    marker = store.root / "validate-data/stage_manifest.json"
+    assert interruption_injected
+    assert not output.exists()
+    assert not marker.exists()
+    assert list(store.root.rglob("*.tmp")) == []
+    assert not any(path.name.startswith(".stage-") for path in store.root.iterdir())
+
+    with store.stage("validate-data", now=FIXED_NOW) as retry:
+        retry.write_text("validated.csv", "ok")
+    assert output.is_file()
+    assert marker.is_file()
+
+
+def test_publication_rollback_preserves_racing_file_with_different_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    output = store.root / "validate-data/validated.csv"
+    original_publish = store._publish_temp
+
+    def replace_output_before_marker(
+        source: Path,
+        destination: Path,
+        publications: list[Any] | None = None,
+    ) -> None:
+        if destination.name == "stage_manifest.json":
+            output.unlink()
+            output.write_text("external racer", encoding="utf-8")
+            raise KeyboardInterrupt
+        original_publish(source, destination, publications)
+
+    monkeypatch.setattr(store, "_publish_temp", replace_output_before_marker)
+    with (
+        pytest.raises(KeyboardInterrupt),
+        store.stage("validate-data", now=FIXED_NOW) as transaction,
+    ):
+        transaction.write_text("validated.csv", "transaction")
+
+    assert output.read_text(encoding="utf-8") == "external racer"
+    assert not (store.root / "validate-data/stage_manifest.json").exists()
+    assert list(store.root.rglob("*.tmp")) == []
 
 
 def test_downstream_rejects_tampered_prerequisite_manifest_chain(tmp_path: Path) -> None:
