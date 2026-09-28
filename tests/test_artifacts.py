@@ -334,6 +334,145 @@ def test_publication_rollback_preserves_racing_file_with_different_identity(
     assert list(store.root.rglob("*.tmp")) == []
 
 
+def test_publication_rollback_cannot_unlink_replacement_after_identity_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    output = store.root / "validate-data/validated.csv"
+    original_publish = store._publish_temp
+    original_stat = Path.stat
+    original_rename = os.rename
+    race_injected = False
+
+    def interrupt_before_marker(
+        source: Path,
+        destination: Path,
+        publications: list[Any] | None = None,
+    ) -> None:
+        if destination.name == "stage_manifest.json":
+            raise KeyboardInterrupt
+        original_publish(source, destination, publications)
+
+    def replace_after_stat(path: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+        nonlocal race_injected
+        result = original_stat(path, *args, **kwargs)
+        if (
+            path == output
+            and kwargs.get("follow_symlinks") is False
+            and not race_injected
+        ):
+            output.unlink()
+            output.write_text("external racer", encoding="utf-8")
+            race_injected = True
+        return result
+
+    def replace_after_quarantine(source: Any, destination: Any) -> None:
+        nonlocal race_injected
+        original_rename(source, destination)
+        if Path(source) == output and not race_injected:
+            output.write_text("external racer", encoding="utf-8")
+            race_injected = True
+
+    monkeypatch.setattr(store, "_publish_temp", interrupt_before_marker)
+    monkeypatch.setattr(Path, "stat", replace_after_stat)
+    monkeypatch.setattr(os, "rename", replace_after_quarantine)
+    with (
+        pytest.raises(KeyboardInterrupt),
+        store.stage("validate-data", now=FIXED_NOW) as transaction,
+    ):
+        transaction.write_text("validated.csv", "transaction")
+
+    assert race_injected
+    assert output.read_text(encoding="utf-8") == "external racer"
+    assert not (store.root / "validate-data/stage_manifest.json").exists()
+    assert not any(path.name.startswith(".rollback-") for path in output.parent.iterdir())
+
+
+def test_publication_rollback_preserves_quarantined_foreign_file_when_raced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    output = store.root / "validate-data/validated.csv"
+    original_publish = store._publish_temp
+    original_rename = os.rename
+    race_injected = False
+
+    def replace_output_before_marker(
+        source: Path,
+        destination: Path,
+        publications: list[Any] | None = None,
+    ) -> None:
+        if destination.name == "stage_manifest.json":
+            output.unlink()
+            output.write_text("foreign before rollback", encoding="utf-8")
+            raise KeyboardInterrupt
+        original_publish(source, destination, publications)
+
+    def create_concurrent_destination(source: Any, destination: Any) -> None:
+        nonlocal race_injected
+        original_rename(source, destination)
+        if Path(source) == output and not race_injected:
+            output.write_text("concurrent racer", encoding="utf-8")
+            race_injected = True
+
+    monkeypatch.setattr(store, "_publish_temp", replace_output_before_marker)
+    monkeypatch.setattr(os, "rename", create_concurrent_destination)
+    with (
+        pytest.raises(KeyboardInterrupt),
+        store.stage("validate-data", now=FIXED_NOW) as transaction,
+    ):
+        transaction.write_text("validated.csv", "transaction")
+
+    assert race_injected
+    assert output.read_text(encoding="utf-8") == "concurrent racer"
+    quarantines = [
+        path for path in output.parent.iterdir() if path.name.startswith(".rollback-")
+    ]
+    assert len(quarantines) == 1
+    assert (quarantines[0] / "entry").read_text(encoding="utf-8") == (
+        "foreign before rollback"
+    )
+
+
+def test_publication_rollback_recovers_from_interrupt_after_quarantine_move(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    output = store.root / "validate-data/validated.csv"
+    original_publish = store._publish_temp
+    original_rename = os.rename
+    interruption_injected = False
+
+    def interrupt_before_marker(
+        source: Path,
+        destination: Path,
+        publications: list[Any] | None = None,
+    ) -> None:
+        if destination.name == "stage_manifest.json":
+            raise KeyboardInterrupt
+        original_publish(source, destination, publications)
+
+    def interrupt_after_quarantine(source: Any, destination: Any) -> None:
+        nonlocal interruption_injected
+        original_rename(source, destination)
+        if Path(source) == output and not interruption_injected:
+            interruption_injected = True
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(store, "_publish_temp", interrupt_before_marker)
+    monkeypatch.setattr(os, "rename", interrupt_after_quarantine)
+    with (
+        pytest.raises(KeyboardInterrupt),
+        store.stage("validate-data", now=FIXED_NOW) as transaction,
+    ):
+        transaction.write_text("validated.csv", "transaction")
+
+    assert interruption_injected
+    assert not output.exists()
+    assert not (store.root / "validate-data/stage_manifest.json").exists()
+    assert not any(path.name.startswith(".rollback-") for path in output.parent.iterdir())
+
+
 def test_downstream_rejects_tampered_prerequisite_manifest_chain(tmp_path: Path) -> None:
     store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
     with store.stage("validate-data", now=FIXED_NOW) as transaction:

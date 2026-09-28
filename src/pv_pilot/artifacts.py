@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
@@ -64,18 +65,69 @@ class PublicationOwnership:
     source_device: int
     source_inode: int
 
-    def rollback(self) -> None:
-        """Remove the destination only while it is still the source hard link."""
+    def _is_owned(self, path: Path) -> bool:
+        path_stat = path.stat(follow_symlinks=False)
+        return (
+            path_stat.st_dev == self.source_device
+            and path_stat.st_ino == self.source_inode
+        )
 
+    def _restore_foreign(self, quarantine: Path) -> None:
+        if os.name == "nt":
+            os.rename(quarantine, self.destination)
+            return
+        os.link(quarantine, self.destination, follow_symlinks=False)
+        raise OSError(
+            "foreign publication was restored but retained in quarantine at "
+            f"{quarantine}"
+        )
+
+    def _settle_quarantine(self, quarantine: Path) -> None:
         try:
-            destination_stat = self.destination.stat(follow_symlinks=False)
+            owned = self._is_owned(quarantine)
         except FileNotFoundError:
             return
-        if (
-            destination_stat.st_dev == self.source_device
-            and destination_stat.st_ino == self.source_inode
-        ):
-            self.destination.unlink()
+        if owned:
+            quarantine.unlink()
+            return
+        self._restore_foreign(quarantine)
+
+    def _recover_quarantine(
+        self, quarantine: Path, interrupted_operation: BaseException
+    ) -> None:
+        try:
+            self._settle_quarantine(quarantine)
+        except BaseException as recovery_error:
+            interrupted_operation.add_note(
+                f"publication quarantine recovery failed: {recovery_error}"
+            )
+
+    def rollback(self) -> None:
+        """Atomically acquire the destination before deciding whether to delete it."""
+
+        quarantine_root = Path(
+            tempfile.mkdtemp(
+                prefix=f".rollback-{self.destination.name}-",
+                dir=self.destination.parent,
+            )
+        )
+        quarantine = quarantine_root / "entry"
+        try:
+            try:
+                os.rename(self.destination, quarantine)
+            except FileNotFoundError:
+                return
+            except BaseException as move_error:
+                self._recover_quarantine(quarantine, move_error)
+                raise
+            try:
+                self._settle_quarantine(quarantine)
+            except BaseException as settle_error:
+                self._recover_quarantine(quarantine, settle_error)
+                raise
+        finally:
+            with suppress(OSError):
+                quarantine_root.rmdir()
 
 
 def sha256_file(path: str | Path) -> str:
@@ -275,11 +327,11 @@ class RunStore:
     def _rollback_publications(
         publications: Iterable[PublicationOwnership], error: BaseException
     ) -> None:
-        cleanup_errors: list[OSError] = []
+        cleanup_errors: list[BaseException] = []
         for publication in reversed(tuple(publications)):
             try:
                 publication.rollback()
-            except OSError as cleanup_error:
+            except BaseException as cleanup_error:
                 cleanup_errors.append(cleanup_error)
         for recorded_cleanup_error in cleanup_errors:
             error.add_note(f"publication cleanup failed: {recorded_cleanup_error}")
