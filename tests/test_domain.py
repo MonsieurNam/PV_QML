@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
@@ -11,11 +12,13 @@ from pv_pilot.domain import (
     DataProvenance,
     DaylightSource,
     DetailEntry,
+    FrozenJsonObject,
     PredictionRecord,
     QuantileValue,
     StageResult,
     StageStatus,
     deterministic_json,
+    freeze_json,
 )
 
 
@@ -77,12 +80,50 @@ def test_domain_payloads_are_deeply_immutable_and_deterministic() -> None:
     )
     first = deterministic_json(result)
     details: Any = result.details
+    first_detail: Any = result.details[0]
 
-    with pytest.raises(ValidationError):
-        result.details[0].key = "changed"
+    with pytest.raises((ValidationError, FrozenInstanceError)):
+        first_detail.key = "changed"
     with pytest.raises(AttributeError):
         details.append(DetailEntry(key="x", value=1))
     assert deterministic_json(result) == first
+
+
+def test_detail_objects_are_recursively_frozen_sorted_and_canonical() -> None:
+    first = StageResult(
+        stage="validate-data",
+        status=StageStatus.SUCCESS,
+        details=(
+            DetailEntry(key="z", value={"b": 2, "a": [1, {"y": True, "x": None}]}),
+            DetailEntry(key="a", value="first"),
+        ),
+    )
+    second = StageResult(
+        stage="validate-data",
+        status=StageStatus.SUCCESS,
+        details=(
+            DetailEntry(key="a", value="first"),
+            DetailEntry(key="z", value={"a": [1, {"x": None, "y": True}], "b": 2}),
+        ),
+    )
+
+    assert isinstance(first.details[1].value, FrozenJsonObject)
+    assert freeze_json({"b": 2, "a": 1}) == freeze_json({"a": 1, "b": 2})
+    assert deterministic_json(first) == deterministic_json(second)
+    nested: Any = first.details[1].value
+    with pytest.raises((FrozenInstanceError, AttributeError)):
+        nested.entries = ()
+
+
+def test_duplicate_detail_and_nested_object_keys_are_rejected() -> None:
+    with pytest.raises(ValidationError, match="duplicate"):
+        StageResult(
+            stage="validate-data",
+            status=StageStatus.SUCCESS,
+            details=(DetailEntry("same", 1), DetailEntry("same", 2)),
+        )
+    with pytest.raises(ValueError, match="duplicate"):
+        FrozenJsonObject((DetailEntry("same", 1), DetailEntry("same", 2)))
 
 
 @pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
@@ -150,3 +191,40 @@ def test_prediction_timing_contract_and_quantile_records() -> None:
             quantiles=(),
             status=StageStatus.SUCCESS,
         )
+
+
+def test_prediction_quantiles_are_nonempty_unique_sorted_and_nondecreasing() -> None:
+    issued = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def prediction(quantiles: tuple[QuantileValue, ...]) -> PredictionRecord:
+        return PredictionRecord(
+            site_id="site-a",
+            issued_at=issued,
+            target_interval_start=issued + timedelta(minutes=10),
+            target_interval_end=issued + timedelta(minutes=15),
+            model_version="v1",
+            quantiles=quantiles,
+            status=StageStatus.SUCCESS,
+        )
+
+    ordered = prediction(
+        (QuantileValue(q=0.1, value=1.0), QuantileValue(q=0.9, value=9.0))
+    )
+    permuted = prediction(
+        (QuantileValue(q=0.9, value=9.0), QuantileValue(q=0.1, value=1.0))
+    )
+    assert permuted.quantiles == ordered.quantiles
+    assert deterministic_json(permuted) == deterministic_json(ordered)
+
+    with pytest.raises(ValidationError):
+        prediction(())
+    with pytest.raises(ValidationError, match="unique"):
+        prediction((QuantileValue(q=0.5, value=1.0), QuantileValue(q=0.5, value=2.0)))
+    with pytest.raises(ValidationError, match="nondecreasing"):
+        prediction((QuantileValue(q=0.1, value=2.0), QuantileValue(q=0.9, value=1.0)))
+
+
+@pytest.mark.parametrize("q", [0.0, 1.0])
+def test_quantile_probabilities_are_strictly_interior(q: float) -> None:
+    with pytest.raises(ValidationError):
+        QuantileValue(q=q, value=1.0)

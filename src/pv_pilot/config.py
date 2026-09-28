@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import posixpath
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
@@ -16,11 +17,9 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    PrivateAttr,
     StrictBool,
     StrictFloat,
     StrictInt,
-    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -73,8 +72,11 @@ class PathsConfig(StrictConfigModel):
     def normalize_path_text(cls, value: object) -> object:
         if not isinstance(value, (str, Path)):
             return value
-        text = str(value).replace("\\", "/")
-        return Path(posixpath.normpath(text))
+        text = str(value).strip().replace("\\", "/")
+        normalized = posixpath.normpath(text)
+        if not text or normalized == ".":
+            raise ValueError("configured paths cannot be blank or the current directory")
+        return Path(normalized)
 
     @field_validator("artifact_dir")
     @classmethod
@@ -413,39 +415,20 @@ class PilotConfig(StrictConfigModel):
     evaluation: EvaluationConfig
     resources: ResourcesConfig
     seeds: SeedsConfig
-    _source_dir: Path | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
-    def daylight_column_is_mapped(self, info: ValidationInfo) -> Self:
+    def cross_section_contracts_hold(self) -> Self:
         if (
             self.daylight.source is DaylightSource.COLUMN
             and self.data.columns.daylight is None
         ):
             raise ValueError("column daylight requires data.columns.daylight")
-        context = info.context if isinstance(info.context, dict) else {}
-        config_dir = context.get("config_dir")
-        project_root = context.get("project_root")
-        if isinstance(config_dir, Path) and isinstance(project_root, Path):
-            resolved_artifact = (config_dir / self.paths.artifact_dir).resolve()
-            if not resolved_artifact.is_relative_to(project_root.resolve()):
-                raise ValueError("artifact_dir must resolve under the project root")
+        expected_suffix = f".{self.data.format}"
+        if self.paths.input_data.suffix.lower() != expected_suffix:
+            raise ValueError(
+                f"input_data suffix must be {expected_suffix!r} for format {self.data.format!r}"
+            )
         return self
-
-    @property
-    def resolved_input_path(self) -> Path:
-        """Resolve the read-only input path against the source configuration directory."""
-
-        if self.paths.input_data.is_absolute():
-            return self.paths.input_data.resolve()
-        base = self._source_dir if self._source_dir is not None else Path.cwd()
-        return (base / self.paths.input_data).resolve()
-
-    @property
-    def resolved_artifact_path(self) -> Path:
-        """Resolve the validated artifact directory against the source config."""
-
-        base = self._source_dir if self._source_dir is not None else Path.cwd()
-        return (base / self.paths.artifact_dir).resolve()
 
     @property
     def science_decision_allowed(self) -> bool:
@@ -507,8 +490,65 @@ UniqueKeySafeLoader.add_constructor(
 )
 
 
-def load_config(path: str | Path) -> PilotConfig:
-    """Load YAML and resolve filesystem paths relative to the configuration file."""
+def _discover_project_root(start: Path) -> Path | None:
+    for candidate in (start, *start.parents):
+        if (candidate / ".git").exists():
+            return candidate.resolve()
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedPilotConfig:
+    """Immutable operational context around a location-independent pilot config."""
+
+    config: PilotConfig
+    config_file: Path
+    source_dir: Path
+    project_root: Path
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "config_file", self.config_file.resolve())
+        object.__setattr__(self, "source_dir", self.source_dir.resolve())
+        object.__setattr__(self, "project_root", self.project_root.resolve())
+        if self.config_file.parent != self.source_dir:
+            raise ValueError("source_dir must be the configuration file parent")
+        self._validated_artifact_path()
+
+    def _validated_artifact_path(self) -> Path:
+        resolved = (self.source_dir / self.config.paths.artifact_dir).resolve()
+        if not resolved.is_relative_to(self.project_root):
+            raise ValueError("artifact_dir must resolve under the project root")
+        return resolved
+
+    @property
+    def resolved_input_path(self) -> Path:
+        """Resolve the read-only input path against the configuration directory."""
+
+        if self.config.paths.input_data.is_absolute():
+            return self.config.paths.input_data.resolve()
+        return (self.source_dir / self.config.paths.input_data).resolve()
+
+    @property
+    def resolved_artifact_path(self) -> Path:
+        """Resolve and revalidate the writable artifact path."""
+
+        return self._validated_artifact_path()
+
+    @property
+    def science_decision_allowed(self) -> bool:
+        return self.config.science_decision_allowed
+
+    def canonical_json(self) -> str:
+        return self.config.canonical_json()
+
+    def config_hash(self) -> str:
+        return self.config.config_hash()
+
+
+def load_config(
+    path: str | Path, project_root: str | Path | None = None
+) -> LoadedPilotConfig:
+    """Load YAML into a scientific config plus immutable operational context."""
 
     config_path = Path(path).resolve()
     if config_path.suffix.lower() not in {".yaml", ".yml"}:
@@ -519,12 +559,20 @@ def load_config(path: str | Path) -> PilotConfig:
     if not isinstance(raw, dict):
         raise ValueError("pilot configuration root must be a mapping")
     config_dir = config_path.parent
-    config = PilotConfig.model_validate(
-        raw,
-        context={"config_dir": config_dir, "project_root": config_dir.parent},
+    resolved_project_root = (
+        Path(project_root).resolve()
+        if project_root is not None
+        else _discover_project_root(config_dir)
     )
-    config._source_dir = config_dir
-    return config
+    if resolved_project_root is None:
+        raise ValueError("project_root is required when no .git ancestor can be discovered")
+    config = PilotConfig.model_validate(raw)
+    return LoadedPilotConfig(
+        config=config,
+        config_file=config_path,
+        source_dir=config_dir,
+        project_root=resolved_project_root,
+    )
 
 
-__all__ = ["PilotConfig", "derive_circuit_seeds", "load_config"]
+__all__ = ["LoadedPilotConfig", "PilotConfig", "derive_circuit_seeds", "load_config"]

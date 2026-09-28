@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import math
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +10,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from pv_pilot.config import PilotConfig, load_config
+from pv_pilot.config import LoadedPilotConfig, PilotConfig, load_config
 
 
 def valid_config() -> dict[str, Any]:
@@ -331,8 +332,8 @@ def test_load_config_resolves_paths_and_hash_is_stable_across_yaml_key_order(
     first_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
     second_path.write_text(yaml.safe_dump(copy.deepcopy(payload), sort_keys=True), encoding="utf-8")
 
-    first = load_config(first_path)
-    second = load_config(second_path)
+    first = load_config(first_path, project_root=tmp_path)
+    second = load_config(second_path, project_root=tmp_path)
 
     assert first.resolved_input_path == (tmp_path / "data/pv.csv").resolve()
     assert first.resolved_artifact_path == (tmp_path / "artifacts/run").resolve()
@@ -349,7 +350,7 @@ def test_config_hash_is_independent_of_checkout_location(tmp_path: Path) -> None
         config_dir.mkdir(parents=True)
         config_path = config_dir / "pilot.yaml"
         config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
-        config = load_config(config_path)
+        config = load_config(config_path, project_root=checkout)
         hashes.append(config.config_hash())
         assert config.resolved_artifact_path == checkout / "artifacts/run"
     assert hashes[0] == hashes[1]
@@ -363,8 +364,8 @@ def test_artifact_path_must_be_relative_and_stay_under_project_root(tmp_path: Pa
         payload["paths"]["artifact_dir"] = artifact_dir
         path = config_dir / "pilot.yaml"
         path.write_text(yaml.safe_dump(payload), encoding="utf-8")
-        with pytest.raises(ValidationError, match="artifact"):
-            load_config(path)
+        with pytest.raises((ValidationError, ValueError), match="artifact"):
+            load_config(path, project_root=config_dir.parent)
 
 
 @pytest.mark.parametrize("duplicate_key", ["provenance", "approved_by"])
@@ -380,6 +381,60 @@ def test_load_config_rejects_duplicate_keys_at_any_level(
     path.write_text(text.replace(original, duplicate, 1), encoding="utf-8")
     with pytest.raises(ValueError, match="duplicate key"):
         load_config(path)
+
+
+def test_load_config_requires_project_root_when_git_cannot_be_discovered(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "pilot.yaml"
+    path.write_text(yaml.safe_dump(valid_config()), encoding="utf-8")
+    with pytest.raises(ValueError, match="project_root"):
+        load_config(path)
+
+
+def test_loaded_config_context_is_frozen_and_config_is_context_free(tmp_path: Path) -> None:
+    config_dir = tmp_path / "project/configs"
+    config_dir.mkdir(parents=True)
+    payload = valid_config()
+    payload["paths"]["artifact_dir"] = "../artifacts/run"
+    path = config_dir / "pilot.yaml"
+    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    loaded = load_config(path, project_root=config_dir.parent)
+    mutable_view: Any = loaded
+
+    assert isinstance(loaded, LoadedPilotConfig)
+    assert not hasattr(loaded.config, "resolved_artifact_path")
+    with pytest.raises(FrozenInstanceError):
+        mutable_view.source_dir = tmp_path
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("input_data", "   "),
+        ("input_data", "."),
+        ("artifact_dir", "   "),
+        ("artifact_dir", "."),
+    ],
+)
+def test_paths_reject_blank_and_current_directory(field: str, value: str) -> None:
+    payload = valid_config()
+    payload["paths"][field] = value
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("data_format", "input_path"),
+    [("csv", "data/input.parquet"), ("parquet", "data/input.csv")],
+)
+def test_input_suffix_must_match_data_format(data_format: str, input_path: str) -> None:
+    payload = valid_config()
+    payload["data"]["format"] = data_format
+    payload["paths"]["input_data"] = input_path
+    with pytest.raises(ValidationError, match="suffix"):
+        PilotConfig.model_validate(payload)
 
 
 def test_column_names_are_stripped_and_all_mappings_are_unique() -> None:
@@ -403,6 +458,6 @@ def test_example_configs_validate() -> None:
     real = load_config(root / "configs/pilot.example.yaml")
     synthetic = load_config(root / "configs/pilot.synthetic.yaml")
 
-    assert real.protocol.provenance.value == "real"
-    assert synthetic.protocol.provenance.value == "synthetic"
+    assert real.config.protocol.provenance.value == "real"
+    assert synthetic.config.protocol.provenance.value == "synthetic"
     assert synthetic.science_decision_allowed is False

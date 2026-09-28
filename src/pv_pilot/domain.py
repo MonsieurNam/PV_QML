@@ -7,8 +7,11 @@ contain only scalar values and metadata so manifests remain stable and portable.
 from __future__ import annotations
 
 import json
+import math
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, Literal, Self
 
@@ -48,20 +51,65 @@ class VersionedRecord(BaseModel):
     schema_version: Literal["1.0"] = "1.0"
 
 
-type FrozenJsonValue = str | int | float | bool | tuple["FrozenJsonValue", ...] | None
-
-
-class DetailEntry(VersionedRecord):
+@dataclass(frozen=True, slots=True)
+class DetailEntry:
     """One immutable key/value metadata entry."""
 
-    key: str = Field(min_length=1)
-    value: FrozenJsonValue
+    key: str
+    value: Any
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.key, str) or not self.key.strip():
+            raise ValueError("detail keys must be nonblank strings")
+        object.__setattr__(self, "key", self.key.strip())
+        object.__setattr__(self, "value", freeze_json(self.value))
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenJsonObject:
+    """An immutable JSON object represented by sorted unique entries."""
+
+    entries: tuple[DetailEntry, ...]
+
+    def __post_init__(self) -> None:
+        entries = tuple(sorted(self.entries, key=lambda entry: entry.key))
+        keys = tuple(entry.key for entry in entries)
+        if len(keys) != len(set(keys)):
+            raise ValueError("duplicate keys are not allowed in immutable JSON objects")
+        object.__setattr__(self, "entries", entries)
+
+
+type FrozenJsonValue = (
+    str | int | float | bool | tuple["FrozenJsonValue", ...] | FrozenJsonObject | None
+)
+
+
+def freeze_json(value: Any) -> FrozenJsonValue:
+    """Convert ordinary JSON-compatible data into its immutable canonical form."""
+
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("JSON numeric values must be finite")
+        return value
+    if isinstance(value, FrozenJsonObject):
+        return value
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("JSON object keys must be strings")
+        return FrozenJsonObject(
+            tuple(DetailEntry(key=key, value=item) for key, item in value.items())
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(freeze_json(item) for item in value)
+    raise ValueError(f"unsupported JSON value type: {type(value).__name__}")
 
 
 class QuantileValue(VersionedRecord):
     """One quantile probability and forecast value."""
 
-    q: float = Field(ge=0, le=1)
+    q: float = Field(gt=0, lt=1)
     value: float
 
 
@@ -73,6 +121,17 @@ class StageResult(VersionedRecord):
     message: str | None = None
     artifacts: tuple[Path, ...] = ()
     details: tuple[DetailEntry, ...] = ()
+
+    @field_validator("details")
+    @classmethod
+    def details_are_unique_and_sorted(
+        cls, value: tuple[DetailEntry, ...]
+    ) -> tuple[DetailEntry, ...]:
+        ordered = tuple(sorted(value, key=lambda entry: entry.key))
+        keys = tuple(entry.key for entry in ordered)
+        if len(keys) != len(set(keys)):
+            raise ValueError("duplicate detail keys are not allowed")
+        return ordered
 
 
 class CanonicalRow(VersionedRecord):
@@ -114,6 +173,22 @@ class PredictionRecord(VersionedRecord):
     raw_attempts: int | None = Field(default=None, ge=0)
     accepted_count: int | None = Field(default=None, ge=0)
     circuit_count: int | None = Field(default=None, ge=0)
+
+    @field_validator("quantiles")
+    @classmethod
+    def quantiles_are_canonical(
+        cls, value: tuple[QuantileValue, ...]
+    ) -> tuple[QuantileValue, ...]:
+        if not value:
+            raise ValueError("quantiles must be nonempty")
+        ordered = tuple(sorted(value, key=lambda item: item.q))
+        probabilities = tuple(item.q for item in ordered)
+        if len(probabilities) != len(set(probabilities)):
+            raise ValueError("quantile probabilities must be unique")
+        values = tuple(item.value for item in ordered)
+        if any(left > right for left, right in pairwise(values)):
+            raise ValueError("quantile forecast values must be nondecreasing")
+        return ordered
 
     @field_validator("issued_at", "target_interval_start", "target_interval_end")
     @classmethod
@@ -165,10 +240,14 @@ class ScoreBundle(VersionedRecord):
 
 
 def _deterministic_value(value: Any) -> Any:
+    if isinstance(value, FrozenJsonObject):
+        return {entry.key: _deterministic_value(entry.value) for entry in value.entries}
+    if isinstance(value, DetailEntry):
+        return {"key": value.key, "value": _deterministic_value(value.value)}
     if isinstance(value, BaseModel):
         return {
-            key: _deterministic_value(item)
-            for key, item in sorted(value.model_dump(mode="python").items())
+            key: _deterministic_value(getattr(value, key))
+            for key in sorted(type(value).model_fields)
         }
     if isinstance(value, dict):
         return {
@@ -214,6 +293,7 @@ __all__ = [
     "DataProvenance",
     "DaylightSource",
     "DetailEntry",
+    "FrozenJsonObject",
     "PhotonicFeatureSet",
     "PredictionRecord",
     "QuantileValue",
@@ -222,4 +302,5 @@ __all__ = [
     "StageStatus",
     "deterministic_data",
     "deterministic_json",
+    "freeze_json",
 ]
