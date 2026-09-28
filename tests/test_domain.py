@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -14,6 +15,7 @@ from pv_pilot.domain import (
     DaylightSource,
     DetailEntry,
     FrozenJsonObject,
+    PhotonicFeatureSet,
     PredictionRecord,
     QuantileValue,
     StageResult,
@@ -153,6 +155,34 @@ def test_stage_result_standard_and_deterministic_json_round_trip_details() -> No
         }
         assert "entries" not in serialized
         assert StageResult.model_validate_json(serialized) == record
+
+
+def test_artifact_paths_use_portable_posix_json_and_round_trip() -> None:
+    windows_style = Path(r"artifacts\circuits\features.parquet")
+    stage = StageResult(
+        stage="build-photonic-features",
+        status=StageStatus.SUCCESS,
+        artifacts=(windows_style,),
+    )
+    features = PhotonicFeatureSet(
+        artifact_path=windows_style,
+        checksum_sha256="0" * 64,
+        backend="SLOS",
+        modes=4,
+        photons=2,
+        phase_scale=1.0,
+        circuit_seed=1,
+        feature_names=("p0",),
+        row_count=1,
+        feature_count=1,
+    )
+
+    for record in (stage, features):
+        for serialized in (record.model_dump_json(), record.deterministic_json()):
+            assert "artifacts/circuits/features.parquet" in serialized
+            assert "\\\\" not in serialized
+        assert type(record).model_validate_json(record.model_dump_json()) == record
+        assert type(record).model_validate_json(record.deterministic_json()) == record
 
 
 @pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])

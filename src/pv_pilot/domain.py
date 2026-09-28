@@ -13,17 +13,27 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from itertools import pairwise
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
     AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
+    PlainSerializer,
     field_serializer,
     field_validator,
     model_validator,
 )
+
+
+def _path_as_posix(value: Path) -> str:
+    return value.as_posix()
+
+
+PortablePath = Annotated[
+    Path, PlainSerializer(_path_as_posix, return_type=str, when_used="json")
+]
 
 
 class StageStatus(StrEnum):
@@ -147,7 +157,7 @@ class StageResult(VersionedRecord):
     stage: str = Field(min_length=1)
     status: StageStatus
     message: str | None = None
-    artifacts: tuple[Path, ...] = ()
+    artifacts: tuple[PortablePath, ...] = ()
     details: tuple[DetailEntry, ...] = ()
 
     @field_validator("details", mode="before")
@@ -250,7 +260,7 @@ class PredictionRecord(VersionedRecord):
 class PhotonicFeatureSet(VersionedRecord):
     """Metadata locating a photonic feature matrix stored as an artifact."""
 
-    artifact_path: Path
+    artifact_path: PortablePath
     checksum_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     backend: str = Field(min_length=1)
     modes: int = Field(gt=0)
@@ -331,6 +341,7 @@ __all__ = [
     "DetailEntry",
     "FrozenJsonObject",
     "PhotonicFeatureSet",
+    "PortablePath",
     "PredictionRecord",
     "QuantileValue",
     "ScoreBundle",
