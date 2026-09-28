@@ -137,3 +137,22 @@ def test_run_pilot_dispatches_both_branches(
     result = runner.invoke(app, ["run-pilot", *arguments])
     assert result.exit_code == 0
     assert recorder.calls == [("run-pilot", expected)]
+
+
+def test_init_run_creates_run_and_prints_path(tmp_path: Path) -> None:
+    source = Path(__file__).parents[1] / "configs/pilot.synthetic.yaml"
+    payload = source.read_text(encoding="utf-8").replace(
+        "../artifacts/pilot-synthetic", "../artifacts/test-cli"
+    )
+    config_dir = tmp_path / "project/configs"
+    config_dir.mkdir(parents=True)
+    (tmp_path / "project/.git").mkdir()
+    config_path = config_dir / "pilot.yaml"
+    config_path.write_text(payload, encoding="utf-8")
+
+    result = runner.invoke(app, ["init-run", "--config", str(config_path)])
+
+    assert result.exit_code == 0, result.output
+    run_path = Path(result.output.strip())
+    assert run_path.is_dir()
+    assert (run_path / "run_manifest.json").is_file()

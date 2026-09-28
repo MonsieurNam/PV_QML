@@ -8,13 +8,15 @@ from typing import Annotated, Protocol
 
 import typer
 
+from .services import DefaultPilotServices
+
 app = typer.Typer(no_args_is_help=True, help="Photonic photovoltaic pilot runner.")
 
 
 class PilotServices(Protocol):
     """Injectable boundary for pipeline services implemented in later tasks."""
 
-    def init_run(self, config: Path) -> None: ...
+    def init_run(self, config: Path) -> Path | None: ...
 
     def validate_data(self, run_dir: Path) -> None: ...
 
@@ -31,41 +33,7 @@ class PilotServices(Protocol):
     def run_pilot(self, *, config: Path | None, run_dir: Path | None) -> None: ...
 
 
-class UnimplementedPilotServices:
-    """Explicit placeholder until individual pipeline stages are implemented."""
-
-    @staticmethod
-    def _raise(stage: str) -> None:
-        raise NotImplementedError(
-            f"Pipeline stages are not implemented yet; cannot execute {stage!r}."
-        )
-
-    def init_run(self, config: Path) -> None:
-        self._raise("init-run")
-
-    def validate_data(self, run_dir: Path) -> None:
-        self._raise("validate-data")
-
-    def build_splits(self, run_dir: Path) -> None:
-        self._raise("build-splits")
-
-    def train_baselines(self, run_dir: Path) -> None:
-        self._raise("train-baselines")
-
-    def build_photonic_features(self, run_dir: Path) -> None:
-        self._raise("build-photonic-features")
-
-    def benchmark(self, run_dir: Path) -> None:
-        self._raise("benchmark")
-
-    def report(self, run_dir: Path) -> None:
-        self._raise("report")
-
-    def run_pilot(self, *, config: Path | None, run_dir: Path | None) -> None:
-        self._raise("run-pilot")
-
-
-services: PilotServices = UnimplementedPilotServices()
+services: PilotServices = DefaultPilotServices()
 
 
 def _run_service(action: Callable[[], None]) -> None:
@@ -80,7 +48,9 @@ def _run_service(action: Callable[[], None]) -> None:
 def init_run(config: Annotated[Path, typer.Option("--config")]) -> None:
     """Initialize a run from a validated pilot configuration."""
 
-    _run_service(lambda: services.init_run(config))
+    created = services.init_run(config)
+    if created is not None:
+        typer.echo(created)
 
 
 @app.command("validate-data")

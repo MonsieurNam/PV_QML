@@ -25,6 +25,7 @@ from pydantic import (
 )
 
 from .domain import DataProvenance, DaylightSource
+from .seeds import SeedManager
 
 NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
 PositiveInt = Annotated[StrictInt, Field(gt=0)]
@@ -367,11 +368,7 @@ class ResourcesConfig(StrictConfigModel):
 def derive_circuit_seeds(master_seed: int) -> tuple[int, ...]:
     """Derive five stable uint32 circuit seeds without global RNG state."""
 
-    seeds = []
-    for index in range(5):
-        digest = hashlib.sha256(f"pv-pilot:{master_seed}:circuit:{index}".encode()).digest()
-        seeds.append(int.from_bytes(digest[:4], byteorder="big", signed=False))
-    return tuple(seeds)
+    return SeedManager(master_seed).circuit_seeds()
 
 
 class SeedsConfig(StrictConfigModel):
