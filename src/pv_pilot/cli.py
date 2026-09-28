@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Protocol
 
@@ -67,32 +68,40 @@ class UnimplementedPilotServices:
 services: PilotServices = UnimplementedPilotServices()
 
 
+def _run_service(action: Callable[[], None]) -> None:
+    try:
+        action()
+    except NotImplementedError as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=1) from None
+
+
 @app.command("init-run")
 def init_run(config: Annotated[Path, typer.Option("--config")]) -> None:
     """Initialize a run from a validated pilot configuration."""
 
-    services.init_run(config)
+    _run_service(lambda: services.init_run(config))
 
 
 @app.command("validate-data")
 def validate_data(run_dir: Annotated[Path, typer.Option("--run-dir")]) -> None:
     """Validate and canonicalize source data."""
 
-    services.validate_data(run_dir)
+    _run_service(lambda: services.validate_data(run_dir))
 
 
 @app.command("build-splits")
 def build_splits(run_dir: Annotated[Path, typer.Option("--run-dir")]) -> None:
     """Build chronological split manifests."""
 
-    services.build_splits(run_dir)
+    _run_service(lambda: services.build_splits(run_dir))
 
 
 @app.command("train-baselines")
 def train_baselines(run_dir: Annotated[Path, typer.Option("--run-dir")]) -> None:
     """Train registered classical baselines."""
 
-    services.train_baselines(run_dir)
+    _run_service(lambda: services.train_baselines(run_dir))
 
 
 @app.command("build-photonic-features")
@@ -101,21 +110,21 @@ def build_photonic_features(
 ) -> None:
     """Build registered photonic feature artifacts."""
 
-    services.build_photonic_features(run_dir)
+    _run_service(lambda: services.build_photonic_features(run_dir))
 
 
 @app.command("benchmark")
 def benchmark(run_dir: Annotated[Path, typer.Option("--run-dir")]) -> None:
     """Run the frozen benchmark matrix."""
 
-    services.benchmark(run_dir)
+    _run_service(lambda: services.benchmark(run_dir))
 
 
 @app.command("report")
 def report(run_dir: Annotated[Path, typer.Option("--run-dir")]) -> None:
     """Render the pilot decision report."""
 
-    services.report(run_dir)
+    _run_service(lambda: services.report(run_dir))
 
 
 @app.command("run-pilot")
@@ -127,7 +136,7 @@ def run_pilot(
 
     if (config is None) == (run_dir is None):
         raise typer.BadParameter("provide exactly one of --config or --run-dir")
-    services.run_pilot(config=config, run_dir=run_dir)
+    _run_service(lambda: services.run_pilot(config=config, run_dir=run_dir))
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import posixpath
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
@@ -15,9 +16,11 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     StrictBool,
     StrictFloat,
     StrictInt,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -32,7 +35,7 @@ PositiveFloat = Annotated[StrictFloat, Field(gt=0)]
 class StrictConfigModel(BaseModel):
     """Reject unknown fields throughout the complete configuration tree."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
 
 def _reject_numeric_datetime(value: object) -> object:
@@ -42,7 +45,7 @@ def _reject_numeric_datetime(value: object) -> object:
 
 
 class ProtocolConfig(StrictConfigModel):
-    version: str = Field(min_length=1)
+    version: Literal["1.0"]
     provenance: DataProvenance
     approved_by: str | None
     approved_at: datetime | None
@@ -65,6 +68,24 @@ class PathsConfig(StrictConfigModel):
     input_data: Path
     artifact_dir: Path
 
+    @field_validator("input_data", "artifact_dir", mode="before")
+    @classmethod
+    def normalize_path_text(cls, value: object) -> object:
+        if not isinstance(value, (str, Path)):
+            return value
+        text = str(value).replace("\\", "/")
+        return Path(posixpath.normpath(text))
+
+    @field_validator("artifact_dir")
+    @classmethod
+    def artifact_path_is_safe_relative(cls, value: Path) -> Path:
+        text = value.as_posix()
+        if value.is_absolute() or value.drive:
+            raise ValueError("artifact_dir must be relative")
+        if text == ".." or text.startswith("../../"):
+            raise ValueError("artifact_dir cannot escape the project root")
+        return value
+
 
 class ColumnMappings(StrictConfigModel):
     site: str = Field(min_length=1)
@@ -75,10 +96,30 @@ class ColumnMappings(StrictConfigModel):
     temperature: str = Field(min_length=1)
     daylight: str | None = None
 
+    @field_validator("*", mode="before")
+    @classmethod
+    def normalize_column_name(cls, value: object) -> object:
+        if value is None or not isinstance(value, str):
+            return value
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("column names cannot be blank")
+        return stripped
+
 
 class AvailabilitySourceConfig(StrictConfigModel):
     column: str | None = None
     fixed_latency_minutes: NonNegativeInt | None = None
+
+    @field_validator("column", mode="before")
+    @classmethod
+    def normalize_column_name(cls, value: object) -> object:
+        if value is None or not isinstance(value, str):
+            return value
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("availability column cannot be blank")
+        return stripped
 
     @model_validator(mode="after")
     def exactly_one_policy(self) -> Self:
@@ -100,6 +141,26 @@ class DataConfig(StrictConfigModel):
     timezone: str = Field(min_length=1)
     columns: ColumnMappings
     availability: AvailabilityConfig
+
+    @model_validator(mode="after")
+    def column_roles_are_unique(self) -> Self:
+        roles: list[tuple[str, str]] = [
+            (name, value)
+            for name, value in self.columns.model_dump().items()
+            if isinstance(value, str)
+        ]
+        if self.availability.power.column is not None:
+            roles.append(("power_availability", self.availability.power.column))
+        if self.availability.weather.column is not None:
+            roles.append(("weather_availability", self.availability.weather.column))
+        seen: dict[str, str] = {}
+        for role, column in roles:
+            if column in seen:
+                raise ValueError(
+                    f"duplicate column mapping {column!r} for {seen[column]!r} and {role!r}"
+                )
+            seen[column] = role
+        return self
 
     @field_validator("raw_cadence_minutes")
     @classmethod
@@ -352,15 +413,39 @@ class PilotConfig(StrictConfigModel):
     evaluation: EvaluationConfig
     resources: ResourcesConfig
     seeds: SeedsConfig
+    _source_dir: Path | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
-    def daylight_column_is_mapped(self) -> Self:
+    def daylight_column_is_mapped(self, info: ValidationInfo) -> Self:
         if (
             self.daylight.source is DaylightSource.COLUMN
             and self.data.columns.daylight is None
         ):
             raise ValueError("column daylight requires data.columns.daylight")
+        context = info.context if isinstance(info.context, dict) else {}
+        config_dir = context.get("config_dir")
+        project_root = context.get("project_root")
+        if isinstance(config_dir, Path) and isinstance(project_root, Path):
+            resolved_artifact = (config_dir / self.paths.artifact_dir).resolve()
+            if not resolved_artifact.is_relative_to(project_root.resolve()):
+                raise ValueError("artifact_dir must resolve under the project root")
         return self
+
+    @property
+    def resolved_input_path(self) -> Path:
+        """Resolve the read-only input path against the source configuration directory."""
+
+        if self.paths.input_data.is_absolute():
+            return self.paths.input_data.resolve()
+        base = self._source_dir if self._source_dir is not None else Path.cwd()
+        return (base / self.paths.input_data).resolve()
+
+    @property
+    def resolved_artifact_path(self) -> Path:
+        """Resolve the validated artifact directory against the source config."""
+
+        base = self._source_dir if self._source_dir is not None else Path.cwd()
+        return (base / self.paths.artifact_dir).resolve()
 
     @property
     def science_decision_allowed(self) -> bool:
@@ -375,8 +460,20 @@ class PilotConfig(StrictConfigModel):
     def canonical_json(self) -> str:
         """Return deterministic JSON containing every declared configuration field."""
 
+        payload = self.model_dump(mode="json")
+        input_path = self.paths.input_data
+        payload["paths"] = {
+            "input_data": {
+                "kind": "absolute" if input_path.is_absolute() else "config-relative",
+                "value": input_path.as_posix(),
+            },
+            "artifact_dir": {
+                "kind": "config-relative",
+                "value": self.paths.artifact_dir.as_posix(),
+            },
+        }
         return json.dumps(
-            self.model_dump(mode="json"),
+            payload,
             allow_nan=False,
             ensure_ascii=False,
             separators=(",", ":"),
@@ -389,10 +486,25 @@ class PilotConfig(StrictConfigModel):
         return hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
 
 
-def _resolve_path(path: Path, config_dir: Path) -> Path:
-    if path.is_absolute():
-        return path.resolve()
-    return (config_dir / path).resolve()
+class UniqueKeySafeLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects duplicate keys at every mapping level."""
+
+
+def _construct_unique_mapping(
+    loader: UniqueKeySafeLoader, node: yaml.nodes.MappingNode, deep: bool = False
+) -> dict[Any, Any]:
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise ValueError(f"duplicate key {key!r} in YAML configuration")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping
+)
 
 
 def load_config(path: str | Path) -> PilotConfig:
@@ -401,17 +513,18 @@ def load_config(path: str | Path) -> PilotConfig:
     config_path = Path(path).resolve()
     if config_path.suffix.lower() not in {".yaml", ".yml"}:
         raise ValueError("pilot configuration must be a YAML file")
-    raw: Any = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw: Any = yaml.load(
+        config_path.read_text(encoding="utf-8"), Loader=UniqueKeySafeLoader
+    )
     if not isinstance(raw, dict):
         raise ValueError("pilot configuration root must be a mapping")
-    config = PilotConfig.model_validate(raw)
-    resolved_paths = config.paths.model_copy(
-        update={
-            "input_data": _resolve_path(config.paths.input_data, config_path.parent),
-            "artifact_dir": _resolve_path(config.paths.artifact_dir, config_path.parent),
-        }
+    config_dir = config_path.parent
+    config = PilotConfig.model_validate(
+        raw,
+        context={"config_dir": config_dir, "project_root": config_dir.parent},
     )
-    return config.model_copy(update={"paths": resolved_paths})
+    config._source_dir = config_dir
+    return config
 
 
 __all__ = ["PilotConfig", "derive_circuit_seeds", "load_config"]

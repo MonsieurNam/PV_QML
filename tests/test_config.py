@@ -104,6 +104,14 @@ def test_valid_config_exposes_approval_and_derived_circuit_seeds() -> None:
     assert len(set(config.seeds.circuit_seeds)) == 5
 
 
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+def test_config_rejects_non_finite_numbers(invalid: float) -> None:
+    payload = valid_config()
+    payload["resources"]["max_memory_gb"] = invalid
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(payload)
+
+
 def test_config_tree_is_deeply_immutable() -> None:
     config = PilotConfig.model_validate(valid_config())
     modes: Any = config.photonics.modes
@@ -191,6 +199,13 @@ def test_unknown_fields_and_coercion_are_rejected() -> None:
 
     payload = valid_config()
     payload["data"]["raw_cadence_minutes"] = "5"
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(payload)
+
+
+def test_protocol_version_is_exactly_one_point_zero() -> None:
+    payload = valid_config()
+    payload["protocol"]["version"] = "1"
     with pytest.raises(ValidationError):
         PilotConfig.model_validate(payload)
 
@@ -319,10 +334,68 @@ def test_load_config_resolves_paths_and_hash_is_stable_across_yaml_key_order(
     first = load_config(first_path)
     second = load_config(second_path)
 
-    assert first.paths.input_data == (tmp_path / "data/pv.csv").resolve()
-    assert first.paths.artifact_dir == (tmp_path / "artifacts/run").resolve()
+    assert first.resolved_input_path == (tmp_path / "data/pv.csv").resolve()
+    assert first.resolved_artifact_path == (tmp_path / "artifacts/run").resolve()
     assert first.canonical_json() == second.canonical_json()
     assert first.config_hash() == second.config_hash()
+
+
+def test_config_hash_is_independent_of_checkout_location(tmp_path: Path) -> None:
+    payload = valid_config()
+    payload["paths"]["artifact_dir"] = "../artifacts/run"
+    hashes: list[str] = []
+    for checkout in (tmp_path / "one", tmp_path / "two"):
+        config_dir = checkout / "configs"
+        config_dir.mkdir(parents=True)
+        config_path = config_dir / "pilot.yaml"
+        config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+        config = load_config(config_path)
+        hashes.append(config.config_hash())
+        assert config.resolved_artifact_path == checkout / "artifacts/run"
+    assert hashes[0] == hashes[1]
+
+
+def test_artifact_path_must_be_relative_and_stay_under_project_root(tmp_path: Path) -> None:
+    config_dir = tmp_path / "project" / "configs"
+    config_dir.mkdir(parents=True)
+    payload = valid_config()
+    for artifact_dir in (str(tmp_path / "absolute"), "../../escape"):
+        payload["paths"]["artifact_dir"] = artifact_dir
+        path = config_dir / "pilot.yaml"
+        path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+        with pytest.raises(ValidationError, match="artifact"):
+            load_config(path)
+
+
+@pytest.mark.parametrize("duplicate_key", ["provenance", "approved_by"])
+def test_load_config_rejects_duplicate_keys_at_any_level(
+    tmp_path: Path, duplicate_key: str
+) -> None:
+    source = Path(__file__).parents[1] / "configs/pilot.synthetic.yaml"
+    text = source.read_text(encoding="utf-8")
+    needle = f"  {duplicate_key}:"
+    original = next(line for line in text.splitlines() if line.startswith(needle))
+    duplicate = f"{original}\n{original}"
+    path = tmp_path / "duplicate.yaml"
+    path.write_text(text.replace(original, duplicate, 1), encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate key"):
+        load_config(path)
+
+
+def test_column_names_are_stripped_and_all_mappings_are_unique() -> None:
+    payload = valid_config()
+    payload["data"]["columns"]["site"] = "  site_id  "
+    assert PilotConfig.model_validate(payload).data.columns.site == "site_id"
+
+    payload = valid_config()
+    payload["data"]["columns"]["power"] = payload["data"]["columns"]["capacity"]
+    with pytest.raises(ValidationError, match="duplicate"):
+        PilotConfig.model_validate(payload)
+
+    payload = valid_config()
+    payload["data"]["availability"]["weather"] = {"column": " ghi_w_m2 "}
+    with pytest.raises(ValidationError, match="duplicate"):
+        PilotConfig.model_validate(payload)
 
 
 def test_example_configs_validate() -> None:
