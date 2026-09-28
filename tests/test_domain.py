@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
@@ -124,6 +125,34 @@ def test_duplicate_detail_and_nested_object_keys_are_rejected() -> None:
         )
     with pytest.raises(ValueError, match="duplicate"):
         FrozenJsonObject((DetailEntry("same", 1), DetailEntry("same", 2)))
+
+
+def test_stage_result_standard_json_round_trips_frozen_nested_details() -> None:
+    record = StageResult(
+        stage="validate-data",
+        status=StageStatus.SUCCESS,
+        details=(
+            DetailEntry(
+                "summary",
+                {
+                    "count": 2,
+                    "items": [1, {"valid": True, "reason": None}],
+                },
+            ),
+        ),
+    )
+
+    serialized = record.model_dump_json()
+    payload = json.loads(serialized)
+
+    assert payload["details"] == {
+        "summary": {
+            "count": 2,
+            "items": [1, {"reason": None, "valid": True}],
+        }
+    }
+    assert "entries" not in serialized
+    assert StageResult.model_validate_json(serialized) == record
 
 
 @pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])

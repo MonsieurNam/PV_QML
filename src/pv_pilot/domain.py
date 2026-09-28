@@ -15,7 +15,15 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any, Literal, Self
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 
 class StageStatus(StrEnum):
@@ -106,6 +114,16 @@ def freeze_json(value: Any) -> FrozenJsonValue:
     raise ValueError(f"unsupported JSON value type: {type(value).__name__}")
 
 
+def thaw_json(value: FrozenJsonValue) -> Any:
+    """Convert canonical frozen JSON data back to ordinary JSON objects and arrays."""
+
+    if isinstance(value, FrozenJsonObject):
+        return {entry.key: thaw_json(entry.value) for entry in value.entries}
+    if isinstance(value, tuple):
+        return [thaw_json(item) for item in value]
+    return value
+
+
 class QuantileValue(VersionedRecord):
     """One quantile probability and forecast value."""
 
@@ -122,6 +140,13 @@ class StageResult(VersionedRecord):
     artifacts: tuple[Path, ...] = ()
     details: tuple[DetailEntry, ...] = ()
 
+    @field_validator("details", mode="before")
+    @classmethod
+    def parse_json_details(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return tuple(DetailEntry(key=key, value=item) for key, item in value.items())
+        return value
+
     @field_validator("details")
     @classmethod
     def details_are_unique_and_sorted(
@@ -132,6 +157,10 @@ class StageResult(VersionedRecord):
         if len(keys) != len(set(keys)):
             raise ValueError("duplicate detail keys are not allowed")
         return ordered
+
+    @field_serializer("details", when_used="json")
+    def serialize_json_details(self, value: tuple[DetailEntry, ...]) -> dict[str, Any]:
+        return {entry.key: thaw_json(entry.value) for entry in value}
 
 
 class CanonicalRow(VersionedRecord):
@@ -303,4 +332,5 @@ __all__ = [
     "deterministic_data",
     "deterministic_json",
     "freeze_json",
+    "thaw_json",
 ]
