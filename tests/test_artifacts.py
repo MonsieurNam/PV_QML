@@ -473,6 +473,62 @@ def test_publication_rollback_recovers_from_interrupt_after_quarantine_move(
     assert not any(path.name.startswith(".rollback-") for path in output.parent.iterdir())
 
 
+@pytest.mark.parametrize("line_event", range(1, 9))
+def test_publication_rollback_retries_line_interrupts_before_atomic_acquisition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    line_event: int,
+) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    output = store.root / "validate-data/validated.csv"
+    marker = store.root / "validate-data/stage_manifest.json"
+    original_publish = store._publish_temp
+    previous_trace = sys.gettrace()
+    rollback_lines = 0
+    interruption_injected = False
+
+    def interrupt_before_marker(
+        source: Path,
+        destination: Path,
+        publications: list[Any] | None = None,
+    ) -> None:
+        if destination == marker:
+            raise KeyboardInterrupt
+        original_publish(source, destination, publications)
+
+    def interrupt_rollback_line(frame: Any, event: str, argument: object) -> Any:
+        del argument
+        nonlocal interruption_injected, rollback_lines
+        if frame.f_code.co_name == "rollback" and event == "line":
+            rollback_lines += 1
+            if rollback_lines == line_event:
+                interruption_injected = True
+                raise KeyboardInterrupt
+        return interrupt_rollback_line
+
+    monkeypatch.setattr(store, "_publish_temp", interrupt_before_marker)
+    sys.settrace(interrupt_rollback_line)
+    try:
+        with (
+            pytest.raises(KeyboardInterrupt),
+            store.stage("validate-data", now=FIXED_NOW) as transaction,
+        ):
+            transaction.write_text("validated.csv", "transaction")
+    finally:
+        sys.settrace(previous_trace)
+
+    assert interruption_injected
+    assert not output.exists()
+    assert not marker.exists()
+    assert not any(path.name.startswith(".rollback-") for path in output.parent.iterdir())
+
+    monkeypatch.setattr(store, "_publish_temp", original_publish)
+    with store.stage("validate-data", now=FIXED_NOW) as retry:
+        retry.write_text("validated.csv", "retry")
+    assert output.is_file()
+    assert marker.is_file()
+
+
 def test_downstream_rejects_tampered_prerequisite_manifest_chain(tmp_path: Path) -> None:
     store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
     with store.stage("validate-data", now=FIXED_NOW) as transaction:

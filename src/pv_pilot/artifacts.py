@@ -17,6 +17,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal, Self
+from uuid import uuid4
 
 from .config import LoadedPilotConfig
 from .seeds import SeedManager
@@ -64,6 +65,17 @@ class PublicationOwnership:
     destination: Path
     source_device: int
     source_inode: int
+    quarantine_root: Path
+
+    @property
+    def quarantine(self) -> Path:
+        return self.quarantine_root / "entry"
+
+    def prepare(self) -> None:
+        self.quarantine_root.mkdir()
+
+    def release(self) -> None:
+        self.quarantine_root.rmdir()
 
     def _is_owned(self, path: Path) -> bool:
         path_stat = path.stat(follow_symlinks=False)
@@ -82,52 +94,33 @@ class PublicationOwnership:
             f"{quarantine}"
         )
 
-    def _settle_quarantine(self, quarantine: Path) -> None:
+    def _settle_quarantine(self, quarantine: Path) -> bool:
         try:
             owned = self._is_owned(quarantine)
         except FileNotFoundError:
-            return
+            return False
         if owned:
             quarantine.unlink()
-            return
-        self._restore_foreign(quarantine)
-
-    def _recover_quarantine(
-        self, quarantine: Path, interrupted_operation: BaseException
-    ) -> None:
-        try:
-            self._settle_quarantine(quarantine)
-        except BaseException as recovery_error:
-            interrupted_operation.add_note(
-                f"publication quarantine recovery failed: {recovery_error}"
-            )
+        else:
+            self._restore_foreign(quarantine)
+        return True
 
     def rollback(self) -> None:
         """Atomically acquire the destination before deciding whether to delete it."""
 
-        quarantine_root = Path(
-            tempfile.mkdtemp(
-                prefix=f".rollback-{self.destination.name}-",
-                dir=self.destination.parent,
-            )
-        )
-        quarantine = quarantine_root / "entry"
+        quarantine = self.quarantine
         try:
+            self.quarantine_root.mkdir(exist_ok=True)
+            if self._settle_quarantine(quarantine):
+                return
             try:
                 os.rename(self.destination, quarantine)
             except FileNotFoundError:
                 return
-            except BaseException as move_error:
-                self._recover_quarantine(quarantine, move_error)
-                raise
-            try:
-                self._settle_quarantine(quarantine)
-            except BaseException as settle_error:
-                self._recover_quarantine(quarantine, settle_error)
-                raise
+            self._settle_quarantine(quarantine)
         finally:
             with suppress(OSError):
-                quarantine_root.rmdir()
+                self.release()
 
 
 def sha256_file(path: str | Path) -> str:
@@ -332,9 +325,22 @@ class RunStore:
             try:
                 publication.rollback()
             except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
+                try:
+                    publication.rollback()
+                except BaseException as retry_error:
+                    cleanup_error.add_note(
+                        f"publication cleanup retry failed: {retry_error}"
+                    )
+                    cleanup_errors.append(cleanup_error)
         for recorded_cleanup_error in cleanup_errors:
             error.add_note(f"publication cleanup failed: {recorded_cleanup_error}")
+
+    @staticmethod
+    def _release_publications(
+        publications: Iterable[PublicationOwnership],
+    ) -> None:
+        for publication in publications:
+            publication.release()
 
     def _publish_temp(
         self,
@@ -349,13 +355,19 @@ class RunStore:
             destination=destination,
             source_device=source_stat.st_dev,
             source_inode=source_stat.st_ino,
+            quarantine_root=destination.parent
+            / f".rollback-{destination.name}-{uuid4().hex}",
         )
+        local_publication = publications is None
         if publications is None:
             publications = []
         publications.append(ownership)
         try:
+            ownership.prepare()
             os.link(source, destination)
             source.unlink()
+            if local_publication:
+                ownership.release()
         except BaseException as error:
             self._rollback_publications((ownership,), error)
             try:
@@ -643,6 +655,7 @@ class StageTransaction:
                 _canonical_json(manifest).encode("utf-8"),
                 published,
             )
+            self._store._release_publications(published)
         except BaseException as error:
             self._store._rollback_publications(published, error)
             raise
