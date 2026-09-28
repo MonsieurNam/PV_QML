@@ -15,10 +15,16 @@ def test_perceval_compatibility_probe_exercises_required_paths() -> None:
     assert isinstance(report, PercevalCompatibility)
     assert report.backend_name == "SLOS"
     assert report.backend_class
-    assert report.full_distribution_size > 0
+    assert report.full_distribution_size == 2
     assert report.full_distribution_probability == pytest.approx(1.0)
-    assert report.distinguishable_distribution_size > 0
+    assert report.indistinguishable_left_bunch_probability == pytest.approx(0.5)
+    assert report.indistinguishable_coincidence_probability == pytest.approx(0.0)
+    assert report.indistinguishable_right_bunch_probability == pytest.approx(0.5)
+    assert report.distinguishable_distribution_size == 3
     assert report.distinguishable_distribution_probability == pytest.approx(1.0)
+    assert report.distinguishable_left_bunch_probability == pytest.approx(0.25)
+    assert report.distinguishable_coincidence_probability == pytest.approx(0.5)
+    assert report.distinguishable_right_bunch_probability == pytest.approx(0.25)
 
 
 def test_perceval_compatibility_probe_runs_in_a_fresh_python_process() -> None:
@@ -40,4 +46,10 @@ print(json.dumps(asdict(verify_perceval_compatibility(seed=23)), sort_keys=True)
     report = json.loads(completed.stdout)
     assert report["backend_name"] == "SLOS"
     assert report["full_distribution_probability"] == pytest.approx(1.0)
+    assert report["indistinguishable_left_bunch_probability"] == pytest.approx(0.5)
+    assert report["indistinguishable_coincidence_probability"] == pytest.approx(0.0)
+    assert report["indistinguishable_right_bunch_probability"] == pytest.approx(0.5)
     assert report["distinguishable_distribution_probability"] == pytest.approx(1.0)
+    assert report["distinguishable_left_bunch_probability"] == pytest.approx(0.25)
+    assert report["distinguishable_coincidence_probability"] == pytest.approx(0.5)
+    assert report["distinguishable_right_bunch_probability"] == pytest.approx(0.25)
