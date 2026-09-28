@@ -104,6 +104,16 @@ def test_valid_config_exposes_approval_and_derived_circuit_seeds() -> None:
     assert len(set(config.seeds.circuit_seeds)) == 5
 
 
+def test_config_tree_is_deeply_immutable() -> None:
+    config = PilotConfig.model_validate(valid_config())
+    modes: Any = config.photonics.modes
+
+    with pytest.raises(ValidationError):
+        config.target.horizon_minutes = 30
+    with pytest.raises(AttributeError):
+        modes.append(8)
+
+
 def test_synthetic_or_unapproved_protocol_cannot_authorize_science_decision() -> None:
     synthetic = valid_config()
     synthetic["protocol"] = {
@@ -144,7 +154,7 @@ def test_protocol_literals_cannot_drift(path: tuple[str, str], invalid_value: ob
 def test_photonic_modes_may_select_a_nonempty_subset_of_four_and_six() -> None:
     payload = valid_config()
     payload["photonics"]["modes"] = [4]
-    assert PilotConfig.model_validate(payload).photonics.modes == [4]
+    assert PilotConfig.model_validate(payload).photonics.modes == (4,)
 
 
 @pytest.mark.parametrize(
@@ -250,6 +260,36 @@ def test_split_cutoffs_must_be_utc_and_strictly_ordered() -> None:
     payload["split"]["test_end_utc"] = "2026-01-01T00:00:00+07:00"
     with pytest.raises(ValidationError):
         PilotConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("section", "field"),
+    [
+        ("protocol", "approved_at"),
+        ("split", "train_end_utc"),
+        ("split", "validation_end_utc"),
+        ("split", "test_end_utc"),
+    ],
+)
+def test_datetime_fields_reject_numeric_timestamps(section: str, field: str) -> None:
+    payload = valid_config()
+    payload[section][field] = 0
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(payload)
+
+
+def test_datetime_fields_accept_iso_strings_and_yaml_datetime_objects() -> None:
+    payload = valid_config()
+    parsed = yaml.safe_load(yaml.safe_dump(payload))
+    parsed["protocol"]["approved_at"] = "2026-09-28T00:00:00Z"
+    parsed["split"]["train_end_utc"] = yaml.safe_load("2025-01-01T00:00:00Z")
+    parsed["split"]["validation_end_utc"] = yaml.safe_load("2025-06-01T00:00:00Z")
+    parsed["split"]["test_end_utc"] = yaml.safe_load("2026-01-01T00:00:00Z")
+
+    config = PilotConfig.model_validate(parsed)
+
+    assert config.protocol.approved_at is not None
+    assert config.split.train_end_utc.utcoffset() is not None
 
 
 def test_daylight_source_requires_its_matching_metadata() -> None:

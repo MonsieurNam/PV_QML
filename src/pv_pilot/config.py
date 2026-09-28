@@ -32,7 +32,13 @@ PositiveFloat = Annotated[StrictFloat, Field(gt=0)]
 class StrictConfigModel(BaseModel):
     """Reject unknown fields throughout the complete configuration tree."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+def _reject_numeric_datetime(value: object) -> object:
+    if value is not None and not isinstance(value, (str, datetime)):
+        raise ValueError("datetime values must be ISO strings or datetime objects")
+    return value
 
 
 class ProtocolConfig(StrictConfigModel):
@@ -40,6 +46,11 @@ class ProtocolConfig(StrictConfigModel):
     provenance: DataProvenance
     approved_by: str | None
     approved_at: datetime | None
+
+    @field_validator("approved_at", mode="before")
+    @classmethod
+    def approval_datetime_has_documented_input_type(cls, value: object) -> object:
+        return _reject_numeric_datetime(value)
 
     @model_validator(mode="after")
     def approval_is_complete_or_empty(self) -> Self:
@@ -123,6 +134,11 @@ class SplitConfig(StrictConfigModel):
     validation_end_utc: datetime
     test_end_utc: datetime
 
+    @field_validator("train_end_utc", "validation_end_utc", "test_end_utc", mode="before")
+    @classmethod
+    def cutoff_has_documented_input_type(cls, value: object) -> object:
+        return _reject_numeric_datetime(value)
+
     @model_validator(mode="after")
     def cutoffs_are_ordered_utc(self) -> Self:
         cutoffs = (self.train_end_utc, self.validation_end_utc, self.test_end_utc)
@@ -152,19 +168,19 @@ class DaylightConfig(StrictConfigModel):
 
 
 class FeaturesConfig(StrictConfigModel):
-    matched_4_mode_power_lags_minutes: list[NonNegativeInt]
-    matched_6_mode_power_lags_minutes: list[NonNegativeInt]
+    matched_4_mode_power_lags_minutes: tuple[NonNegativeInt, ...]
+    matched_6_mode_power_lags_minutes: tuple[NonNegativeInt, ...]
     include_current_ghi: StrictBool
     include_current_temperature: StrictBool
-    strong_xgb_power_lags_minutes: list[NonNegativeInt]
+    strong_xgb_power_lags_minutes: tuple[NonNegativeInt, ...]
 
     @model_validator(mode="after")
     def grids_are_protocol_literals(self) -> Self:
-        if self.matched_4_mode_power_lags_minutes != [0, 15]:
+        if self.matched_4_mode_power_lags_minutes != (0, 15):
             raise ValueError("4-mode matched power lags must be [0, 15]")
-        if self.matched_6_mode_power_lags_minutes != [0, 5, 15, 60]:
+        if self.matched_6_mode_power_lags_minutes != (0, 5, 15, 60):
             raise ValueError("6-mode matched power lags must be [0, 5, 15, 60]")
-        if self.strong_xgb_power_lags_minutes != [0, 5, 10, 15, 30, 60]:
+        if self.strong_xgb_power_lags_minutes != (0, 5, 10, 15, 30, 60):
             raise ValueError("strong XGBoost power lags must be [0, 5, 10, 15, 30, 60]")
         if not self.include_current_ghi or not self.include_current_temperature:
             raise ValueError("matched feature grids require current GHI and temperature")
@@ -172,12 +188,12 @@ class FeaturesConfig(StrictConfigModel):
 
 
 class PhotonicsConfig(StrictConfigModel):
-    modes: list[PositiveInt]
+    modes: tuple[PositiveInt, ...]
     primary_photons: PositiveInt
     max_photons: PositiveInt
     backend: Literal["SLOS"]
-    phase_scales: list[PositiveFloat]
-    raw_attempt_budgets: list[PositiveInt]
+    phase_scales: tuple[PositiveFloat, ...]
+    raw_attempt_budgets: tuple[PositiveInt, ...]
 
     @model_validator(mode="after")
     def protocol_literals_are_locked(self) -> Self:
@@ -191,27 +207,27 @@ class PhotonicsConfig(StrictConfigModel):
             raise ValueError("primary_photons must be 2")
         if self.max_photons < self.primary_photons or self.max_photons > 3:
             raise ValueError("max_photons must include the primary and cannot exceed 3")
-        if self.phase_scales != [math.pi / 2, math.pi]:
+        if self.phase_scales != (math.pi / 2, math.pi):
             raise ValueError("phase_scales must be exactly [pi/2, pi]")
-        if self.raw_attempt_budgets != [1000, 10000]:
+        if self.raw_attempt_budgets != (1000, 10000):
             raise ValueError("raw_attempt_budgets must be exactly [1000, 10000]")
         return self
 
 
 class RFFConfig(StrictConfigModel):
-    gamma_grid: list[PositiveFloat]
+    gamma_grid: tuple[PositiveFloat, ...]
     n_components: Literal["fock_dimension"]
 
     @model_validator(mode="after")
     def gamma_grid_is_locked(self) -> Self:
-        if self.gamma_grid != [0.1, 1.0, 10.0]:
+        if self.gamma_grid != (0.1, 1.0, 10.0):
             raise ValueError("RFF gamma_grid must be [0.1, 1.0, 10.0]")
         return self
 
 
 class XGBoostConfig(StrictConfigModel):
-    max_depth_grid: list[PositiveInt]
-    learning_rate_grid: list[PositiveFloat]
+    max_depth_grid: tuple[PositiveInt, ...]
+    learning_rate_grid: tuple[PositiveFloat, ...]
     n_estimators: StrictInt
     subsample: StrictFloat
     colsample_bytree: StrictFloat
@@ -222,9 +238,9 @@ class XGBoostConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def grids_are_locked(self) -> Self:
-        if self.max_depth_grid != [3, 6]:
+        if self.max_depth_grid != (3, 6):
             raise ValueError("XGBoost max_depth_grid must be [3, 6]")
-        if self.learning_rate_grid != [0.03, 0.1]:
+        if self.learning_rate_grid != (0.03, 0.1):
             raise ValueError("XGBoost learning_rate_grid must be [0.03, 0.1]")
         if self.n_estimators != 300 or self.n_jobs != 1:
             raise ValueError("XGBoost requires n_estimators=300 and n_jobs=1")
@@ -234,26 +250,26 @@ class XGBoostConfig(StrictConfigModel):
 
 
 class ModelsConfig(StrictConfigModel):
-    quantile_alpha_grid: list[PositiveFloat]
+    quantile_alpha_grid: tuple[PositiveFloat, ...]
     rff: RFFConfig
     xgboost: XGBoostConfig
 
     @model_validator(mode="after")
     def alpha_grid_is_locked(self) -> Self:
-        if self.quantile_alpha_grid != [0.0001, 0.001, 0.01, 0.1]:
+        if self.quantile_alpha_grid != (0.0001, 0.001, 0.01, 0.1):
             raise ValueError("quantile_alpha_grid must be [0.0001, 0.001, 0.01, 0.1]")
         return self
 
 
 class BootstrapConfig(StrictConfigModel):
     block_days: StrictInt
-    sensitivity_block_days: list[PositiveInt]
+    sensitivity_block_days: tuple[PositiveInt, ...]
     replicates: StrictInt
     min_valid_blocks: StrictInt
 
     @model_validator(mode="after")
     def sensitivity_is_locked(self) -> Self:
-        if self.sensitivity_block_days != [2, 7]:
+        if self.sensitivity_block_days != (2, 7):
             raise ValueError("bootstrap sensitivity_block_days must be [2, 7]")
         if (self.block_days, self.replicates, self.min_valid_blocks) != (1, 2000, 20):
             raise ValueError(
@@ -263,16 +279,16 @@ class BootstrapConfig(StrictConfigModel):
 
 
 class EvaluationConfig(StrictConfigModel):
-    quantiles: list[PositiveFloat]
+    quantiles: tuple[PositiveFloat, ...]
     bootstrap: BootstrapConfig
     minimum_relative_wis_skill: StrictFloat
-    coverage_acceptance: list[PositiveFloat]
+    coverage_acceptance: tuple[PositiveFloat, ...]
 
     @model_validator(mode="after")
     def grids_are_locked(self) -> Self:
-        if self.quantiles != [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95]:
+        if self.quantiles != (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95):
             raise ValueError("evaluation quantiles do not match the frozen protocol")
-        if self.coverage_acceptance != [0.85, 0.95]:
+        if self.coverage_acceptance != (0.85, 0.95):
             raise ValueError("coverage_acceptance must be [0.85, 0.95]")
         if self.minimum_relative_wis_skill != 0.02:
             raise ValueError("minimum_relative_wis_skill must be 0.02")
@@ -285,26 +301,38 @@ class ResourcesConfig(StrictConfigModel):
     max_workers: PositiveInt
 
 
-def derive_circuit_seeds(master_seed: int) -> list[int]:
+def derive_circuit_seeds(master_seed: int) -> tuple[int, ...]:
     """Derive five stable uint32 circuit seeds without global RNG state."""
 
     seeds = []
     for index in range(5):
         digest = hashlib.sha256(f"pv-pilot:{master_seed}:circuit:{index}".encode()).digest()
         seeds.append(int.from_bytes(digest[:4], byteorder="big", signed=False))
-    return seeds
+    return tuple(seeds)
 
 
 class SeedsConfig(StrictConfigModel):
     master_seed: NonNegativeInt = 20260928
-    circuit_seeds: list[NonNegativeInt] = Field(default_factory=list)
+    circuit_seeds: tuple[NonNegativeInt, ...] = ()
+
+    @model_validator(mode="before")
+    @classmethod
+    def supply_derived_circuit_seeds(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        values = dict(value)
+        master_seed = values.get("master_seed", 20260928)
+        if isinstance(master_seed, bool) or not isinstance(master_seed, int):
+            return values
+        expected = derive_circuit_seeds(master_seed)
+        configured = values.get("circuit_seeds")
+        if configured is None or configured == [] or configured == ():
+            values["circuit_seeds"] = expected
+        return values
 
     @model_validator(mode="after")
-    def circuit_seeds_are_derived(self) -> Self:
-        expected = derive_circuit_seeds(self.master_seed)
-        if not self.circuit_seeds:
-            self.circuit_seeds = expected
-        elif self.circuit_seeds != expected:
+    def circuit_seeds_match_master(self) -> Self:
+        if self.circuit_seeds != derive_circuit_seeds(self.master_seed):
             raise ValueError("circuit_seeds must be the five values derived from master_seed")
         return self
 
