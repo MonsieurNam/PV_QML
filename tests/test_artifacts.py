@@ -207,6 +207,51 @@ def test_stage_exception_leaves_no_outputs_or_success_marker(tmp_path: Path) -> 
     assert not any(path.name.startswith(".stage-") for path in store.root.iterdir())
 
 
+@pytest.mark.parametrize("interrupted_publish", ["output", "marker"])
+def test_post_link_interruption_rolls_back_and_stage_can_rerun(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupted_publish: str,
+) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    original_unlink = Path.unlink
+    interruption_injected = False
+
+    def interrupt_first_matching_unlink(
+        path: Path, *, missing_ok: bool = False
+    ) -> None:
+        nonlocal interruption_injected
+        is_output_temp = (
+            path.name == "validated.csv" and path.parent.name.startswith(".stage-")
+        )
+        is_marker_temp = path.suffix == ".tmp" and path.parent.name == "validate-data"
+        selected = is_marker_temp if interrupted_publish == "marker" else is_output_temp
+        if selected and not interruption_injected:
+            interruption_injected = True
+            raise KeyboardInterrupt
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", interrupt_first_matching_unlink)
+    with (
+        pytest.raises(KeyboardInterrupt),
+        store.stage("validate-data", now=FIXED_NOW) as transaction,
+    ):
+        transaction.write_text("validated.csv", "ok")
+
+    output = store.root / "validate-data/validated.csv"
+    marker = store.root / "validate-data/stage_manifest.json"
+    assert not output.exists()
+    assert not marker.exists()
+    assert list(store.root.rglob("*.tmp")) == []
+    assert not any(path.name.startswith(".stage-") for path in store.root.iterdir())
+
+    monkeypatch.setattr(Path, "unlink", original_unlink)
+    with store.stage("validate-data", now=FIXED_NOW) as retry:
+        retry.write_text("validated.csv", "ok")
+    assert output.is_file()
+    assert marker.is_file()
+
+
 def test_downstream_rejects_tampered_prerequisite_manifest_chain(tmp_path: Path) -> None:
     store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
     with store.stage("validate-data", now=FIXED_NOW) as transaction:

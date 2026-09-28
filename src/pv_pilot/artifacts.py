@@ -249,12 +249,32 @@ class RunStore:
         return resolved
 
     def _publish_temp(self, source: Path, destination: Path) -> None:
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError(f"artifact already exists: {destination}")
+        source_stat = source.stat(follow_symlinks=False)
         try:
             os.link(source, destination)
-        except FileExistsError:
+            source.unlink()
+        except BaseException as error:
+            cleanup_errors: list[OSError] = []
+            try:
+                destination_stat = destination.stat(follow_symlinks=False)
+                if (
+                    destination_stat.st_dev == source_stat.st_dev
+                    and destination_stat.st_ino == source_stat.st_ino
+                ):
+                    destination.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as destination_cleanup_error:
+                cleanup_errors.append(destination_cleanup_error)
+            try:
+                source.unlink(missing_ok=True)
+            except OSError as source_cleanup_error:
+                cleanup_errors.append(source_cleanup_error)
+            for recorded_cleanup_error in cleanup_errors:
+                error.add_note(f"publication cleanup failed: {recorded_cleanup_error}")
             raise
-        finally:
-            source.unlink(missing_ok=True)
 
     def write_bytes(self, relative_path: str | Path, data: bytes) -> Path:
         """Atomically publish bytes inside the run without overwriting a file."""
@@ -520,7 +540,10 @@ class StageTransaction:
                 "started_at": _timestamp(self._started_at),
                 "status": "SUCCESS",
             }
-            self._store.write_json(f"{self.stage}/stage_manifest.json", manifest)
+            marker = self._store.write_json(
+                f"{self.stage}/stage_manifest.json", manifest
+            )
+            published.append(marker)
         except BaseException:
             for path in published:
                 path.unlink(missing_ok=True)
