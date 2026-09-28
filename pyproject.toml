@@ -23,12 +23,16 @@ dependencies = [
     "xgboost",
 ]
 
+[project.scripts]
+pv-pilot = "pv_pilot.cli:app"
+
 [dependency-groups]
 dev = [
     "mypy",
     "pytest",
     "pytest-cov",
     "ruff",
+    "types-pyyaml",
 ]
 
 [tool.hatch.build.targets.wheel]

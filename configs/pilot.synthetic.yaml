@@ -1,0 +1,77 @@
+protocol:
+  version: "1.0"
+  provenance: synthetic
+  approved_by: null
+  approved_at: null
+paths:
+  input_data: ../tests/fixtures/synthetic_pv.csv
+  artifact_dir: ../artifacts/pilot-synthetic
+data:
+  format: csv
+  raw_cadence_minutes: 5
+  timezone: UTC
+  columns:
+    site: site_id
+    timestamp: timestamp
+    power: power_kw
+    capacity: capacity_kw
+    ghi: ghi_w_m2
+    temperature: temperature_c
+    daylight: is_daylight
+  availability:
+    power:
+      fixed_latency_minutes: 0
+    weather:
+      fixed_latency_minutes: 0
+target:
+  interval_minutes: 5
+  horizon_minutes: 15
+split:
+  train_end_utc: "2024-12-31T23:59:59Z"
+  validation_end_utc: "2025-06-30T23:59:59Z"
+  test_end_utc: "2025-12-31T23:59:59Z"
+daylight:
+  source: column
+features:
+  matched_4_mode_power_lags_minutes: [0, 15]
+  matched_6_mode_power_lags_minutes: [0, 5, 15, 60]
+  include_current_ghi: true
+  include_current_temperature: true
+  strong_xgb_power_lags_minutes: [0, 5, 10, 15, 30, 60]
+photonics:
+  modes: [4, 6]
+  primary_photons: 2
+  max_photons: 3
+  backend: SLOS
+  phase_scales: [1.5707963267948966, 3.141592653589793]
+  raw_attempt_budgets: [1000, 10000]
+models:
+  quantile_alpha_grid: [0.0001, 0.001, 0.01, 0.1]
+  rff:
+    gamma_grid: [0.1, 1.0, 10.0]
+    n_components: fock_dimension
+  xgboost:
+    max_depth_grid: [3, 6]
+    learning_rate_grid: [0.03, 0.1]
+    n_estimators: 300
+    subsample: 1.0
+    colsample_bytree: 1.0
+    reg_lambda: 1.0
+    tree_method: hist
+    n_jobs: 1
+    objective: reg:quantileerror
+evaluation:
+  quantiles: [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95]
+  bootstrap:
+    block_days: 1
+    sensitivity_block_days: [2, 7]
+    replicates: 2000
+    min_valid_blocks: 20
+  minimum_relative_wis_skill: 0.02
+  coverage_acceptance: [0.85, 0.95]
+resources:
+  max_wall_clock_seconds: 3600
+  max_memory_gb: 8.0
+  max_workers: 1
+seeds:
+  master_seed: 20260928

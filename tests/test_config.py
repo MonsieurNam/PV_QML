@@ -1,0 +1,295 @@
+from __future__ import annotations
+
+import copy
+import math
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+from pydantic import ValidationError
+
+from pv_pilot.config import PilotConfig, load_config
+
+
+def valid_config() -> dict[str, Any]:
+    return {
+        "protocol": {
+            "version": "1.0",
+            "provenance": "real",
+            "approved_by": "Quang",
+            "approved_at": "2026-09-28T00:00:00Z",
+        },
+        "paths": {"input_data": "data/pv.csv", "artifact_dir": "artifacts/run"},
+        "data": {
+            "format": "csv",
+            "raw_cadence_minutes": 5,
+            "timezone": "Asia/Ho_Chi_Minh",
+            "columns": {
+                "site": "site_id",
+                "timestamp": "timestamp",
+                "power": "power_kw",
+                "capacity": "capacity_kw",
+                "ghi": "ghi_w_m2",
+                "temperature": "temperature_c",
+            },
+            "availability": {
+                "power": {"fixed_latency_minutes": 0},
+                "weather": {"column": "weather_available_at"},
+            },
+        },
+        "target": {"interval_minutes": 5, "horizon_minutes": 15},
+        "split": {
+            "train_end_utc": "2025-01-01T00:00:00Z",
+            "validation_end_utc": "2025-06-01T00:00:00Z",
+            "test_end_utc": "2026-01-01T00:00:00Z",
+        },
+        "daylight": {"source": "solar_elevation", "latitude": 10.82, "longitude": 106.63},
+        "features": {
+            "matched_4_mode_power_lags_minutes": [0, 15],
+            "matched_6_mode_power_lags_minutes": [0, 5, 15, 60],
+            "include_current_ghi": True,
+            "include_current_temperature": True,
+            "strong_xgb_power_lags_minutes": [0, 5, 10, 15, 30, 60],
+        },
+        "photonics": {
+            "modes": [4, 6],
+            "primary_photons": 2,
+            "max_photons": 3,
+            "backend": "SLOS",
+            "phase_scales": [math.pi / 2, math.pi],
+            "raw_attempt_budgets": [1000, 10000],
+        },
+        "models": {
+            "quantile_alpha_grid": [0.0001, 0.001, 0.01, 0.1],
+            "rff": {"gamma_grid": [0.1, 1.0, 10.0], "n_components": "fock_dimension"},
+            "xgboost": {
+                "max_depth_grid": [3, 6],
+                "learning_rate_grid": [0.03, 0.1],
+                "n_estimators": 300,
+                "subsample": 1.0,
+                "colsample_bytree": 1.0,
+                "reg_lambda": 1.0,
+                "tree_method": "hist",
+                "n_jobs": 1,
+                "objective": "reg:quantileerror",
+            },
+        },
+        "evaluation": {
+            "quantiles": [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95],
+            "bootstrap": {
+                "block_days": 1,
+                "sensitivity_block_days": [2, 7],
+                "replicates": 2000,
+                "min_valid_blocks": 20,
+            },
+            "minimum_relative_wis_skill": 0.02,
+            "coverage_acceptance": [0.85, 0.95],
+        },
+        "resources": {
+            "max_wall_clock_seconds": 3600,
+            "max_memory_gb": 8.0,
+            "max_workers": 1,
+        },
+        "seeds": {"master_seed": 20260928},
+    }
+
+
+def test_valid_config_exposes_approval_and_derived_circuit_seeds() -> None:
+    config = PilotConfig.model_validate(valid_config())
+
+    assert config.science_decision_allowed is True
+    assert config.seeds.master_seed == 20260928
+    assert len(config.seeds.circuit_seeds) == 5
+    assert len(set(config.seeds.circuit_seeds)) == 5
+
+
+def test_synthetic_or_unapproved_protocol_cannot_authorize_science_decision() -> None:
+    synthetic = valid_config()
+    synthetic["protocol"] = {
+        "version": "1.0",
+        "provenance": "synthetic",
+        "approved_by": None,
+        "approved_at": None,
+    }
+    assert PilotConfig.model_validate(synthetic).science_decision_allowed is False
+
+
+@pytest.mark.parametrize(
+    ("path", "invalid_value"),
+    [
+        (("data", "raw_cadence_minutes"), 2),
+        (("data", "format"), "json"),
+        (("target", "interval_minutes"), 10),
+        (("target", "horizon_minutes"), 30),
+        (("photonics", "modes"), [4, 8]),
+        (("photonics", "primary_photons"), 3),
+        (("photonics", "max_photons"), 4),
+        (("photonics", "backend"), "Naive"),
+        (("photonics", "phase_scales"), [math.pi]),
+        (("models", "quantile_alpha_grid"), [0.001, 0.01]),
+        (("evaluation", "quantiles"), [0.1, 0.5, 0.9]),
+        (("evaluation", "minimum_relative_wis_skill"), 0.01),
+        (("evaluation", "coverage_acceptance"), [0.8, 0.95]),
+    ],
+)
+def test_protocol_literals_cannot_drift(path: tuple[str, str], invalid_value: object) -> None:
+    payload = valid_config()
+    payload[path[0]][path[1]] = invalid_value
+
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(payload)
+
+
+def test_photonic_modes_may_select_a_nonempty_subset_of_four_and_six() -> None:
+    payload = valid_config()
+    payload["photonics"]["modes"] = [4]
+    assert PilotConfig.model_validate(payload).photonics.modes == [4]
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "invalid_value"),
+    [
+        ("features", "matched_4_mode_power_lags_minutes", [0, 10]),
+        ("features", "matched_6_mode_power_lags_minutes", [0, 15, 30, 60]),
+        ("features", "strong_xgb_power_lags_minutes", [0, 15, 60]),
+        ("models", "rff", {"gamma_grid": [1.0], "n_components": "fock_dimension"}),
+        (
+            "models",
+            "xgboost",
+            {
+                **valid_config()["models"]["xgboost"],
+                "max_depth_grid": [2, 4],
+            },
+        ),
+    ],
+)
+def test_feature_and_model_grids_are_locked(
+    section: str, field: str, invalid_value: object
+) -> None:
+    payload = valid_config()
+    payload[section][field] = invalid_value
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(payload)
+
+
+def test_unknown_fields_and_coercion_are_rejected() -> None:
+    payload = valid_config()
+    payload["surprise"] = True
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        PilotConfig.model_validate(payload)
+
+    payload = valid_config()
+    payload["data"]["raw_cadence_minutes"] = "5"
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("section", "field"),
+    [
+        ("data", "raw_cadence_minutes"),
+        ("target", "interval_minutes"),
+        ("target", "horizon_minutes"),
+    ],
+)
+def test_integer_protocol_fields_reject_equal_float_values(section: str, field: str) -> None:
+    payload = valid_config()
+    payload[section][field] = float(payload[section][field])
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ("models", "xgboost", "n_estimators"),
+        ("models", "xgboost", "n_jobs"),
+        ("evaluation", "bootstrap", "block_days"),
+        ("evaluation", "bootstrap", "replicates"),
+        ("evaluation", "bootstrap", "min_valid_blocks"),
+    ],
+)
+def test_nested_integer_protocol_fields_reject_equal_float_values(
+    path: tuple[str, str, str],
+) -> None:
+    payload = valid_config()
+    container = payload[path[0]][path[1]]
+    container[path[2]] = float(container[path[2]])
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(payload)
+
+
+def test_availability_requires_column_or_nonnegative_fixed_latency_for_each_source() -> None:
+    payload = valid_config()
+    payload["data"]["availability"]["power"] = {}
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(payload)
+
+    payload = valid_config()
+    payload["data"]["availability"]["weather"] = {"fixed_latency_minutes": -1}
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(payload)
+
+    payload = valid_config()
+    payload["data"]["availability"]["weather"] = {
+        "column": "available_at",
+        "fixed_latency_minutes": 0,
+    }
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(payload)
+
+
+def test_split_cutoffs_must_be_utc_and_strictly_ordered() -> None:
+    payload = valid_config()
+    payload["split"]["validation_end_utc"] = payload["split"]["train_end_utc"]
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(payload)
+
+    payload = valid_config()
+    payload["split"]["test_end_utc"] = "2026-01-01T00:00:00+07:00"
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(payload)
+
+
+def test_daylight_source_requires_its_matching_metadata() -> None:
+    payload = valid_config()
+    payload["daylight"] = {"source": "solar_elevation", "latitude": None, "longitude": 1.0}
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(payload)
+
+    payload = valid_config()
+    payload["daylight"] = {"source": "column"}
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(payload)
+
+    payload["data"]["columns"]["daylight"] = "is_daylight"
+    assert PilotConfig.model_validate(payload).daylight.source.value == "column"
+
+
+def test_load_config_resolves_paths_and_hash_is_stable_across_yaml_key_order(
+    tmp_path: Path,
+) -> None:
+    first_path = tmp_path / "first.yaml"
+    second_path = tmp_path / "second.yaml"
+    payload = valid_config()
+    first_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    second_path.write_text(yaml.safe_dump(copy.deepcopy(payload), sort_keys=True), encoding="utf-8")
+
+    first = load_config(first_path)
+    second = load_config(second_path)
+
+    assert first.paths.input_data == (tmp_path / "data/pv.csv").resolve()
+    assert first.paths.artifact_dir == (tmp_path / "artifacts/run").resolve()
+    assert first.canonical_json() == second.canonical_json()
+    assert first.config_hash() == second.config_hash()
+
+
+def test_example_configs_validate() -> None:
+    root = Path(__file__).parents[1]
+    real = load_config(root / "configs/pilot.example.yaml")
+    synthetic = load_config(root / "configs/pilot.synthetic.yaml")
+
+    assert real.protocol.provenance.value == "real"
+    assert synthetic.protocol.provenance.value == "synthetic"
+    assert synthetic.science_decision_allowed is False
