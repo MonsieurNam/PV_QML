@@ -13,6 +13,7 @@ from typing import Any, Literal, cast
 
 import pandas as pd
 import psutil
+import pyarrow.dataset as pds
 
 from . import baselines as baseline_models
 from .artifacts import RunStore, sha256_file
@@ -820,8 +821,11 @@ class DefaultPilotServices:
         )
         try:
             guard.checkpoint(feature_path.stat().st_size)
-            features = pd.read_parquet(feature_path)
-            declared = int(features.memory_usage(index=True, deep=True).sum())
+            feature_dataset = pds.dataset(feature_path, format="parquet")
+            development = feature_dataset.scanner(
+                filter=pds.field("split").isin(["train", "validation"])
+            ).to_table().to_pandas()
+            declared = int(development.memory_usage(index=True, deep=True).sum())
             guard.checkpoint(declared)
         except _ResourceLimitExceeded as error:
             return self._publish_baseline_resource_invalid(
@@ -868,8 +872,31 @@ class DefaultPilotServices:
                 resource_status="WITHIN_LIMIT",
             )
 
+        holdout_open_count = 0
+        holdout_declared = 0
+
+        def load_holdout(selection_freeze_sha256: str) -> pd.DataFrame:
+            nonlocal holdout_declared, holdout_open_count
+            if len(selection_freeze_sha256) != 64:
+                raise RuntimeError("holdout cannot open before selection is frozen")
+            if holdout_open_count != 0:
+                raise RuntimeError("holdout loader may be invoked exactly once")
+            holdout_open_count += 1
+            holdout = feature_dataset.scanner(
+                filter=pds.field("split") == "test"
+            ).to_table().to_pandas()
+            holdout_declared = int(holdout.memory_usage(index=True, deep=True).sum())
+            guard.checkpoint(declared + holdout_declared)
+            return holdout
+
         try:
-            training = baseline_models.train_baseline_models(features, config)
+            training = baseline_models.train_baseline_models(
+                development,
+                config,
+                holdout_loader=load_holdout,
+            )
+            if holdout_open_count != 1:
+                raise RuntimeError("baseline trainer did not open holdout exactly once")
             guard.checkpoint(declared)
             prediction_bytes = baseline_models.prediction_parquet_bytes(training.predictions)
             validation_frame = pd.DataFrame.from_records(training.validation_scores)
@@ -894,7 +921,9 @@ class DefaultPilotServices:
         selected_object = training.selection_manifest.get("selected")
         if not isinstance(selected_object, dict):
             raise RuntimeError("baseline selection manifest lost selected configurations")
-        serialization_probe = features.loc[features["split"] == "train"].iloc[:3].copy()
+        serialization_probe = development.loc[
+            development["split"] == "train"
+        ].iloc[:3].copy()
         original_probe_predictions = baseline_models.predict_test_models(
             serialization_probe,
             training.models,
@@ -926,7 +955,13 @@ class DefaultPilotServices:
             "serialization_probe": "first_three_train_rows",
             "scientific_decision": "NOT_EVALUATED",
         }
-        total_bytes = declared + len(prediction_bytes) + len(validation_bytes) + len(model_bytes)
+        total_bytes = (
+            declared
+            + holdout_declared
+            + len(prediction_bytes)
+            + len(validation_bytes)
+            + len(model_bytes)
+        )
         try:
             guard.checkpoint(total_bytes)
         except _ResourceLimitExceeded as error:

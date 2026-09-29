@@ -4,6 +4,7 @@ import json
 import pickle
 import subprocess
 import sys
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from pv_pilot.artifacts import RunStore
 from pv_pilot.baselines import (
     BaselineContractError,
     BaselineModelBundle,
+    BaselineTrainingResult,
     PersistenceModel,
     QuantileHeads,
     candidate_sort_key,
@@ -127,6 +129,27 @@ def feature_frame(test_target_offset: float = 0.0) -> pd.DataFrame:
                 }
             )
     return pd.DataFrame.from_records(records)
+
+
+def development_and_holdout(
+    *, test_target_offset: float = 0.0
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    frame = feature_frame(test_target_offset=test_target_offset)
+    return (
+        frame.loc[frame["split"].isin(("train", "validation"))].copy(),
+        frame.loc[frame["split"] == "test"].copy(),
+    )
+
+
+def train_fixture(*, test_target_offset: float = 0.0) -> BaselineTrainingResult:
+    development, holdout = development_and_holdout(
+        test_target_offset=test_target_offset
+    )
+    return train_baseline_models(
+        development,
+        pilot_config(),
+        holdout_loader=lambda _selection_hash: holdout,
+    )
 
 
 def make_feature_run(tmp_path: Path) -> RunStore:
@@ -368,9 +391,8 @@ def test_real_xgboost_quantile_objective_smoke() -> None:
 def test_training_selects_one_shared_configuration_and_never_uses_test_for_selection(
     fast_baseline_fits: None,
 ) -> None:
-    config = pilot_config()
-    first = train_baseline_models(feature_frame(), config)
-    changed_test = train_baseline_models(feature_frame(test_target_offset=10_000.0), config)
+    first = train_fixture()
+    changed_test = train_fixture(test_target_offset=10_000.0)
 
     assert first.selection_manifest["selected"] == changed_test.selection_manifest["selected"]
     assert first.selection_manifest["selection_data"] == ["train", "validation"]
@@ -388,8 +410,43 @@ def test_training_selects_one_shared_configuration_and_never_uses_test_for_selec
     assert len(first.predictions) == 4 * 12
 
 
+def test_holdout_is_opened_once_only_after_selection_freezes_and_fits_complete(
+    fast_baseline_fits: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pv_pilot.baselines as module
+
+    development, holdout = development_and_holdout()
+    poisoned = holdout.copy()
+    poisoned["target_ac_power_kw"] = np.nan
+    original_fit = module._fit_linear_heads
+    fit_count = 0
+    loader_calls: list[str] = []
+
+    def counted_fit(*args: object, **kwargs: object) -> QuantileHeads:
+        nonlocal fit_count
+        fit_count += 1
+        return original_fit(*args, **kwargs)  # type: ignore[arg-type]
+
+    def load_holdout(selection_freeze_sha256: str) -> pd.DataFrame:
+        loader_calls.append(selection_freeze_sha256)
+        assert fit_count == 34  # all 32 candidates plus two selected refits
+        assert len(selection_freeze_sha256) == 64
+        return poisoned
+
+    monkeypatch.setattr(module, "_fit_linear_heads", counted_fit)
+    with pytest.raises(BaselineContractError, match="holdout"):
+        train_baseline_models(
+            development,
+            pilot_config(),
+            holdout_loader=load_holdout,
+        )
+
+    assert len(loader_calls) == 1
+
+
 def test_selected_raw_and_rff_scalers_are_fit_on_train_only(fast_baseline_fits: None) -> None:
-    result = train_baseline_models(feature_frame(), pilot_config())
+    result = train_fixture()
     raw = result.models["raw"]
     rff = result.models["rff"]
     assert isinstance(raw, BaselineModelBundle)
@@ -409,7 +466,7 @@ def test_selected_raw_and_rff_scalers_are_fit_on_train_only(fast_baseline_fits: 
 def test_candidate_records_use_common_alpha_and_xgboost_tuple_for_all_heads(
     fast_baseline_fits: None,
 ) -> None:
-    result = train_baseline_models(feature_frame(), pilot_config())
+    result = train_fixture()
 
     for candidate in result.selection_manifest["candidates"]:
         if candidate["branch"] in {"raw", "rff"}:
@@ -422,9 +479,9 @@ def test_candidate_records_use_common_alpha_and_xgboost_tuple_for_all_heads(
 def test_prediction_and_validation_schemas_are_stable_for_empty_frames(
     fast_baseline_fits: None,
 ) -> None:
-    predictions = train_baseline_models(feature_frame(), pilot_config()).predictions
+    predictions = train_fixture().predictions
     scores = pd.DataFrame.from_records(
-        train_baseline_models(feature_frame(), pilot_config()).validation_scores
+        train_fixture().validation_scores
     )
 
     prediction_schema = pq.read_schema(pa.BufferReader(prediction_parquet_bytes(predictions)))
@@ -482,6 +539,54 @@ def test_train_baselines_service_publishes_complete_artifacts_and_resumes(
     assert manifest["scientific_decision"] == "NOT_EVALUATED"
 
 
+def test_service_scans_development_before_lazy_holdout_and_opens_holdout_once(
+    tmp_path: Path,
+    fast_baseline_fits: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pv_pilot.baselines as baseline_module
+
+    store = make_feature_run(tmp_path)
+    original = baseline_module.train_baseline_models
+    events: list[str] = []
+
+    def audited_train(
+        development_frame: pd.DataFrame,
+        config: PilotConfig,
+        *,
+        holdout_loader: Callable[[str], pd.DataFrame],
+    ) -> BaselineTrainingResult:
+        assert set(development_frame["split"]) == {"train", "validation"}
+        events.append("development_received")
+
+        def audited_loader(selection_hash: str) -> pd.DataFrame:
+            events.append("holdout_opened")
+            assert len(selection_hash) == 64
+            return holdout_loader(selection_hash)
+
+        return original(
+            development_frame,
+            config,
+            holdout_loader=audited_loader,
+        )
+
+    monkeypatch.setattr(baseline_module, "train_baseline_models", audited_train)
+    result = DefaultPilotServices().train_baselines(store.root)
+
+    assert result.status is StageStatus.SUCCESS
+    assert events == ["development_received", "holdout_opened"]
+    selection = json.loads(
+        (store.root / "train-baselines/selection_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    audit = selection["holdout_audit"]
+    assert audit["event_order"]["selection_frozen"] < audit["event_order"]["holdout_opened"]
+    assert audit["prediction_passes"] == 1
+    assert audit["opened_at_utc"].endswith("Z")
+    assert len(audit["row_content_sha256"]) == 64
+
+
 def test_train_baselines_rejects_feature_input_tamper(
     tmp_path: Path,
     fast_baseline_fits: None,
@@ -528,8 +633,10 @@ def test_train_baselines_contract_error_publishes_invalid_not_failed(
 
     store = make_feature_run(tmp_path)
 
-    def reject(frame: pd.DataFrame, config: object) -> object:
-        del frame, config
+    def reject(
+        frame: pd.DataFrame, config: object, *, holdout_loader: object
+    ) -> object:
+        del frame, config, holdout_loader
         raise BaselineContractError("bad split schema")
 
     monkeypatch.setattr(baseline_module, "train_baseline_models", reject)

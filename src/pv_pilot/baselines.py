@@ -6,11 +6,14 @@ import hashlib
 import io
 import json
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from importlib.metadata import version
 from typing import Any, Protocol
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from numpy.typing import NDArray
@@ -370,11 +373,15 @@ def _select_candidate(branch: str, candidates: list[dict[str, Any]]) -> dict[str
     )
 
 
-def _validate_feature_frame(frame: Any, config: PilotConfig) -> Any:
-    import pandas as pd
-
+def _validate_feature_frame(
+    frame: Any,
+    config: PilotConfig,
+    *,
+    expected_splits: frozenset[str],
+    label: str,
+) -> Any:
     if not isinstance(frame, pd.DataFrame):
-        raise BaselineContractError("feature matrix must be a pandas DataFrame")
+        raise BaselineContractError(f"{label} feature matrix must be a pandas DataFrame")
     xgb_columns = [
         "power_lag_0m_kw",
         "power_lag_5m_kw",
@@ -400,16 +407,34 @@ def _validate_feature_frame(frame: Any, config: PilotConfig) -> Any:
     }
     missing = sorted(required - set(frame.columns))
     if missing:
-        raise BaselineContractError(f"feature matrix is missing columns: {missing}")
+        raise BaselineContractError(f"{label} feature matrix is missing columns: {missing}")
     work = frame.copy(deep=True)
-    if work.empty or set(work["split"].unique()) != {"train", "validation", "test"}:
-        raise BaselineContractError("feature matrix must contain train, validation, and test")
+    if work.empty or set(work["split"].unique()) != expected_splits:
+        expected = ", ".join(sorted(expected_splits))
+        raise BaselineContractError(
+            f"{label} feature matrix must contain exactly these splits: {expected}"
+        )
     if work["sample_id"].duplicated().any():
-        raise BaselineContractError("feature sample_id values must be unique")
+        raise BaselineContractError(f"{label} feature sample_id values must be unique")
     numeric_columns = ["target_ac_power_kw", "capacity_kw", *xgb_columns]
     values = work.loc[:, numeric_columns].to_numpy(dtype=np.float64)
     if not np.isfinite(values).all() or np.any(work["capacity_kw"].to_numpy() <= 0):
-        raise BaselineContractError("feature values must be finite with positive capacity")
+        raise BaselineContractError(
+            f"{label} feature values must be finite with positive capacity"
+        )
+    for timestamp_column in ("issued_at_utc", "target_at_utc"):
+        try:
+            work[timestamp_column] = pd.to_datetime(
+                work[timestamp_column], utc=True, errors="raise"
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise BaselineContractError(
+                f"{label} {timestamp_column} must contain valid UTC timestamps"
+            ) from error
+        if work[timestamp_column].isna().any():
+            raise BaselineContractError(
+                f"{label} {timestamp_column} cannot contain missing timestamps"
+            )
     work.attrs["xgb_columns"] = tuple(xgb_columns)
     return work
 
@@ -420,8 +445,6 @@ def _prediction_records(
     quantiles: tuple[float, ...],
     selected: dict[str, dict[str, Any]],
 ) -> tuple[Any, dict[str, Any]]:
-    import pandas as pd
-
     records: list[dict[str, Any]] = []
     diagnostics: dict[str, Any] = {}
     capacity = test["capacity_kw"].to_numpy(dtype=np.float64)
@@ -467,16 +490,26 @@ def predict_test_models(
     return predictions
 
 
-def train_baseline_models(frame: Any, config: PilotConfig) -> BaselineTrainingResult:
+def train_baseline_models(
+    development_frame: Any,
+    config: PilotConfig,
+    *,
+    holdout_loader: Callable[[str], Any],
+) -> BaselineTrainingResult:
     """Select on validation, freeze choices, refit, and open test once for inference."""
 
-    work = _validate_feature_frame(frame, config)
+    work = _validate_feature_frame(
+        development_frame,
+        config,
+        expected_splits=frozenset({"train", "validation"}),
+        label="development",
+    )
     quantiles = tuple(config.evaluation.quantiles)
     if quantiles != LOCKED_QUANTILES:
         raise BaselineContractError("quantile grid does not match the frozen protocol")
     train = work.loc[work["split"] == "train"].copy()
     validation = work.loc[work["split"] == "validation"].copy()
-    # The test frame is intentionally not materialized until selection has been frozen.
+    # The holdout loader is intentionally not invoked until selection has been frozen.
     seed_manager = SeedManager(config.seeds.master_seed)
     target_train = train["target_ac_power_kw"].to_numpy(dtype=np.float64)
     target_validation = validation["target_ac_power_kw"].to_numpy(dtype=np.float64)
@@ -706,14 +739,32 @@ def train_baseline_models(frame: Any, config: PilotConfig) -> BaselineTrainingRe
         branch="xgboost", feature_columns=xgb_columns, predictor=xgb_heads
     )
 
-    test = work.loc[work["split"] == "test"].copy()
+    holdout_opened_at = datetime.now(UTC)
+    holdout_candidate = holdout_loader(selection_manifest["selection_freeze_sha256"])
+    test = _validate_feature_frame(
+        holdout_candidate,
+        config,
+        expected_splits=frozenset({"test"}),
+        label="holdout",
+    )
+    if set(work["sample_id"].astype(str)) & set(test["sample_id"].astype(str)):
+        raise BaselineContractError("holdout sample_id values overlap development data")
     test_sample_payload = json.dumps(
         test["sample_id"].astype(str).tolist(), separators=(",", ":")
     )
+    row_hashes = pd.util.hash_pandas_object(test, index=False).to_numpy(dtype=np.uint64)
     selection_manifest["holdout_audit"] = {
+        "event_order": {
+            "selection_frozen": 1,
+            "models_refit": 2,
+            "holdout_opened": 3,
+            "holdout_predicted": 4,
+        },
+        "opened_at_utc": holdout_opened_at.isoformat().replace("+00:00", "Z"),
         "opened_after_selection_freeze_sha256": selection_manifest[
             "selection_freeze_sha256"
         ],
+        "row_content_sha256": hashlib.sha256(row_hashes.tobytes()).hexdigest(),
         "sample_id_order_sha256": hashlib.sha256(
             test_sample_payload.encode("utf-8")
         ).hexdigest(),
@@ -777,8 +828,6 @@ def validation_score_arrow_schema() -> pa.Schema:
 
 
 def _parquet_bytes(frame: Any, schema: pa.Schema) -> bytes:
-    import pandas as pd
-
     if not isinstance(frame, pd.DataFrame):
         raise BaselineContractError("parquet payload must be a pandas DataFrame")
     normalized = frame.copy(deep=False)
