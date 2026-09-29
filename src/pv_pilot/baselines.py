@@ -13,6 +13,7 @@ import stat
 import tempfile
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.metadata import version
@@ -111,9 +112,13 @@ class DeadlineProcessFitExecutor:
     deadline_monotonic: float
     resource_checkpoint: Callable[[int], None]
     private_directory: Path
-    max_child_rss_bytes: int | None = None
+    max_memory_bytes: int | None = None
+    telemetry_callback: Callable[[int, int, int], None] | None = None
     poll_seconds: float = 0.025
     _active_child_pid: int | None = None
+    peak_parent_rss_bytes: int = 0
+    peak_child_tree_rss_bytes: int = 0
+    peak_combined_rss_bytes: int = 0
 
     @property
     def active_child_pid(self) -> int | None:
@@ -121,14 +126,63 @@ class DeadlineProcessFitExecutor:
 
     @staticmethod
     def _stop(process: BaseProcess) -> None:
+        descendants: list[psutil.Process] = []
+        if process.pid is not None:
+            try:
+                descendants = psutil.Process(process.pid).children(recursive=True)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                descendants = []
+        for descendant in reversed(descendants):
+            with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                descendant.terminate()
         if not process.is_alive():
             process.join()
-            return
-        process.terminate()
-        process.join(timeout=1.0)
-        if process.is_alive():
-            process.kill()
-            process.join()
+        else:
+            process.terminate()
+            process.join(timeout=1.0)
+            if process.is_alive():
+                process.kill()
+                process.join()
+        _, surviving = psutil.wait_procs(descendants, timeout=1.0)
+        for descendant in surviving:
+            with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                descendant.kill()
+        if surviving:
+            psutil.wait_procs(surviving, timeout=1.0)
+
+    @staticmethod
+    def _process_rss(process: psutil.Process) -> int:
+        try:
+            return int(process.memory_info().rss)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return 0
+
+    def _sample_memory(self, child_pid: int) -> None:
+        parent_rss = self._process_rss(psutil.Process())
+        child_tree_rss = 0
+        try:
+            child_root = psutil.Process(child_pid)
+            descendants = child_root.children(recursive=True)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            descendants = []
+            child_root = None
+        seen_pids: set[int] = set()
+        for process in (() if child_root is None else (child_root, *descendants)):
+            process_pid = int(getattr(process, "pid", child_pid))
+            if process_pid in seen_pids:
+                continue
+            seen_pids.add(process_pid)
+            child_tree_rss += self._process_rss(process)
+        combined_rss = parent_rss + child_tree_rss
+        self.peak_parent_rss_bytes = max(self.peak_parent_rss_bytes, parent_rss)
+        self.peak_child_tree_rss_bytes = max(
+            self.peak_child_tree_rss_bytes, child_tree_rss
+        )
+        self.peak_combined_rss_bytes = max(self.peak_combined_rss_bytes, combined_rss)
+        if self.telemetry_callback is not None:
+            self.telemetry_callback(parent_rss, child_tree_rss, combined_rss)
+        if self.max_memory_bytes is not None and combined_rss > self.max_memory_bytes:
+            raise FitMemoryExceeded("fit exceeded the aggregate parent and child-tree RSS limit")
 
     def run(
         self,
@@ -171,17 +225,13 @@ class DeadlineProcessFitExecutor:
                     self._stop(process)
                     raise FitDeadlineExceeded(f"{operation} exceeded the fit deadline")
                 process.join(timeout=min(self.poll_seconds, remaining))
-                self.resource_checkpoint(declared_bytes)
-                if self.max_child_rss_bytes is not None and process.pid is not None:
+                if process.pid is not None:
                     try:
-                        child_rss = psutil.Process(process.pid).memory_info().rss
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        child_rss = 0
-                    if child_rss > self.max_child_rss_bytes:
+                        self._sample_memory(process.pid)
+                    except FitMemoryExceeded:
                         self._stop(process)
-                        raise FitMemoryExceeded(
-                            f"{operation} exceeded the child RSS limit"
-                        )
+                        raise
+                self.resource_checkpoint(declared_bytes)
             process.join()
             if process.exitcode != 0 or not result_path.is_file():
                 raise RuntimeError(

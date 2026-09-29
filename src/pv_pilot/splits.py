@@ -45,6 +45,8 @@ XGB_BASE_COLUMNS = (
     "ghi_w_m2",
     "air_temp_c",
 )
+PARTITION_ORDER_COLUMNS = ("site_id", "issued_at_utc", "sample_id")
+COMBINED_MEMBERSHIP_POLICY = "sorted_unique_sample_id"
 SOLAR_COLUMNS = ("solar_elevation_deg", "solar_azimuth_deg")
 FEATURE_SCHEMA_VERSION = "1.0"
 _SPLIT_NAMES = ("train", "validation", "test")
@@ -189,6 +191,14 @@ def _solar_geometry(work: pd.DataFrame, config: PilotConfig) -> pd.DataFrame:
 
 def _sample_hash(sample_ids: pd.Series) -> str:
     payload = json.dumps(sample_ids.astype(str).tolist(), separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _sample_membership_hash(sample_ids: pd.Series) -> str:
+    values = sample_ids.astype(str).tolist()
+    if len(values) != len(set(values)):
+        raise SplitContractError("sample_id membership hash requires unique values")
+    payload = json.dumps(sorted(values), separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -511,6 +521,7 @@ def build_feature_splits(
                 "splits": ["train", "validation"],
                 "row_count": int(features["split"].isin(("train", "validation")).sum()),
                 "schema_sha256": feature_schema_sha256(config),
+                "order_policy": list(PARTITION_ORDER_COLUMNS),
                 "sample_id_order_sha256": _sample_hash(
                     features.loc[
                         features["split"].isin(("train", "validation")), "sample_id"
@@ -522,6 +533,7 @@ def build_feature_splits(
                 "splits": ["test"],
                 "row_count": int((features["split"] == "test").sum()),
                 "schema_sha256": feature_schema_sha256(config),
+                "order_policy": list(PARTITION_ORDER_COLUMNS),
                 "sample_id_order_sha256": _sample_hash(
                     features.loc[features["split"] == "test", "sample_id"]
                 ),
@@ -529,7 +541,10 @@ def build_feature_splits(
             "combined": {
                 "row_count": len(features),
                 "schema_sha256": feature_schema_sha256(config),
-                "sample_id_order_sha256": _sample_hash(features["sample_id"]),
+                "membership_policy": COMBINED_MEMBERSHIP_POLICY,
+                "sample_id_membership_sha256": _sample_membership_hash(
+                    features["sample_id"]
+                ),
             },
         },
         "exclusion_counts": {
@@ -636,9 +651,11 @@ def diagnostic_split_parquet_bytes(config: PilotConfig) -> tuple[bytes, bytes]:
 
 
 __all__ = [
+    "COMBINED_MEMBERSHIP_POLICY",
     "FEATURE_SCHEMA_VERSION",
     "MATCHED4_COLUMNS",
     "MATCHED6_COLUMNS",
+    "PARTITION_ORDER_COLUMNS",
     "SOLAR_COLUMNS",
     "XGB_BASE_COLUMNS",
     "FeatureBuildResult",

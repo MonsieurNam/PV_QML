@@ -423,6 +423,20 @@ def test_build_splits_service_publishes_and_resumes(tmp_path: Path) -> None:
     assert len(manifest["partitions"]["development"]["sample_id_order_sha256"]) == 64
     assert len(manifest["partitions"]["holdout"]["schema_sha256"]) == 64
     assert len(manifest["partitions"]["holdout"]["sample_id_order_sha256"]) == 64
+    assert manifest["partitions"]["development"]["order_policy"] == [
+        "site_id",
+        "issued_at_utc",
+        "sample_id",
+    ]
+    assert manifest["partitions"]["holdout"]["order_policy"] == [
+        "site_id",
+        "issued_at_utc",
+        "sample_id",
+    ]
+    assert manifest["partitions"]["combined"]["membership_policy"] == (
+        "sorted_unique_sample_id"
+    )
+    assert len(manifest["partitions"]["combined"]["sample_id_membership_sha256"]) == 64
     store.verify_terminal_stage("build-splits")
     assert read_json(store.root / "build-splits/stage_result.json")["status"] == "success"
 

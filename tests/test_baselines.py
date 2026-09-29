@@ -19,7 +19,7 @@ import pyarrow.parquet as pq
 import pytest
 import yaml
 
-from pv_pilot.artifacts import RunStore
+from pv_pilot.artifacts import RunStore, sha256_file
 from pv_pilot.baselines import (
     BaselineContractError,
     BaselineModelBundle,
@@ -64,7 +64,7 @@ def _raise_fit_error() -> None:
 
 @pytest.fixture
 def fast_baseline_fits(monkeypatch: pytest.MonkeyPatch) -> None:
-    import pv_pilot.baselines as baseline_module
+    baseline_module: Any = importlib.import_module("pv_pilot.baselines")
 
     monkeypatch.setattr(
         baseline_module,
@@ -149,7 +149,11 @@ def feature_frame(test_target_offset: float = 0.0) -> pd.DataFrame:
                     "air_temp_c": 20 + value / 10,
                 }
             )
-    return pd.DataFrame.from_records(records)
+    return (
+        pd.DataFrame.from_records(records)
+        .sort_values(["site_id", "issued_at_utc", "sample_id"], kind="stable")
+        .reset_index(drop=True)
+    )
 
 
 def development_and_holdout(
@@ -200,6 +204,12 @@ def make_feature_run(tmp_path: Path) -> RunStore:
     def sample_hash(frame: pd.DataFrame) -> str:
         payload = json.dumps(
             frame["sample_id"].astype(str).tolist(), separators=(",", ":")
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def membership_hash(frame: pd.DataFrame) -> str:
+        payload = json.dumps(
+            sorted(set(frame["sample_id"].astype(str))), separators=(",", ":")
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
     with store.stage(
@@ -254,6 +264,7 @@ def make_feature_run(tmp_path: Path) -> RunStore:
                         "row_count": 24,
                         "schema_sha256": feature_schema_sha256(loaded.config),
                         "sample_id_order_sha256": sample_hash(development_features),
+                        "order_policy": ["site_id", "issued_at_utc", "sample_id"],
                     },
                     "holdout": {
                         "path": "build-splits/holdout_features.parquet",
@@ -261,11 +272,13 @@ def make_feature_run(tmp_path: Path) -> RunStore:
                         "row_count": 12,
                         "schema_sha256": feature_schema_sha256(loaded.config),
                         "sample_id_order_sha256": sample_hash(holdout_features),
+                        "order_policy": ["site_id", "issued_at_utc", "sample_id"],
                     },
                     "combined": {
                         "row_count": 36,
                         "schema_sha256": feature_schema_sha256(loaded.config),
-                        "sample_id_order_sha256": sample_hash(complete_features),
+                        "sample_id_membership_sha256": membership_hash(complete_features),
+                        "membership_policy": "sorted_unique_sample_id",
                     },
                 },
             },
@@ -273,6 +286,44 @@ def make_feature_run(tmp_path: Path) -> RunStore:
         transaction.write_json("minmax_scalers.json", {})
         transaction.write_json("stage_result.json", deterministic_data(split_result))
     return store
+
+
+def make_pipeline_run(tmp_path: Path, sites: tuple[str, ...]) -> RunStore:
+    project = tmp_path / "pipeline-project"
+    (project / ".git").mkdir(parents=True)
+    (project / "configs").mkdir()
+    (project / "data").mkdir()
+    source = Path(__file__).parents[1] / "configs/pilot.synthetic.yaml"
+    payload = yaml.safe_load(source.read_text(encoding="utf-8"))
+    payload["paths"] = {
+        "input_data": "../data/input.csv",
+        "artifact_dir": "../artifacts",
+    }
+    payload["split"] = {
+        "train_end_utc": "2025-01-01T02:00:00Z",
+        "validation_end_utc": "2025-01-01T03:00:00Z",
+        "test_end_utc": "2025-01-01T04:00:00Z",
+    }
+    config_path = project / "configs/pilot.yaml"
+    config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    rows: list[dict[str, object]] = []
+    times = pd.date_range("2025-01-01T00:00:00Z", periods=55, freq="5min")
+    for site_index, site in enumerate(sites):
+        for index, timestamp in enumerate(times):
+            rows.append(
+                {
+                    "site_id": site,
+                    "timestamp": timestamp,
+                    "power_kw": float(site_index * 1000 + index),
+                    "capacity_kw": 2000.0,
+                    "ghi_w_m2": float(100 + index),
+                    "temperature_c": float(20 + index / 10),
+                    "is_daylight": True,
+                }
+            )
+    pd.DataFrame.from_records(rows).to_csv(project / "data/input.csv", index=False)
+    loaded = load_config(config_path, project_root=project)
+    return RunStore.create(loaded, now=datetime(2026, 9, 29, tzinfo=UTC))
 
 
 def test_wis_matches_hand_calculation_and_normalizes_by_capacity() -> None:
@@ -546,7 +597,7 @@ def test_deadline_fit_executor_enforces_child_rss_and_cleans_private_files(
         deadline_monotonic=time.monotonic() + 5.0,
         resource_checkpoint=lambda _declared: None,
         private_directory=tmp_path,
-        max_child_rss_bytes=1,
+        max_memory_bytes=1,
     )
 
     with pytest.raises(FitMemoryExceeded, match="RSS"):
@@ -556,11 +607,97 @@ def test_deadline_fit_executor_enforces_child_rss_and_cleans_private_files(
     assert not list(tmp_path.iterdir())
 
 
+def test_fit_executor_counts_each_child_descendant_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_module: Any = importlib.import_module("pv_pilot.baselines")
+    processes: dict[int, tuple[int, list[int]]] = {
+        10: (200, [11, 12, 11]),
+        11: (300, []),
+        12: (400, []),
+    }
+
+    class MemoryInfo:
+        def __init__(self, rss: int) -> None:
+            self.rss = rss
+
+    class FakePsutilProcess:
+        def __init__(self, pid: int | None = None) -> None:
+            self.pid = 1 if pid is None else pid
+
+        def memory_info(self) -> MemoryInfo:
+            if self.pid == 1:
+                return MemoryInfo(100)
+            return MemoryInfo(processes[self.pid][0])
+
+        def children(self, *, recursive: bool = False) -> list[FakePsutilProcess]:
+            assert recursive
+            return [FakePsutilProcess(pid) for pid in processes[self.pid][1]]
+
+    monkeypatch.setattr(baseline_module.psutil, "Process", FakePsutilProcess)
+    executor = DeadlineProcessFitExecutor(
+        deadline_monotonic=time.monotonic() + 5.0,
+        resource_checkpoint=lambda _declared: None,
+        private_directory=tmp_path,
+        max_memory_bytes=2_000,
+    )
+
+    executor._sample_memory(10)
+
+    assert executor.peak_parent_rss_bytes == 100
+    assert executor.peak_child_tree_rss_bytes == 900
+    assert executor.peak_combined_rss_bytes == 1_000
+
+
+def test_train_baselines_aggregate_fit_rss_exceedance_is_invalid_and_telemetried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_module: Any = importlib.import_module("pv_pilot.baselines")
+
+    store = make_feature_run(tmp_path)
+    per_process_rss = 5 * 1024**3
+
+    class MemoryInfo:
+        rss = per_process_rss
+
+    class FakePsutilProcess:
+        def __init__(self, _pid: int | None = None) -> None:
+            pass
+
+        def memory_info(self) -> MemoryInfo:
+            return MemoryInfo()
+
+        def children(self, *, recursive: bool = False) -> list[FakePsutilProcess]:
+            del recursive
+            return []
+
+    monkeypatch.setattr(baseline_module.psutil, "Process", FakePsutilProcess)
+
+    result = DefaultPilotServices().train_baselines(store.root)
+
+    assert result.status is StageStatus.INVALID
+    ledger = json.loads(
+        (store.root / "train-baselines/resource_ledger.json").read_text(encoding="utf-8")
+    )
+    assert ledger["resource_gate"] == "fit_memory_rss"
+    assert ledger["resource_status"] == "EXCEEDED"
+    assert ledger["max_memory_bytes"] == 8 * 1024**3
+    assert ledger["peak_parent_rss_bytes"] == per_process_rss
+    assert ledger["peak_child_tree_rss_bytes"] == per_process_rss
+    assert ledger["peak_combined_rss_bytes"] == 2 * per_process_rss
+    assert ledger["peak_parent_rss_bytes"] < 8 * 1024**3
+    assert ledger["peak_child_tree_rss_bytes"] < 8 * 1024**3
+    assert ledger["peak_combined_rss_bytes"] > 8 * 1024**3
+    assert not list(store.root.glob(".fit-operation-*"))
+
+
 def test_deadline_fit_executor_propagates_child_error_and_cleans_private_files(
     tmp_path: Path,
 ) -> None:
     executor = DeadlineProcessFitExecutor(
-        deadline_monotonic=time.monotonic() + 5.0,
+        deadline_monotonic=time.monotonic() + 30.0,
         resource_checkpoint=lambda _declared: None,
         private_directory=tmp_path,
     )
@@ -666,6 +803,39 @@ def test_train_baselines_service_publishes_complete_artifacts_and_resumes(
     assert manifest["scientific_decision"] == "NOT_EVALUATED"
 
 
+@pytest.mark.parametrize(
+    "sites",
+    [("site-a",), ("site-b", "site-a")],
+    ids=["single-site", "exact-two-site"],
+)
+def test_validate_build_train_pipeline_preserves_partition_membership(
+    tmp_path: Path,
+    fast_baseline_fits: None,
+    sites: tuple[str, ...],
+) -> None:
+    store = make_pipeline_run(tmp_path, sites)
+    service = DefaultPilotServices()
+
+    assert service.validate_data(store.root).status is StageStatus.SUCCESS
+    assert service.build_splits(store.root).status is StageStatus.SUCCESS
+    assert service.train_baselines(store.root).status is StageStatus.SUCCESS
+
+    development = pd.read_parquet(
+        store.root / "build-splits/development_features.parquet"
+    )
+    holdout = pd.read_parquet(store.root / "build-splits/holdout_features.parquet")
+    assert set(development["sample_id"]).isdisjoint(set(holdout["sample_id"]))
+    assert set(development["site_id"]) == set(sites)
+    assert set(holdout["site_id"]) == set(sites)
+    stage_marker = json.loads(
+        (store.root / "train-baselines/stage_manifest.json").read_text(encoding="utf-8")
+    )
+    assert {
+        "build-splits/development_features.parquet",
+        "build-splits/holdout_features.parquet",
+    } <= set(stage_marker["input_hashes"])
+
+
 def test_service_scans_development_before_lazy_holdout_and_opens_holdout_once(
     tmp_path: Path,
     fast_baseline_fits: None,
@@ -748,6 +918,68 @@ def test_train_baselines_rejects_feature_input_tamper(
         DefaultPilotServices().train_baselines(store.root)
 
     assert not (store.root / "train-baselines/stage_manifest.json").exists()
+
+
+@pytest.mark.parametrize("mutation", ["missing-and-extra", "duplicate"])
+def test_train_baselines_rejects_invalid_combined_partition_membership(
+    tmp_path: Path,
+    fast_baseline_fits: None,
+    mutation: str,
+) -> None:
+    store = make_feature_run(tmp_path)
+    holdout_path = store.root / "build-splits/holdout_features.parquet"
+    manifest_path = store.root / "build-splits/feature_manifest.json"
+    marker_path = store.root / "build-splits/stage_manifest.json"
+    holdout = pd.read_parquet(holdout_path)
+    if mutation == "missing-and-extra":
+        holdout.loc[holdout.index[0], "sample_id"] = "unexpected-extra-sample"
+    else:
+        holdout = pd.concat([holdout, holdout.iloc[[0]]], ignore_index=True)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    holdout_ids = holdout["sample_id"].astype(str).tolist()
+    manifest["partitions"]["holdout"]["row_count"] = len(holdout)
+    manifest["partitions"]["holdout"]["sample_id_order_sha256"] = hashlib.sha256(
+        json.dumps(holdout_ids, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if mutation == "duplicate":
+        manifest["partitions"]["combined"]["row_count"] += 1
+    holdout_path.write_bytes(feature_dataframe_parquet_bytes(holdout, pilot_config()))
+    manifest_path.write_text(
+        json.dumps(
+            manifest,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    replacement_hashes = {
+        "build-splits/holdout_features.parquet": sha256_file(holdout_path),
+        "build-splits/feature_manifest.json": sha256_file(manifest_path),
+    }
+    for output in marker["outputs"]:
+        if output["path"] in replacement_hashes:
+            output["sha256"] = replacement_hashes[output["path"]]
+    marker_path.write_text(
+        json.dumps(
+            marker,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    result = DefaultPilotServices().train_baselines(store.root)
+
+    assert result.status is StageStatus.INVALID
+    assert "contract" in (result.message or "")
+    store.verify_terminal_stage(
+        "train-baselines", accepted_statuses=frozenset({"INVALID"})
+    )
 
 
 def test_train_baselines_resource_limit_publishes_bounded_invalid(

@@ -31,9 +31,11 @@ from .data import (
 from .data import dataframe_parquet_bytes as dataframe_parquet_bytes
 from .domain import DetailEntry, StageResult, StageStatus, deterministic_data
 from .splits import (
+    COMBINED_MEMBERSHIP_POLICY,
     FEATURE_SCHEMA_VERSION,
     MATCHED4_COLUMNS,
     MATCHED6_COLUMNS,
+    PARTITION_ORDER_COLUMNS,
     SplitContractError,
     build_feature_splits,
     diagnostic_split_parquet_bytes,
@@ -57,11 +59,16 @@ class _ResourceGuard:
     memory_bytes: int
     peak_rss_bytes: int = 0
     peak_declared_bytes: int = 0
+    peak_parent_rss_bytes: int = 0
+    peak_child_tree_rss_bytes: int = 0
+    peak_combined_rss_bytes: int = 0
 
     def checkpoint(self, declared_bytes: int = 0) -> None:
         self.peak_declared_bytes = max(self.peak_declared_bytes, declared_bytes)
         rss = psutil.Process().memory_info().rss
         self.peak_rss_bytes = max(self.peak_rss_bytes, rss)
+        self.peak_parent_rss_bytes = max(self.peak_parent_rss_bytes, rss)
+        self.peak_combined_rss_bytes = max(self.peak_combined_rss_bytes, rss)
         if time.perf_counter() - self.started > self.wall_seconds:
             raise _ResourceLimitExceeded("wall_clock")
         if rss > self.memory_bytes:
@@ -70,8 +77,23 @@ class _ResourceGuard:
             raise _ResourceLimitExceeded("dataframe_or_output_bytes")
 
     def sample_without_enforcement(self) -> None:
-        self.peak_rss_bytes = max(
-            self.peak_rss_bytes, psutil.Process().memory_info().rss
+        rss = psutil.Process().memory_info().rss
+        self.peak_rss_bytes = max(self.peak_rss_bytes, rss)
+        self.peak_parent_rss_bytes = max(self.peak_parent_rss_bytes, rss)
+        self.peak_combined_rss_bytes = max(self.peak_combined_rss_bytes, rss)
+
+    def record_fit_rss(
+        self, parent_rss_bytes: int, child_tree_rss_bytes: int, combined_rss_bytes: int
+    ) -> None:
+        self.peak_rss_bytes = max(self.peak_rss_bytes, parent_rss_bytes)
+        self.peak_parent_rss_bytes = max(
+            self.peak_parent_rss_bytes, parent_rss_bytes
+        )
+        self.peak_child_tree_rss_bytes = max(
+            self.peak_child_tree_rss_bytes, child_tree_rss_bytes
+        )
+        self.peak_combined_rss_bytes = max(
+            self.peak_combined_rss_bytes, combined_rss_bytes
         )
 
 
@@ -217,6 +239,10 @@ class DefaultPilotServices:
             "resource_status": resource_status,
             "resource_gate": gate,
             "peak_rss_bytes": guard.peak_rss_bytes,
+            "peak_parent_rss_bytes": guard.peak_parent_rss_bytes,
+            "peak_child_tree_rss_bytes": guard.peak_child_tree_rss_bytes,
+            "peak_combined_rss_bytes": guard.peak_combined_rss_bytes,
+            "max_memory_bytes": guard.memory_bytes,
             "peak_declared_bytes": guard.peak_declared_bytes,
             "cpu_only": True,
         }
@@ -645,6 +671,7 @@ class DefaultPilotServices:
                     "row_count": 0,
                     "schema_sha256": feature_schema_sha256(config),
                     "sample_id_order_sha256": hashlib.sha256(b"[]").hexdigest(),
+                    "order_policy": list(PARTITION_ORDER_COLUMNS),
                 },
                 "holdout": {
                     "path": "build-splits/holdout_features.parquet",
@@ -652,11 +679,13 @@ class DefaultPilotServices:
                     "row_count": 0,
                     "schema_sha256": feature_schema_sha256(config),
                     "sample_id_order_sha256": hashlib.sha256(b"[]").hexdigest(),
+                    "order_policy": list(PARTITION_ORDER_COLUMNS),
                 },
                 "combined": {
                     "row_count": 0,
                     "schema_sha256": feature_schema_sha256(config),
-                    "sample_id_order_sha256": hashlib.sha256(b"[]").hexdigest(),
+                    "membership_policy": COMBINED_MEMBERSHIP_POLICY,
+                    "sample_id_membership_sha256": hashlib.sha256(b"[]").hexdigest(),
                 },
             },
             "diagnostic": failure_details,
@@ -997,11 +1026,20 @@ class DefaultPilotServices:
             raise baseline_models.BaselineContractError(
                 "feature manifest combined partition record is invalid"
             )
+        development_order = development.sort_values(
+            list(PARTITION_ORDER_COLUMNS), kind="stable"
+        )["sample_id"].astype(str).tolist()
         if (
             development_contract.get("row_count") != len(development)
             or development_contract.get("schema_sha256")
             != feature_schema_sha256(config)
+            or development_contract.get("path") != development_relative
+            or development_contract.get("splits") != ["train", "validation"]
+            or development_contract.get("order_policy")
+            != list(PARTITION_ORDER_COLUMNS)
             or set(development["split"].astype(str)) != {"train", "validation"}
+            or development["sample_id"].duplicated().any()
+            or development["sample_id"].astype(str).tolist() != development_order
         ):
             raise baseline_models.BaselineContractError(
                 "development partition violates its manifest contract"
@@ -1041,11 +1079,28 @@ class DefaultPilotServices:
             if (
                 holdout_contract.get("schema_sha256")
                 != feature_schema_sha256(config)
+                or holdout_contract.get("path") != holdout_relative
+                or holdout_contract.get("splits") != ["test"]
+                or holdout_contract.get("order_policy")
+                != list(PARTITION_ORDER_COLUMNS)
                 or combined_contract.get("schema_sha256")
                 != feature_schema_sha256(config)
+                or combined_contract.get("membership_policy")
+                != COMBINED_MEMBERSHIP_POLICY
             ):
                 raise baseline_models.BaselineContractError(
                     "feature partition schema hash mismatch"
+                )
+            if (
+                set(holdout["split"].astype(str)) != {"test"}
+                or holdout["sample_id"].duplicated().any()
+                or holdout["sample_id"].astype(str).tolist()
+                != holdout.sort_values(
+                    list(PARTITION_ORDER_COLUMNS), kind="stable"
+                )["sample_id"].astype(str).tolist()
+            ):
+                raise baseline_models.BaselineContractError(
+                    "holdout partition violates its split or uniqueness contract"
                 )
             if combined_contract.get("row_count") != len(development) + len(holdout):
                 raise baseline_models.BaselineContractError(
@@ -1062,20 +1117,24 @@ class DefaultPilotServices:
                 raise baseline_models.BaselineContractError(
                     "holdout partition sample order hash mismatch"
                 )
+            development_ids = development["sample_id"].astype(str).tolist()
+            holdout_ids = holdout["sample_id"].astype(str).tolist()
+            if set(development_ids) & set(holdout_ids):
+                raise baseline_models.BaselineContractError(
+                    "development and holdout partition memberships overlap"
+                )
             combined_sample_payload = json.dumps(
-                [
-                    *development["sample_id"].astype(str).tolist(),
-                    *holdout["sample_id"].astype(str).tolist(),
-                ],
-                separators=(",", ":"),
+                sorted([*development_ids, *holdout_ids]), separators=(",", ":")
             )
-            declared_combined_hash = combined_contract.get("sample_id_order_sha256")
+            declared_combined_hash = combined_contract.get(
+                "sample_id_membership_sha256"
+            )
             if (
                 hashlib.sha256(combined_sample_payload.encode("utf-8")).hexdigest()
                 != declared_combined_hash
             ):
                 raise baseline_models.BaselineContractError(
-                    "feature partitions do not reproduce the combined sample order hash"
+                    "feature partitions do not reproduce the combined sample membership hash"
                 )
             guard.checkpoint(declared + holdout_declared)
             return holdout
@@ -1092,7 +1151,8 @@ class DefaultPilotServices:
                 ),
                 resource_checkpoint=guard.checkpoint,
                 private_directory=store.root,
-                max_child_rss_bytes=guard.memory_bytes,
+                max_memory_bytes=guard.memory_bytes,
+                telemetry_callback=guard.record_fit_rss,
             )
             training = baseline_models.train_baseline_models(
                 development,
@@ -1236,6 +1296,9 @@ class DefaultPilotServices:
             "resource_status": "WITHIN_LIMIT",
             "wall_clock_seconds": time.perf_counter() - started,
             "peak_rss_bytes": guard.peak_rss_bytes,
+            "peak_parent_rss_bytes": guard.peak_parent_rss_bytes,
+            "peak_child_tree_rss_bytes": guard.peak_child_tree_rss_bytes,
+            "peak_combined_rss_bytes": guard.peak_combined_rss_bytes,
             "peak_declared_bytes": guard.peak_declared_bytes,
             "max_wall_clock_seconds": config.resources.max_wall_clock_seconds,
             "max_memory_bytes": guard.memory_bytes,
