@@ -930,30 +930,42 @@ class RunStore:
         return sha256_file(path)
 
     def _verify_terminal_result_contract(self, manifest: Mapping[str, object]) -> None:
-        """Require a declared JSON result status to match its terminal stage marker."""
+        """Bind the conventional JSON result to its marker even if declaration is removed."""
 
-        declaration = manifest.get("terminal_result")
-        if declaration is None:
-            return
-        if not isinstance(declaration, dict):
-            raise ValueError("stage terminal result declaration is invalid")
-        result_path = declaration.get("path")
-        declared_status = _normalize_terminal_status(declaration.get("status"))
-        marker_status = _normalize_terminal_status(manifest.get("status"))
         stage = manifest.get("stage")
-        if declared_status != marker_status:
-            raise ValueError("terminal result status does not match stage marker")
-        if not isinstance(result_path, str) or not isinstance(stage, str):
-            raise ValueError("stage terminal result declaration is invalid")
         outputs = manifest.get("outputs")
-        if not isinstance(outputs, list) or result_path not in {
-            record.get("path") for record in outputs if isinstance(record, dict)
-        }:
-            raise ValueError("declared terminal result is not a stage output")
-        payload = self._read_json_file(self._validated_target(result_path))
+        if not isinstance(stage, str) or not isinstance(outputs, list):
+            raise ValueError("stage terminal result declaration is invalid")
+        conventional_path = f"{stage}/stage_result.json"
+        matching_outputs = [
+            record
+            for record in outputs
+            if isinstance(record, dict) and record.get("path") == conventional_path
+        ]
+        result_path = self._validated_target(conventional_path)
+        result_exists = result_path.exists() or result_path.is_symlink()
+        declaration = manifest.get("terminal_result")
+        if not matching_outputs:
+            if result_exists:
+                raise ValueError("terminal result exists but is not a committed stage output")
+            if declaration is not None:
+                raise ValueError("terminal result declaration has no committed stage output")
+            return
+        if len(matching_outputs) != 1:
+            raise ValueError("terminal result must appear exactly once in stage outputs")
+        if result_path.is_symlink() or not result_path.is_file():
+            raise ValueError("committed terminal result is not a regular file")
+        marker_status = _normalize_terminal_status(manifest.get("status"))
+        payload = self._read_json_file(result_path)
         if payload.get("stage") != stage:
             raise ValueError("terminal result stage does not match stage marker")
         if _normalize_terminal_status(payload.get("status")) != marker_status:
+            raise ValueError("terminal result status does not match stage marker")
+        if not isinstance(declaration, dict):
+            raise ValueError("terminal result declaration is required")
+        if declaration.get("path") != conventional_path:
+            raise ValueError("terminal result declaration path is inconsistent")
+        if _normalize_terminal_status(declaration.get("status")) != marker_status:
             raise ValueError("terminal result status does not match stage marker")
 
     def verify_terminal_stage(

@@ -404,6 +404,82 @@ def test_valid_checksums_cannot_hide_result_marker_status_mismatch(
         RunStore.open(store.root).stage("build-splits")
 
 
+def test_removing_terminal_declaration_cannot_hide_rechecksummed_status_mismatch(
+    tmp_path: Path,
+) -> None:
+    store, _ = make_run(tmp_path, frame_5m())
+    service = DefaultPilotServices()
+    assert service.validate_data(store.root).status is StageStatus.SUCCESS
+    result_path = store.root / "validate-data/stage_result.json"
+    result = read_json(result_path)
+    result["status"] = "blocked"
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    marker_path = store.root / "validate-data/stage_manifest.json"
+    marker = read_json(marker_path)
+    marker.pop("terminal_result")
+    for output in marker["outputs"]:
+        if output["path"] == "validate-data/stage_result.json":
+            output["sha256"] = sha256_file(result_path)
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="terminal result status"):
+        service.validate_data(store.root)
+    with pytest.raises(ValueError, match="terminal result status"):
+        RunStore.open(store.root).stage("build-splits")
+
+
+def test_matching_conventional_result_still_requires_declaration(tmp_path: Path) -> None:
+    store, _ = make_run(tmp_path, frame_5m())
+    service = DefaultPilotServices()
+    assert service.validate_data(store.root).status is StageStatus.SUCCESS
+    marker_path = store.root / "validate-data/stage_manifest.json"
+    marker = read_json(marker_path)
+    marker.pop("terminal_result")
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="declaration is required"):
+        service.validate_data(store.root)
+
+
+def test_existing_result_removed_from_marker_outputs_is_rejected(tmp_path: Path) -> None:
+    store, _ = make_run(tmp_path, frame_5m())
+    service = DefaultPilotServices()
+    assert service.validate_data(store.root).status is StageStatus.SUCCESS
+    marker_path = store.root / "validate-data/stage_manifest.json"
+    marker = read_json(marker_path)
+    marker.pop("terminal_result")
+    marker["outputs"] = [
+        output
+        for output in marker["outputs"]
+        if output["path"] != "validate-data/stage_result.json"
+    ]
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="committed stage output"):
+        service.validate_data(store.root)
+    with pytest.raises(ValueError, match="committed stage output"):
+        RunStore.open(store.root).stage("build-splits")
+
+
+def test_duplicate_or_inconsistent_terminal_result_declaration_is_rejected(
+    tmp_path: Path,
+) -> None:
+    store, _ = make_run(tmp_path, frame_5m())
+    assert DefaultPilotServices().validate_data(store.root).status is StageStatus.SUCCESS
+    marker_path = store.root / "validate-data/stage_manifest.json"
+    marker = read_json(marker_path)
+    result_record = next(
+        output
+        for output in marker["outputs"]
+        if output["path"] == "validate-data/stage_result.json"
+    )
+    marker["outputs"].append(dict(result_record))
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exactly once"):
+        RunStore.open(store.root).verify_terminal_stage("validate-data")
+
+
 def test_source_tamper_after_init_is_durable_invalid(tmp_path: Path) -> None:
     store, input_path = make_run(tmp_path, frame_5m())
     original = sha256_file(input_path)
