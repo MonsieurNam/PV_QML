@@ -170,7 +170,8 @@ def test_scalers_fit_train_only_clip_extremes_and_record_rates() -> None:
     assert result.features.loc[
         result.features["split"] == "validation", "matched4_scaled_2"
     ].eq(1.0).all()
-    assert result.clip_rates["matched4"]["validation"]["ghi_w_m2"] == 1.0
+    matched4_rates = result.clip_rates["profiles"]["matched4"]["rates"]
+    assert matched4_rates["validation"]["ghi_w_m2"] == 1.0
     assert scaler["train_sample_count"] == result.feature_manifest["split_counts"]["train"]
     assert scaler["train_sample_sha256"]
 
@@ -190,7 +191,77 @@ def test_constant_train_feature_scales_to_zero_without_refitting() -> None:
 
     assert "air_temp_c" in result.scalers["matched4"]["constant_features"]
     assert result.features["matched4_scaled_3"].eq(0.0).all()
-    assert result.clip_rates["matched4"]["validation"]["air_temp_c"] == 0.0
+    profile = result.clip_rates["profiles"]["matched4"]
+    assert profile["rates"]["train"]["air_temp_c"] == 0.0
+    assert profile["rates"]["validation"]["air_temp_c"] == 1.0
+    assert profile["rates"]["test"]["air_temp_c"] == 1.0
+    assert profile["counts"]["validation"]["air_temp_c"] == (
+        result.feature_manifest["split_counts"]["validation"]
+    )
+    assert result.clip_rates["out_of_domain_policy"] == {
+        "comparison": "raw_value < train_min or raw_value > train_max",
+        "constant_feature": "raw_value != train_constant",
+        "equality_is_out_of_domain": False,
+    }
+    assert result.scalers["matched4"]["constant_feature_policy"] == {
+        "out_of_domain_rule": "raw_value != train_constant",
+        "scaled_value": 0.0,
+    }
+
+
+def test_constant_feature_ood_counts_exact_and_deviating_values() -> None:
+    frame = canonical_frame()
+    train_mask = frame["interval_end_utc"] <= pd.Timestamp("2025-01-01T02:00:00Z")
+    validation_mask = (
+        (frame["interval_end_utc"] > pd.Timestamp("2025-01-01T02:00:00Z"))
+        & (frame["interval_end_utc"] <= pd.Timestamp("2025-01-01T03:00:00Z"))
+    )
+    frame.loc[train_mask, "air_temp_c"] = 25.0
+    validation_indices = frame.index[validation_mask]
+    frame.loc[validation_indices, "air_temp_c"] = [
+        25.0 if position % 2 == 0 else 99.0
+        for position in range(len(validation_indices))
+    ]
+
+    result = build_feature_splits(frame, pilot_config())
+    validation = result.features[result.features["split"] == "validation"]
+    expected_count = int(validation["air_temp_c"].ne(25.0).sum())
+    profile = result.clip_rates["profiles"]["matched4"]
+
+    assert validation["matched4_scaled_3"].eq(0.0).all()
+    assert profile["counts"]["validation"]["air_temp_c"] == expected_count
+    assert profile["rates"]["validation"]["air_temp_c"] == pytest.approx(
+        expected_count / len(validation)
+    )
+
+
+def test_resource_memory_scans_are_constant_count_for_large_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = pd.DataFrame.memory_usage
+    calls = 0
+
+    def counted_memory_usage(self: pd.DataFrame, *args: Any, **kwargs: Any) -> pd.Series:
+        nonlocal calls
+        calls += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(pd.DataFrame, "memory_usage", counted_memory_usage)
+    build_feature_splits(
+        canonical_frame(periods=4096),
+        pilot_config(),
+        resource_checkpoint=lambda declared: None,
+    )
+    calls_for_4096 = calls
+    calls = 0
+    build_feature_splits(
+        canonical_frame(periods=8192),
+        pilot_config(),
+        resource_checkpoint=lambda declared: None,
+    )
+
+    assert calls_for_4096 <= 4
+    assert calls == calls_for_4096
 
 
 def test_column_daylight_excludes_false_and_missing_fail_closed() -> None:

@@ -49,6 +49,9 @@ SOLAR_COLUMNS = ("solar_elevation_deg", "solar_azimuth_deg")
 FEATURE_SCHEMA_VERSION = "1.0"
 _SPLIT_NAMES = ("train", "validation", "test")
 _EXPECTED_POWER_LAGS = (0, 5, 10, 15, 30, 60)
+_ESTIMATED_LOOKUP_ENTRY_BYTES = 256
+_ESTIMATED_FEATURE_RECORD_BYTES = 2048
+_ESTIMATED_EXCLUSION_RECORD_BYTES = 512
 
 
 class SplitContractError(ValueError):
@@ -193,31 +196,38 @@ def _fit_and_apply_scaler(
     features: pd.DataFrame,
     columns: tuple[str, ...],
     profile: str,
-) -> tuple[dict[str, Any], dict[str, dict[str, float]]]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     train = features.loc[features["split"] == "train"]
     minimum = {column: float(train[column].min()) for column in columns}
     maximum = {column: float(train[column].max()) for column in columns}
     ranges = {column: maximum[column] - minimum[column] for column in columns}
-    clip_rates: dict[str, dict[str, float]] = {name: {} for name in _SPLIT_NAMES}
+    out_of_domain_rates: dict[str, dict[str, float]] = {
+        name: {} for name in _SPLIT_NAMES
+    }
+    out_of_domain_counts: dict[str, dict[str, int]] = {
+        name: {} for name in _SPLIT_NAMES
+    }
     for position, column in enumerate(columns):
         span = ranges[column]
-        raw_scaled = (
-            pd.Series(0.0, index=features.index, dtype="float64")
-            if span == 0.0
-            else (features[column] - minimum[column]) / span
-        )
+        if span == 0.0:
+            raw_scaled = pd.Series(0.0, index=features.index, dtype="float64")
+            out_of_domain = features[column] != minimum[column]
+        else:
+            raw_scaled = (features[column] - minimum[column]) / span
+            out_of_domain = (features[column] < minimum[column]) | (
+                features[column] > maximum[column]
+            )
         features[f"{profile}_scaled_{position}"] = raw_scaled.clip(0.0, 1.0).astype(
             "float64"
         )
         for split in _SPLIT_NAMES:
             mask = features["split"] == split
-            count = int(mask.sum())
-            rate = (
-                0.0
-                if count == 0 or span == 0.0
-                else float(((raw_scaled[mask] < 0.0) | (raw_scaled[mask] > 1.0)).mean())
+            sample_count = int(mask.sum())
+            out_of_domain_count = int(out_of_domain[mask].sum())
+            out_of_domain_counts[split][column] = out_of_domain_count
+            out_of_domain_rates[split][column] = (
+                0.0 if sample_count == 0 else out_of_domain_count / sample_count
             )
-            clip_rates[split][column] = rate
     scaler = {
         "schema_version": FEATURE_SCHEMA_VERSION,
         "feature_order": list(columns),
@@ -225,12 +235,35 @@ def _fit_and_apply_scaler(
         "max": maximum,
         "range": ranges,
         "constant_features": [column for column in columns if ranges[column] == 0.0],
+        "constant_feature_policy": {
+            "out_of_domain_rule": "raw_value != train_constant",
+            "scaled_value": 0.0,
+        },
         "fitted_split": "train",
         "train_sample_count": len(train),
         "train_sample_sha256": _sample_hash(train["sample_id"]),
         "train_sample_order": ["site_id", "issued_at_utc", "sample_id"],
     }
-    return scaler, clip_rates
+    return scaler, {
+        "counts": out_of_domain_counts,
+        "feature_order": list(columns),
+        "rates": out_of_domain_rates,
+    }
+
+
+def empty_clip_metrics() -> dict[str, Any]:
+    """Return explicit OOD policy metadata with no fitted feature profiles."""
+
+    return {
+        "schema_version": FEATURE_SCHEMA_VERSION,
+        "metric": "out_of_train_domain_before_clipping",
+        "out_of_domain_policy": {
+            "comparison": "raw_value < train_min or raw_value > train_max",
+            "constant_feature": "raw_value != train_constant",
+            "equality_is_out_of_domain": False,
+        },
+        "profiles": {},
+    }
 
 
 def _exclusion_record(row: pd.Series, reason: str, detail: str) -> dict[str, Any]:
@@ -274,8 +307,6 @@ def build_feature_splits(
     """Build exact-time features without interpolation, row shifts, or future leakage."""
 
     work = _validate_canonical(canonical, config)
-    if resource_checkpoint is not None:
-        resource_checkpoint(int(work.memory_usage(index=True, deep=True).sum()))
     solar = _solar_geometry(work, config)
     for column in solar.columns:
         work[column] = solar[column]
@@ -283,13 +314,19 @@ def build_feature_splits(
         (str(row.site_id), pd.Timestamp(row.interval_end_utc)): row
         for row in work.itertuples(index=False)
     }
+    static_declared_bytes = int(work.memory_usage(index=True, deep=True).sum())
+    static_declared_bytes += len(lookup) * _ESTIMATED_LOOKUP_ENTRY_BYTES
+    if resource_checkpoint is not None:
+        resource_checkpoint(static_declared_bytes)
     horizon = timedelta(minutes=15)
     output_rows: list[dict[str, Any]] = []
     exclusions: list[dict[str, Any]] = []
 
     for row_number, (_, row) in enumerate(work.iterrows(), start=1):
         if resource_checkpoint is not None and row_number % 1024 == 0:
-            resource_checkpoint(int(work.memory_usage(index=True, deep=True).sum()))
+            incremental_bytes = len(output_rows) * _ESTIMATED_FEATURE_RECORD_BYTES
+            incremental_bytes += len(exclusions) * _ESTIMATED_EXCLUSION_RECORD_BYTES
+            resource_checkpoint(static_declared_bytes + incremental_bytes)
         issued_at = pd.Timestamp(row["interval_end_utc"])
         split = _split_for_timestamp(issued_at, config)
         if split is None:
@@ -422,18 +459,18 @@ def build_feature_splits(
     has_all_splits = all(split_counts[name] > 0 for name in _SPLIT_NAMES)
     status = StageStatus.SUCCESS if has_all_splits else StageStatus.INVALID
     scalers: dict[str, Any] = {}
-    clip_rates: dict[str, Any] = {}
+    clip_rates = empty_clip_metrics()
     if has_all_splits:
         for profile, columns in (("matched4", MATCHED4_COLUMNS), ("matched6", MATCHED6_COLUMNS)):
-            scaler, rates = _fit_and_apply_scaler(features, columns, profile)
+            scaler, profile_metrics = _fit_and_apply_scaler(features, columns, profile)
             scalers[profile] = scaler
-            clip_rates[profile] = rates
+            clip_rates["profiles"][profile] = profile_metrics
     else:
         for column in _scaled_feature_columns():
             features[column] = pd.Series(np.nan, index=features.index, dtype="float64")
     features = features.loc[:, [*base_columns, *_scaled_feature_columns()]]
     if resource_checkpoint is not None:
-        declared = int(work.memory_usage(index=True, deep=True).sum())
+        declared = static_declared_bytes
         declared += int(features.memory_usage(index=True, deep=True).sum())
         declared += int(exclusions_frame.memory_usage(index=True, deep=True).sum())
         resource_checkpoint(declared)
@@ -576,6 +613,7 @@ __all__ = [
     "build_feature_splits",
     "diagnostic_split_frames",
     "diagnostic_split_parquet_bytes",
+    "empty_clip_metrics",
     "feature_arrow_schema",
     "feature_dataframe_parquet_bytes",
     "split_exclusion_arrow_schema",

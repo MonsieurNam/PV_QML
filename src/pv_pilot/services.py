@@ -31,6 +31,7 @@ from .splits import (
     SplitContractError,
     build_feature_splits,
     diagnostic_split_parquet_bytes,
+    empty_clip_metrics,
     feature_dataframe_parquet_bytes,
     split_exclusion_dataframe_parquet_bytes,
 )
@@ -558,7 +559,7 @@ class DefaultPilotServices:
             transaction.write_bytes("exclusions.parquet", exclusion_bytes)
             transaction.write_json("feature_manifest.json", manifest)
             transaction.write_json("minmax_scalers.json", {})
-            transaction.write_json("clip_rates.json", {})
+            transaction.write_json("clip_rates.json", empty_clip_metrics())
             transaction.write_json("stage_result.json", deterministic_data(result))
             transaction.write_json("resource_ledger.json", ledger)
         return result
