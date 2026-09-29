@@ -745,7 +745,11 @@ from pv_pilot.artifacts import RunStore
 store = RunStore.open(Path({str(store.root)!r}))
 store._release_publications = lambda publications: os._exit(91)
 with store.stage("validate-data", terminal_status="BLOCKED") as transaction:
-    transaction.write_text("stage_result.json", "blocked")
+    transaction.write_text("stage_result.json", {json.dumps({
+        "schema_version": "1.0",
+        "stage": "validate-data",
+        "status": "blocked",
+    }, separators=(",", ":"), sort_keys=True)!r})
 """
     completed = subprocess.run(
         [sys.executable, "-c", script], check=False, capture_output=True, text=True
@@ -758,6 +762,26 @@ with store.stage("validate-data", terminal_status="BLOCKED") as transaction:
 
     with pytest.raises(ValueError, match="terminal marker"):
         RunStore.open(store.root)
+
+
+def test_stage_refuses_result_status_that_disagrees_with_terminal_marker(
+    tmp_path: Path,
+) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    payload = json.dumps(
+        {"schema_version": "1.0", "stage": "validate-data", "status": "blocked"},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+    with (
+        pytest.raises(ValueError, match="terminal result status"),
+        store.stage("validate-data", terminal_status="SUCCESS") as transaction,
+    ):
+        transaction.write_text("stage_result.json", payload)
+
+    assert not (store.root / "validate-data/stage_result.json").exists()
+    assert not (store.root / "validate-data/stage_manifest.json").exists()
 
 
 def test_publication_lock_rejects_symlink_and_hardlink_without_mutating_target(

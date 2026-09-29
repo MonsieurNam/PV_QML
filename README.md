@@ -24,6 +24,9 @@ Configured source-column names beginning with `_pv_pilot_` are rejected because 
 reserved for collision-proof adapter bookkeeping. The data card distinguishes raw rows accepted
 into canonical intervals from raw rows excluded; synthetic gap records are counted separately as
 ledger records and never as raw input rows.
+Every published `stage_result.json` is declared by its stage manifest. Its normalized terminal
+status must match the marker before publication, during crash recovery, on resume, and whenever a
+downstream stage verifies prerequisites.
 
 The bundled fixture is synthetic and exists only for software acceptance:
 

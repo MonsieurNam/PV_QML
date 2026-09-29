@@ -60,6 +60,13 @@ _PACKAGE_NAMES = (
 _PUBLICATION_JOURNAL = "ownership.json"
 _PUBLICATION_JOURNAL_SCHEMA = "1"
 _PUBLICATION_ABORT_PREFIX = ".publication-abort-"
+_TERMINAL_STATUSES = frozenset({"SUCCESS", "BLOCKED", "INVALID"})
+
+
+def _normalize_terminal_status(value: object) -> str:
+    if not isinstance(value, str) or value.upper() not in _TERMINAL_STATUSES:
+        raise ValueError("terminal result has an invalid status")
+    return value.upper()
 
 
 @dataclass(frozen=True, slots=True)
@@ -535,6 +542,13 @@ class RunStore:
         }
         if any(actual_outputs.get(path) != digest for path, digest in expected_outputs.items()):
             raise ValueError("publication success marker outputs do not match journal")
+        for relative_path, expected_digest in expected_outputs.items():
+            if not isinstance(relative_path, str) or not isinstance(expected_digest, str):
+                raise ValueError("publication output checksum record is invalid")
+            output = self._validated_target(relative_path)
+            if not output.is_file() or sha256_file(output) != expected_digest:
+                raise ValueError(f"publication output checksum mismatch: {relative_path}")
+        self._verify_terminal_result_contract(manifest)
         return True
 
     def _recover_publication_journals(self) -> None:
@@ -911,8 +925,36 @@ class RunStore:
                 raise ValueError(
                     f"prerequisite output checksum mismatch: {relative_path}"
                 )
+        self._verify_terminal_result_contract(manifest)
         verified.add(stage)
         return sha256_file(path)
+
+    def _verify_terminal_result_contract(self, manifest: Mapping[str, object]) -> None:
+        """Require a declared JSON result status to match its terminal stage marker."""
+
+        declaration = manifest.get("terminal_result")
+        if declaration is None:
+            return
+        if not isinstance(declaration, dict):
+            raise ValueError("stage terminal result declaration is invalid")
+        result_path = declaration.get("path")
+        declared_status = _normalize_terminal_status(declaration.get("status"))
+        marker_status = _normalize_terminal_status(manifest.get("status"))
+        stage = manifest.get("stage")
+        if declared_status != marker_status:
+            raise ValueError("terminal result status does not match stage marker")
+        if not isinstance(result_path, str) or not isinstance(stage, str):
+            raise ValueError("stage terminal result declaration is invalid")
+        outputs = manifest.get("outputs")
+        if not isinstance(outputs, list) or result_path not in {
+            record.get("path") for record in outputs if isinstance(record, dict)
+        }:
+            raise ValueError("declared terminal result is not a stage output")
+        payload = self._read_json_file(self._validated_target(result_path))
+        if payload.get("stage") != stage:
+            raise ValueError("terminal result stage does not match stage marker")
+        if _normalize_terminal_status(payload.get("status")) != marker_status:
+            raise ValueError("terminal result status does not match stage marker")
 
     def verify_terminal_stage(
         self,
@@ -1096,6 +1138,24 @@ class StageTransaction:
             {"path": logical, "sha256": sha256_file(temporary)}
             for logical, temporary in sorted(self._outputs.items())
         ]
+        result_logical = f"{self.stage}/stage_result.json"
+        terminal_result: dict[str, str] | None = None
+        result_temporary = self._outputs.get(result_logical)
+        if result_temporary is not None:
+            try:
+                result_payload = self._store._read_json_file(result_temporary)
+                if result_payload.get("stage") != self.stage:
+                    raise ValueError(
+                        "terminal result stage does not match its transaction"
+                    )
+                result_status = _normalize_terminal_status(result_payload.get("status"))
+                if result_status != self._terminal_status:
+                    raise ValueError("terminal result status does not match stage marker")
+                terminal_result = {"path": result_logical, "status": result_status}
+            except BaseException:
+                self._release_lease()
+                shutil.rmtree(temporary_root, ignore_errors=True)
+                raise
         transaction_id = uuid4().hex
         marker_relative = f"{self.stage}/stage_manifest.json"
         published = PublicationBatch(
@@ -1148,6 +1208,7 @@ class StageTransaction:
                     "stage": self.stage,
                     "started_at": _timestamp(self._started_at),
                     "status": self._terminal_status,
+                    "terminal_result": terminal_result,
                     "transaction_id": transaction_id,
                 }
                 self._store._write_bytes(

@@ -368,6 +368,42 @@ def test_resume_rejects_tampered_blocked_stage_outputs(tmp_path: Path) -> None:
         service.validate_data(store.root)
 
 
+def test_result_status_tamper_fails_checksum_before_semantic_check(tmp_path: Path) -> None:
+    store, _ = make_run(tmp_path, frame_5m())
+    service = DefaultPilotServices()
+    assert service.validate_data(store.root).status is StageStatus.SUCCESS
+    result_path = store.root / "validate-data/stage_result.json"
+    payload = read_json(result_path)
+    payload["status"] = "blocked"
+    result_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="output checksum"):
+        service.validate_data(store.root)
+
+
+def test_valid_checksums_cannot_hide_result_marker_status_mismatch(
+    tmp_path: Path,
+) -> None:
+    store, _ = make_run(tmp_path, frame_5m())
+    service = DefaultPilotServices()
+    assert service.validate_data(store.root).status is StageStatus.SUCCESS
+    result_path = store.root / "validate-data/stage_result.json"
+    payload = read_json(result_path)
+    payload["status"] = "blocked"
+    result_path.write_text(json.dumps(payload), encoding="utf-8")
+    marker_path = store.root / "validate-data/stage_manifest.json"
+    marker = read_json(marker_path)
+    for output in marker["outputs"]:
+        if output["path"] == "validate-data/stage_result.json":
+            output["sha256"] = sha256_file(result_path)
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="terminal result status"):
+        service.validate_data(store.root)
+    with pytest.raises(ValueError, match="terminal result status"):
+        RunStore.open(store.root).stage("build-splits")
+
+
 def test_source_tamper_after_init_is_durable_invalid(tmp_path: Path) -> None:
     store, input_path = make_run(tmp_path, frame_5m())
     original = sha256_file(input_path)
