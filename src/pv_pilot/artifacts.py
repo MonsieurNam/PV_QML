@@ -146,12 +146,14 @@ class PublicationBatch(list[PublicationOwnership]):
         transaction_id: str,
         stage: str,
         marker_relative: str,
+        terminal_status: Literal["SUCCESS", "BLOCKED", "INVALID"],
         output_hashes: Mapping[str, str],
     ) -> None:
         super().__init__()
         self.transaction_id = transaction_id
         self.stage = stage
         self.marker_relative = marker_relative
+        self.terminal_status = terminal_status
         self.output_hashes = dict(output_hashes)
 
 
@@ -488,14 +490,34 @@ class RunStore:
         manifest = self._read_json_file(marker)
         transaction_id = first["transaction_id"]
         stage = first["stage"]
+        terminal_status = first["terminal_status"]
+        if terminal_status not in {"SUCCESS", "BLOCKED", "INVALID"}:
+            raise ValueError("publication journal terminal status is invalid")
+        common_fields = (
+            "config_hash",
+            "marker",
+            "run_id",
+            "schema",
+            "stage",
+            "terminal_status",
+            "transaction_id",
+        )
+        if any(
+            any(
+                self._publication_record(publication).get(field) != first.get(field)
+                for field in common_fields
+            )
+            for publication in publications
+        ):
+            raise ValueError("publication journal group metadata is inconsistent")
         if (
             manifest.get("transaction_id") != transaction_id
             or manifest.get("stage") != stage
             or manifest.get("config_hash") != self.config_hash
             or manifest.get("schema_version") != SCHEMA_VERSION
-            or manifest.get("status") != "SUCCESS"
+            or manifest.get("status") != terminal_status
         ):
-            raise ValueError("publication success marker does not match journal")
+            raise ValueError("publication terminal marker does not match journal")
         expected_outputs = {
             self._publication_record(publication)["destination"]: self._publication_record(
                 publication
@@ -557,6 +579,7 @@ class RunStore:
                 "schema",
                 "sha256",
                 "stage",
+                "terminal_status",
                 "transaction_id",
             )
             if any(not isinstance(record.get(key), str) for key in required_strings):
@@ -566,6 +589,8 @@ class RunStore:
                 or record["config_hash"] != self.config_hash
                 or record["run_id"] != self.root.name
                 or record["kind"] not in {"output", "marker"}
+                or record["terminal_status"]
+                not in {"SUCCESS", "BLOCKED", "INVALID"}
                 or not isinstance(record.get("source_device"), int)
                 or not isinstance(record.get("source_inode"), int)
             ):
@@ -693,6 +718,7 @@ class RunStore:
                 "source_device": source_stat.st_dev,
                 "source_inode": source_stat.st_ino,
                 "stage": publications.stage,
+                "terminal_status": publications.terminal_status,
                 "transaction_id": publications.transaction_id,
             }
         ownership = PublicationOwnership(
@@ -853,6 +879,23 @@ class RunStore:
             target = self._validated_target(relative_path)
             if not target.is_file() or sha256_file(target) != expected:
                 raise ValueError(f"prerequisite input checksum mismatch: {relative_path}")
+        external_inputs = manifest.get("external_input_hashes")
+        if not isinstance(external_inputs, list):
+            raise ValueError(f"stage {stage!r} has invalid external input hashes")
+        for record in external_inputs:
+            if not isinstance(record, dict):
+                raise ValueError(f"stage {stage!r} has invalid external input hashes")
+            raw_path = record.get("path")
+            expected_external = record.get("sha256")
+            if not isinstance(raw_path, str) or not isinstance(expected_external, str):
+                raise ValueError(f"stage {stage!r} has invalid external input hashes")
+            external_path = Path(raw_path)
+            if (
+                not external_path.is_absolute()
+                or not external_path.is_file()
+                or sha256_file(external_path) != expected_external
+            ):
+                raise ValueError(f"external input checksum mismatch: {raw_path}")
         outputs = manifest.get("outputs")
         if not isinstance(outputs, list):
             raise ValueError(f"prerequisite stage {stage!r} has invalid outputs")
@@ -890,6 +933,7 @@ class RunStore:
         stage: str,
         *,
         input_paths: Iterable[str | Path] = (),
+        external_input_hashes: Mapping[str | Path, str] | None = None,
         details: Mapping[str, object] | None = None,
         terminal_status: Literal["SUCCESS", "BLOCKED", "INVALID"] = "SUCCESS",
         config_hash: str | None = None,
@@ -916,10 +960,22 @@ class RunStore:
             if not target.is_file():
                 raise FileNotFoundError(f"stage input is not a file: {relative}")
             inputs[relative] = sha256_file(target)
+        external_inputs: dict[str, str] = {}
+        for input_path, expected in (external_input_hashes or {}).items():
+            target = Path(input_path).resolve()
+            if (
+                len(expected) != 64
+                or any(character not in "0123456789abcdef" for character in expected)
+            ):
+                raise ValueError("external input checksum must be a lowercase SHA-256 digest")
+            if not target.is_file() or sha256_file(target) != expected:
+                raise ValueError(f"external stage input changed: {target}")
+            external_inputs[target.as_posix()] = expected
         return StageTransaction(
             store=self,
             stage=stage,
             input_hashes=inputs,
+            external_input_hashes=external_inputs,
             prerequisite_manifest_hashes=prerequisite_hashes,
             details=dict(details or {}),
             terminal_status=terminal_status,
@@ -936,6 +992,7 @@ class StageTransaction:
         store: RunStore,
         stage: str,
         input_hashes: dict[str, str],
+        external_input_hashes: dict[str, str],
         prerequisite_manifest_hashes: dict[str, str],
         details: dict[str, object],
         terminal_status: Literal["SUCCESS", "BLOCKED", "INVALID"],
@@ -944,6 +1001,7 @@ class StageTransaction:
         self._store = store
         self.stage = stage
         self._input_hashes = input_hashes
+        self._external_input_hashes = external_input_hashes
         self._prerequisite_manifest_hashes = prerequisite_manifest_hashes
         self._details = details
         self._terminal_status = terminal_status
@@ -1044,6 +1102,7 @@ class StageTransaction:
             transaction_id=transaction_id,
             stage=self.stage,
             marker_relative=marker_relative,
+            terminal_status=self._terminal_status,
             output_hashes={
                 str(record["path"]): str(record["sha256"]) for record in output_records
             },
@@ -1055,6 +1114,13 @@ class StageTransaction:
                     target = self._store._validated_target(relative_path)
                     if not target.is_file() or sha256_file(target) != expected:
                         raise ValueError(f"stage input changed: {relative_path}")
+                for raw_path, expected in self._external_input_hashes.items():
+                    external_path = Path(raw_path)
+                    if (
+                        not external_path.is_file()
+                        or sha256_file(external_path) != expected
+                    ):
+                        raise ValueError(f"external stage input changed: {raw_path}")
                 marker = self._store._validated_target(marker_relative)
                 if marker.exists() or marker.is_symlink():
                     raise FileExistsError(f"stage {self.stage!r} is already completed")
@@ -1072,6 +1138,10 @@ class StageTransaction:
                     "details": self._details,
                     "ended_at": _timestamp(ended_at),
                     "input_hashes": self._input_hashes,
+                    "external_input_hashes": [
+                        {"path": path, "sha256": digest}
+                        for path, digest in sorted(self._external_input_hashes.items())
+                    ],
                     "outputs": output_records,
                     "prerequisite_manifest_hashes": self._prerequisite_manifest_hashes,
                     "schema_version": SCHEMA_VERSION,

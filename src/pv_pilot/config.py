@@ -30,6 +30,7 @@ from .seeds import SeedManager
 NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
 PositiveInt = Annotated[StrictInt, Field(gt=0)]
 PositiveFloat = Annotated[StrictFloat, Field(gt=0)]
+RESERVED_COLUMN_PREFIX = "_pv_pilot_"
 
 
 class StrictConfigModel(BaseModel):
@@ -158,6 +159,11 @@ class DataConfig(StrictConfigModel):
             roles.append(("weather_availability", self.availability.weather.column))
         seen: dict[str, str] = {}
         for role, column in roles:
+            if column.startswith(RESERVED_COLUMN_PREFIX):
+                raise ValueError(
+                    f"column mapping {column!r} uses reserved prefix "
+                    f"{RESERVED_COLUMN_PREFIX!r}"
+                )
             if column in seen:
                 raise ValueError(
                     f"duplicate column mapping {column!r} for {seen[column]!r} and {role!r}"

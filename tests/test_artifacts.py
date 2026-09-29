@@ -14,6 +14,7 @@ from test_config import valid_config
 
 from pv_pilot.artifacts import RunStore, sha256_file
 from pv_pilot.config import LoadedPilotConfig, load_config
+from pv_pilot.services import DefaultPilotServices
 
 FIXED_NOW = datetime(2026, 9, 28, 12, 34, 56, tzinfo=UTC)
 
@@ -680,6 +681,83 @@ def test_open_commits_matching_marker_after_process_dies_before_abort_intent(
     assert not any(path.name.startswith(".rollback-") for path in output.parent.iterdir())
     with pytest.raises(FileExistsError, match="completed"):
         resumed.stage("validate-data", now=FIXED_NOW)
+
+
+@pytest.mark.parametrize("terminal_status", ["BLOCKED", "INVALID"])
+def test_open_recovers_terminal_marker_after_true_process_death(
+    tmp_path: Path, terminal_status: str
+) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    result_payload = json.dumps(
+        {
+            "artifacts": [],
+            "details": {},
+            "message": "terminal result",
+            "schema_version": "1.0",
+            "stage": "validate-data",
+            "status": terminal_status.lower(),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    script = f"""
+import os
+from pathlib import Path
+from pv_pilot.artifacts import RunStore
+
+store = RunStore.open(Path({str(store.root)!r}))
+store._release_publications = lambda publications: os._exit(91)
+with store.stage("validate-data", terminal_status={terminal_status!r}) as transaction:
+    transaction.write_text("stage_result.json", {result_payload!r})
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script], check=False, capture_output=True, text=True
+    )
+
+    assert completed.returncode == 91, completed.stderr
+    marker = store.root / "validate-data/stage_manifest.json"
+    assert read_json(marker)["status"] == terminal_status
+    assert any(
+        path.name.startswith(".rollback-")
+        for path in (store.root / "validate-data").iterdir()
+    )
+    resumed = RunStore.open(store.root)
+    resumed.verify_terminal_stage(
+        "validate-data", accepted_statuses=frozenset({terminal_status})
+    )
+    result = DefaultPilotServices().validate_data(store.root)
+    assert result.status.value == terminal_status.lower()
+    assert "already" in (result.message or "")
+    assert not any(
+        path.name.startswith(".rollback-")
+        for path in (store.root / "validate-data").iterdir()
+    )
+
+
+def test_recovery_rejects_marker_status_that_differs_from_journal(tmp_path: Path) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    script = f"""
+import os
+from pathlib import Path
+from pv_pilot.artifacts import RunStore
+
+store = RunStore.open(Path({str(store.root)!r}))
+store._release_publications = lambda publications: os._exit(91)
+with store.stage("validate-data", terminal_status="BLOCKED") as transaction:
+    transaction.write_text("stage_result.json", "blocked")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script], check=False, capture_output=True, text=True
+    )
+    assert completed.returncode == 91, completed.stderr
+    marker = store.root / "validate-data/stage_manifest.json"
+    payload = read_json(marker)
+    payload["status"] = "INVALID"
+    marker.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="terminal marker"):
+        RunStore.open(store.root)
 
 
 def test_publication_lock_rejects_symlink_and_hardlink_without_mutating_target(

@@ -11,6 +11,7 @@ import yaml
 from test_config import valid_config
 from typer.testing import CliRunner
 
+import pv_pilot.services as services_module
 from pv_pilot.artifacts import RunStore, sha256_file
 from pv_pilot.cli import app
 from pv_pilot.config import DataConfig, load_config
@@ -128,6 +129,32 @@ def test_one_minute_bins_are_right_closed_exact_five_point_means(tmp_path: Path)
     assert "incomplete_bin" in set(result.exclusions["reason"])
 
 
+def test_incomplete_one_minute_bin_excludes_every_constituent(tmp_path: Path) -> None:
+    frame = pd.DataFrame(
+        {
+            "site_id": "A",
+            "timestamp": pd.date_range("2025-01-01 00:01", periods=4, freq="1min").astype(str),
+            "power_kw": [1, 2, 3, 4],
+            "capacity_kw": 10,
+            "ghi_w_m2": [10, 20, 30, 40],
+            "temperature_c": [20, 21, 22, 23],
+        }
+    )
+    path = tmp_path / "incomplete.csv"
+    frame.to_csv(path, index=False)
+
+    result = canonicalize_data(path, data_config(cadence=1), "csv")
+
+    incomplete = result.exclusions[result.exclusions["reason"] == "incomplete_bin"]
+    assert len(incomplete) == 4
+    assert incomplete["source_row_id"].nunique() == 4
+    assert result.accepted_input_row_count == 0
+    assert result.excluded_input_row_count == 4
+    assert result.input_row_count == (
+        result.accepted_input_row_count + result.excluded_input_row_count
+    )
+
+
 def test_explicit_availability_uses_latest_constituent_and_preserves_delay(
     tmp_path: Path,
 ) -> None:
@@ -209,6 +236,26 @@ def test_off_grid_and_nonfinite_rows_are_excluded_without_interpolation(
     assert result.canonical["interval_end_utc"].tolist() == [
         pd.Timestamp("2025-01-01T00:10:00Z")
     ]
+
+
+def test_five_minute_alignment_rejects_nanosecond_remainder(tmp_path: Path) -> None:
+    frame = frame_5m().iloc[:1].copy()
+    frame["timestamp"] = ["2025-01-01T00:05:00.000000001Z"]
+    path = tmp_path / "nanosecond.parquet"
+    frame.to_parquet(path, index=False)
+
+    result = canonicalize_data(path, data_config(), "parquet")
+
+    assert result.status is StageStatus.INVALID
+    assert result.exclusions["reason"].tolist() == ["off_grid"]
+
+
+def test_reserved_working_prefix_is_rejected_in_configured_mapping() -> None:
+    payload = valid_config()["data"]
+    payload["columns"]["site"] = "_pv_pilot_source_row_id"
+
+    with pytest.raises(ValueError, match="reserved"):
+        DataConfig.model_validate(payload)
 
 
 def test_missing_site_and_timestamp_are_safely_excluded(tmp_path: Path) -> None:
@@ -333,6 +380,59 @@ def test_source_tamper_after_init_is_durable_invalid(tmp_path: Path) -> None:
     assert stage["status"] == "invalid"
     assert stage["details"]["expected_sha256"] == original
     assert stage["details"]["scientific_decision"] == "NOT_EVALUATED"
+
+
+def test_source_deleted_after_available_init_is_invalid_not_blocked(tmp_path: Path) -> None:
+    store, input_path = make_run(tmp_path, frame_5m())
+    input_path.unlink()
+
+    result = DefaultPilotServices().validate_data(store.root)
+
+    assert result.status is StageStatus.INVALID
+    assert "checksum" in (result.message or "")
+    assert read_json(store.root / "validate-data/stage_manifest.json")["status"] == "INVALID"
+
+
+@pytest.mark.parametrize("tamper", ["mutate", "delete"])
+def test_source_change_during_serialization_cannot_publish_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str
+) -> None:
+    store, input_path = make_run(tmp_path, frame_5m())
+    original_serializer = services_module.dataframe_parquet_bytes
+    mutated = False
+
+    def mutate_then_serialize(frame: pd.DataFrame) -> bytes:
+        nonlocal mutated
+        if not mutated:
+            mutated = True
+            if tamper == "mutate":
+                input_path.write_text("mutated during publication\n", encoding="utf-8")
+            else:
+                input_path.unlink()
+        return original_serializer(frame)
+
+    monkeypatch.setattr(services_module, "dataframe_parquet_bytes", mutate_then_serialize)
+
+    with pytest.raises(ValueError, match="external stage input changed"):
+        DefaultPilotServices().validate_data(store.root)
+
+    assert mutated
+    assert not (store.root / "validate-data/stage_manifest.json").exists()
+    assert not (store.root / "validate-data/canonical.parquet").exists()
+
+
+def test_success_manifest_tracks_and_revalidates_external_source(tmp_path: Path) -> None:
+    store, input_path = make_run(tmp_path, frame_5m())
+    service = DefaultPilotServices()
+    assert service.validate_data(store.root).status is StageStatus.SUCCESS
+    manifest = read_json(store.root / "validate-data/stage_manifest.json")
+
+    assert manifest["external_input_hashes"] == [
+        {"path": input_path.resolve().as_posix(), "sha256": sha256_file(input_path)}
+    ]
+    input_path.write_text("changed after success\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="external input checksum"):
+        service.validate_data(store.root)
 
 
 def test_empty_exclusion_parquet_has_stable_schema(tmp_path: Path) -> None:

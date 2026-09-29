@@ -16,10 +16,10 @@ from .data import (
     DataValidationResult,
     canonical_checksum,
     canonicalize_data,
-    dataframe_parquet_bytes,
     empty_canonical_frame,
     empty_exclusion_frame,
 )
+from .data import dataframe_parquet_bytes as dataframe_parquet_bytes
 from .domain import DetailEntry, StageResult, StageStatus, deterministic_data
 
 
@@ -99,7 +99,8 @@ class DefaultPilotServices:
         status: StageStatus
         message: str
         failure_details: dict[str, object] = {}
-        if source_record.get("status") == "MISSING" or actual_hash is None:
+        register_external_input = False
+        if source_record.get("status") == "MISSING":
             status = StageStatus.BLOCKED
             message = "input dataset is missing; scientific decision not evaluated"
             result = DataValidationResult(
@@ -109,6 +110,23 @@ class DefaultPilotServices:
                 ),
                 exclusions=empty_exclusion_frame(),
                 input_row_count=0,
+                accepted_input_row_count=0,
+            )
+        elif actual_hash is None:
+            status = StageStatus.INVALID
+            message = "input dataset checksum cannot be verified because the source is missing"
+            failure_details = {
+                "actual_sha256": None,
+                "expected_sha256": expected_hash,
+            }
+            result = DataValidationResult(
+                status=status,
+                canonical=empty_canonical_frame(
+                    include_daylight=config.data.columns.daylight is not None
+                ),
+                exclusions=empty_exclusion_frame(),
+                input_row_count=0,
+                accepted_input_row_count=0,
             )
         elif not isinstance(expected_hash, str) or actual_hash != expected_hash:
             status = StageStatus.INVALID
@@ -124,8 +142,10 @@ class DefaultPilotServices:
                 ),
                 exclusions=empty_exclusion_frame(),
                 input_row_count=0,
+                accepted_input_row_count=0,
             )
         else:
+            register_external_input = True
             try:
                 result = canonicalize_data(source_path, config.data, config.data.format)
             except (DataContractError, OSError, ValueError) as error:
@@ -139,10 +159,12 @@ class DefaultPilotServices:
                     ),
                     exclusions=empty_exclusion_frame(),
                     input_row_count=0,
+                    accepted_input_row_count=0,
                 )
             else:
                 post_read_hash = sha256_file(source_path)
                 if post_read_hash != expected_hash:
+                    register_external_input = False
                     status = StageStatus.INVALID
                     message = "input dataset changed while it was being validated"
                     failure_details = {
@@ -156,6 +178,7 @@ class DefaultPilotServices:
                         ),
                         exclusions=empty_exclusion_frame(),
                         input_row_count=0,
+                        accepted_input_row_count=0,
                     )
                 else:
                     status = result.status
@@ -184,8 +207,10 @@ class DefaultPilotServices:
             "cadence_minutes": config.data.raw_cadence_minutes,
             "end_utc": end_utc,
             "excluded_by_reason": result.exclusion_counts,
-            "excluded_row_count": len(exclusions),
+            "excluded_row_count": result.excluded_input_row_count,
+            "exclusion_record_count": len(exclusions),
             "input_row_count": result.input_row_count,
+            "accepted_input_row_count": result.accepted_input_row_count,
             "input_sha256": expected_hash,
             "provenance": config.protocol.provenance.value,
             "schema_version": "1.0",
@@ -222,6 +247,11 @@ class DefaultPilotServices:
         terminal = cast(Literal["SUCCESS", "BLOCKED", "INVALID"], status.value.upper())
         with store.stage(
             "validate-data",
+            external_input_hashes=(
+                {source_path: expected_hash}
+                if register_external_input and isinstance(expected_hash, str)
+                else None
+            ),
             terminal_status=terminal,
             details={"result_status": status.value, "scientific_decision": "NOT_EVALUATED"},
         ) as transaction:
