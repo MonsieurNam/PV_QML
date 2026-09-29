@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
+import pandas as pd
 import psutil
 
 from .artifacts import RunStore, sha256_file
@@ -25,6 +26,14 @@ from .data import (
 )
 from .data import dataframe_parquet_bytes as dataframe_parquet_bytes
 from .domain import DetailEntry, StageResult, StageStatus, deterministic_data
+from .splits import (
+    FEATURE_SCHEMA_VERSION,
+    SplitContractError,
+    build_feature_splits,
+    diagnostic_split_parquet_bytes,
+    feature_dataframe_parquet_bytes,
+    split_exclusion_dataframe_parquet_bytes,
+)
 
 
 class _ResourceLimitExceeded(RuntimeError):
@@ -114,6 +123,27 @@ class DefaultPilotServices:
         if status == "SUCCESS":
             return result.model_copy(update={"message": "validate-data already successful"})
         return result.model_copy(update={"message": f"validate-data already {status.lower()}"})
+
+    @classmethod
+    def _existing_build_splits_result(cls, store: RunStore) -> StageResult | None:
+        marker = store.root / "build-splits/stage_manifest.json"
+        if not marker.is_file():
+            return None
+        manifest = cls._read_object(marker)
+        status = manifest.get("status")
+        if status not in {"SUCCESS", "INVALID"}:
+            raise ValueError("build-splits has an invalid terminal marker")
+        store.verify_terminal_stage(
+            "build-splits", accepted_statuses=frozenset({str(status)})
+        )
+        result_path = store.root / "build-splits/stage_result.json"
+        result = StageResult.model_validate_json(result_path.read_text(encoding="utf-8"))
+        message = (
+            "build-splits already successful"
+            if status == "SUCCESS"
+            else "build-splits already invalid"
+        )
+        return result.model_copy(update={"message": message})
 
     @staticmethod
     def _publish_resource_invalid(
@@ -445,8 +475,225 @@ class DefaultPilotServices:
             )
         return stage_result
 
-    def build_splits(self, run_dir: Path) -> None:
-        self._unimplemented("build-splits")
+    @staticmethod
+    def _split_artifacts() -> tuple[Path, ...]:
+        return (
+            Path("build-splits/feature_matrix.parquet"),
+            Path("build-splits/exclusions.parquet"),
+            Path("build-splits/feature_manifest.json"),
+            Path("build-splits/minmax_scalers.json"),
+            Path("build-splits/clip_rates.json"),
+            Path("build-splits/resource_ledger.json"),
+        )
+
+    @staticmethod
+    def _split_ledger(
+        *,
+        guard: _ResourceGuard,
+        status: StageStatus,
+        resource_status: str,
+    ) -> dict[str, object]:
+        guard.sample_without_enforcement()
+        return {
+            "elapsed_seconds": time.perf_counter() - guard.started,
+            "peak_declared_bytes_observed": guard.peak_declared_bytes,
+            "peak_rss_bytes_observed": guard.peak_rss_bytes,
+            "resource_status": resource_status,
+            "schema_version": FEATURE_SCHEMA_VERSION,
+            "scientific_decision": "NOT_EVALUATED",
+            "status": status.value,
+            "timebox_seconds": guard.wall_seconds,
+        }
+
+    def _publish_split_invalid(
+        self,
+        *,
+        store: RunStore,
+        config: PilotConfig,
+        canonical_path: Path,
+        guard: _ResourceGuard,
+        message: str,
+        failure_details: dict[str, object],
+        resource_status: str,
+    ) -> StageResult:
+        """Publish small, schema-stable INVALID outputs without an expired guard."""
+
+        feature_bytes, exclusion_bytes = diagnostic_split_parquet_bytes(config)
+        manifest = {
+            "schema_version": FEATURE_SCHEMA_VERSION,
+            "status": StageStatus.INVALID.value,
+            "scientific_decision": "NOT_EVALUATED",
+            "split_counts": {"train": 0, "validation": 0, "test": 0},
+            "exclusion_counts": {},
+            "diagnostic": failure_details,
+        }
+        details = {
+            "scientific_decision": "NOT_EVALUATED",
+            **failure_details,
+        }
+        result = StageResult(
+            stage="build-splits",
+            status=StageStatus.INVALID,
+            message=message,
+            artifacts=self._split_artifacts(),
+            details=tuple(
+                DetailEntry(key=key, value=value) for key, value in details.items()
+            ),
+        )
+        ledger = self._split_ledger(
+            guard=guard,
+            status=StageStatus.INVALID,
+            resource_status=resource_status,
+        )
+        with store.stage(
+            "build-splits",
+            input_paths=(Path("validate-data/canonical.parquet"),),
+            terminal_status="INVALID",
+            details={
+                "result_status": StageStatus.INVALID.value,
+                "scientific_decision": "NOT_EVALUATED",
+            },
+        ) as transaction:
+            transaction.write_bytes("feature_matrix.parquet", feature_bytes)
+            transaction.write_bytes("exclusions.parquet", exclusion_bytes)
+            transaction.write_json("feature_manifest.json", manifest)
+            transaction.write_json("minmax_scalers.json", {})
+            transaction.write_json("clip_rates.json", {})
+            transaction.write_json("stage_result.json", deterministic_data(result))
+            transaction.write_json("resource_ledger.json", ledger)
+        return result
+
+    def build_splits(self, run_dir: Path) -> StageResult:
+        started = time.perf_counter()
+        store = RunStore.open(run_dir)
+        existing = self._existing_build_splits_result(store)
+        if existing is not None:
+            return existing
+        store.verify_terminal_stage("validate-data")
+        config = self._run_config(store)
+        canonical_path = store.root / "validate-data/canonical.parquet"
+        guard = _ResourceGuard(
+            started=started,
+            wall_seconds=config.resources.max_wall_clock_seconds,
+            memory_bytes=int(config.resources.max_memory_gb * 1024**3),
+        )
+        try:
+            guard.checkpoint(canonical_path.stat().st_size)
+            canonical = pd.read_parquet(canonical_path)
+            declared = int(canonical.memory_usage(index=True, deep=True).sum())
+            guard.checkpoint(declared)
+            build = build_feature_splits(
+                canonical,
+                config,
+                resource_checkpoint=guard.checkpoint,
+            )
+        except _ResourceLimitExceeded as error:
+            return self._publish_split_invalid(
+                store=store,
+                config=config,
+                canonical_path=canonical_path,
+                guard=guard,
+                message="split construction exceeded a configured resource cap",
+                failure_details={"resource_gate": error.gate},
+                resource_status="EXCEEDED",
+            )
+        except (SplitContractError, OSError, TypeError, ValueError) as error:
+            return self._publish_split_invalid(
+                store=store,
+                config=config,
+                canonical_path=canonical_path,
+                guard=guard,
+                message=f"canonical data violates the split contract: {error}",
+                failure_details={"error_type": type(error).__name__},
+                resource_status="WITHIN_LIMIT",
+            )
+
+        try:
+            feature_bytes = feature_dataframe_parquet_bytes(build.features, config)
+            guard.checkpoint(declared + len(feature_bytes))
+            exclusion_bytes = split_exclusion_dataframe_parquet_bytes(build.exclusions)
+            guard.checkpoint(declared + len(feature_bytes) + len(exclusion_bytes))
+        except _ResourceLimitExceeded as error:
+            return self._publish_split_invalid(
+                store=store,
+                config=config,
+                canonical_path=canonical_path,
+                guard=guard,
+                message="split serialization exceeded a configured resource cap",
+                failure_details={"resource_gate": error.gate},
+                resource_status="EXCEEDED",
+            )
+        except (OSError, TypeError, ValueError) as error:
+            return self._publish_split_invalid(
+                store=store,
+                config=config,
+                canonical_path=canonical_path,
+                guard=guard,
+                message=f"split outputs violate their serialization contract: {error}",
+                failure_details={"error_type": type(error).__name__},
+                resource_status="WITHIN_LIMIT",
+            )
+
+        status = build.status
+        message = (
+            "feature splits built successfully"
+            if status is StageStatus.SUCCESS
+            else "one or more chronological splits contain no eligible samples"
+        )
+        result = StageResult(
+            stage="build-splits",
+            status=status,
+            message=message,
+            artifacts=self._split_artifacts(),
+            details=(
+                DetailEntry(key="scientific_decision", value="NOT_EVALUATED"),
+                DetailEntry(
+                    key="split_counts", value=build.feature_manifest["split_counts"]
+                ),
+            ),
+        )
+        ledger = self._split_ledger(
+            guard=guard,
+            status=status,
+            resource_status="WITHIN_LIMIT",
+        )
+        terminal = cast(Literal["SUCCESS", "INVALID"], status.value.upper())
+        try:
+            with store.stage(
+                "build-splits",
+                input_paths=(Path("validate-data/canonical.parquet"),),
+                terminal_status=terminal,
+                details={
+                    "result_status": status.value,
+                    "scientific_decision": "NOT_EVALUATED",
+                },
+                commit_guard=guard.checkpoint,
+            ) as transaction:
+                transaction.write_bytes("feature_matrix.parquet", feature_bytes)
+                guard.checkpoint(declared + len(feature_bytes) + len(exclusion_bytes))
+                transaction.write_bytes("exclusions.parquet", exclusion_bytes)
+                guard.checkpoint(declared + len(feature_bytes) + len(exclusion_bytes))
+                transaction.write_json("feature_manifest.json", build.feature_manifest)
+                guard.checkpoint(declared + len(feature_bytes) + len(exclusion_bytes))
+                transaction.write_json("minmax_scalers.json", build.scalers)
+                guard.checkpoint(declared + len(feature_bytes) + len(exclusion_bytes))
+                transaction.write_json("clip_rates.json", build.clip_rates)
+                guard.checkpoint(declared + len(feature_bytes) + len(exclusion_bytes))
+                transaction.write_json("stage_result.json", deterministic_data(result))
+                guard.checkpoint(declared + len(feature_bytes) + len(exclusion_bytes))
+                transaction.write_json("resource_ledger.json", ledger)
+                guard.checkpoint(declared + len(feature_bytes) + len(exclusion_bytes))
+        except _ResourceLimitExceeded as error:
+            return self._publish_split_invalid(
+                store=store,
+                config=config,
+                canonical_path=canonical_path,
+                guard=guard,
+                message="split publication exceeded a configured resource cap",
+                failure_details={"resource_gate": error.gate},
+                resource_status="EXCEEDED",
+            )
+        return result
 
     def train_baselines(self, run_dir: Path) -> None:
         self._unimplemented("train-baselines")
