@@ -301,7 +301,13 @@ def test_missing_site_and_timestamp_are_safely_excluded(tmp_path: Path) -> None:
     assert result.canonical["site_id"].tolist() == ["A"]
 
 
-def make_run(tmp_path: Path, frame: pd.DataFrame | None) -> tuple[RunStore, Path]:
+def make_run(
+    tmp_path: Path,
+    frame: pd.DataFrame | None,
+    *,
+    max_wall_seconds: int = 3600,
+    max_memory_gb: float = 8.0,
+) -> tuple[RunStore, Path]:
     project = tmp_path / "project"
     (project / ".git").mkdir(parents=True)
     config_dir = project / "configs"
@@ -324,6 +330,8 @@ def make_run(tmp_path: Path, frame: pd.DataFrame | None) -> tuple[RunStore, Path
         "power": {"fixed_latency_minutes": 0},
         "weather": {"fixed_latency_minutes": 0},
     }
+    payload["resources"]["max_wall_clock_seconds"] = max_wall_seconds
+    payload["resources"]["max_memory_gb"] = max_memory_gb
     config_path = config_dir / "pilot.yaml"
     config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
     input_path = data_dir / "input.csv"
@@ -613,8 +621,60 @@ def test_parquet_physical_schemas_are_stable_for_empty_and_nonempty_frames(
     assert exclusion_schemas == {exclusion_arrow_schema()}
     assert canonical_arrow_schema(False).field("quality_flags").type.value_type == pa.string()
     assert canonical_arrow_schema(False).field("interval_end_utc").type == pa.timestamp(
-        "us", tz="UTC"
+        "ns", tz="UTC"
     )
+
+
+def test_nanosecond_availability_is_preserved_in_canonical_parquet(tmp_path: Path) -> None:
+    frame = frame_5m().iloc[:1].copy()
+    frame["power_available"] = ["2025-01-01T00:01:00.000000001Z"]
+    frame["weather_available"] = ["2025-01-01T00:02:00.000000002Z"]
+    path = tmp_path / "availability.parquet"
+    frame.to_parquet(path, index=False)
+
+    result = canonicalize_data(
+        path, data_config(availability_columns=True), "parquet"
+    )
+    payload = dataframe_parquet_bytes(result.canonical, kind="canonical")
+    roundtrip = pq.read_table(pa.BufferReader(payload)).to_pandas()
+
+    assert roundtrip["power_available_at_utc"].iloc[0].nanosecond == 1
+    assert roundtrip["weather_available_at_utc"].iloc[0].nanosecond == 2
+
+
+def test_off_grid_nanosecond_exclusion_serializes_without_precision_loss(
+    tmp_path: Path,
+) -> None:
+    frame = frame_5m().iloc[:1].copy()
+    frame["timestamp"] = ["2025-01-01T00:05:00.000000001Z"]
+    path = tmp_path / "off-grid.parquet"
+    frame.to_parquet(path, index=False)
+
+    result = canonicalize_data(path, data_config(), "parquet")
+    payload = dataframe_parquet_bytes(result.exclusions, kind="exclusions")
+    roundtrip = pq.read_table(pa.BufferReader(payload)).to_pandas()
+
+    assert roundtrip["source_timestamp_utc"].iloc[0].nanosecond == 1
+
+
+@pytest.mark.parametrize("format_", ["csv", "parquet"])
+@pytest.mark.parametrize("daylight", [0, 1, 0.0, 1.0])
+def test_integral_numeric_daylight_has_csv_parquet_parity(
+    tmp_path: Path,
+    format_: Literal["csv", "parquet"],
+    daylight: int | float,
+) -> None:
+    frame = frame_5m().iloc[:1].copy()
+    frame["is_daylight"] = daylight
+    path = tmp_path / f"daylight.{format_}"
+    write_input(path, frame, format_)
+    payload = data_config().model_dump()
+    payload["columns"]["daylight"] = "is_daylight"
+
+    result = canonicalize_data(path, DataConfig.model_validate(payload), format_)
+
+    assert result.status is StageStatus.SUCCESS
+    assert result.canonical["is_daylight"].tolist() == [bool(daylight)]
 
 
 def test_csv_identifier_na_is_preserved_and_matches_parquet(tmp_path: Path) -> None:
@@ -642,6 +702,54 @@ def test_csv_duplicate_quoted_or_bom_header_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="duplicate CSV header"):
         canonicalize_data(path, data_config(), "csv")
+
+
+def test_csv_leading_blank_records_do_not_bypass_duplicate_header_check(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "leading-blank-duplicate.csv"
+    path.write_text(
+        '\ufeff\n\n"site_id","timestamp","power_kw","capacity_kw","ghi_w_m2",'
+        '"temperature_c","site_id"\nA,2025-01-01T00:00:00Z,1,10,100,20,A\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate CSV header"):
+        canonicalize_data(path, data_config(), "csv")
+
+
+def test_resource_deadline_across_serializers_publishes_durable_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, _ = make_run(tmp_path, frame_5m(), max_wall_seconds=1)
+    original = services_module.dataframe_parquet_bytes
+
+    def slow_serializer(
+        frame: pd.DataFrame, *, kind: Literal["canonical", "exclusions"]
+    ) -> bytes:
+        time.sleep(0.7)
+        return original(frame, kind=kind)
+
+    monkeypatch.setattr(services_module, "dataframe_parquet_bytes", slow_serializer)
+
+    result = DefaultPilotServices().validate_data(store.root)
+    ledger = read_json(store.root / "validate-data/cleaning_ledger.json")
+
+    assert result.status is StageStatus.INVALID
+    assert ledger["resource_status"] == "EXCEEDED"
+    assert ledger["elapsed_seconds"] >= 1
+    assert read_json(store.root / "validate-data/stage_manifest.json")["status"] == "INVALID"
+
+
+def test_resource_memory_guard_publishes_durable_invalid(tmp_path: Path) -> None:
+    store, _ = make_run(tmp_path, frame_5m(), max_memory_gb=0.000001)
+
+    result = DefaultPilotServices().validate_data(store.root)
+    ledger = read_json(store.root / "validate-data/cleaning_ledger.json")
+
+    assert result.status is StageStatus.INVALID
+    assert ledger["resource_status"] == "EXCEEDED"
+    assert ledger["peak_rss_bytes_observed"] > 0
 
 
 def test_hundred_year_timestamp_typo_is_bounded_and_invalid(tmp_path: Path) -> None:

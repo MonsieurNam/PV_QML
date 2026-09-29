@@ -29,11 +29,14 @@ status must match the marker before publication, during crash recovery, on resum
 downstream stage verifies prerequisites.
 
 Canonical and QC Parquet artifacts use explicit Arrow schemas: UTC timestamps are stored at
-microsecond precision, quality flags are non-null `list<string>`, and a configured daylight field
+nanosecond precision, quality flags are non-null `list<string>`, and a configured daylight field
 is a non-null boolean after invalid/missing values are excluded. CSV headers are parsed before
 pandas ingestion so duplicate names are rejected and identifier strings such as `NA` are retained.
 Gap reporting is compact and never materializes the complete missing timestamp range; a per-site
 span above 3,660 days is treated as an invalid source timestamp contract.
+Validation checks the configured wall-clock and memory limits around source materialization,
+quality control, serialization, and final publication. Exceeding a cap discards candidate outputs
+and publishes a bounded typed `INVALID` diagnostic bundle without reapplying the expired cap.
 
 The bundled fixture is synthetic and exists only for software acceptance:
 

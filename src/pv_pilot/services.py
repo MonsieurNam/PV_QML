@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -18,11 +19,43 @@ from .data import (
     DataValidationResult,
     canonical_checksum,
     canonicalize_data,
+    diagnostic_parquet_bytes,
     empty_canonical_frame,
     empty_exclusion_frame,
 )
 from .data import dataframe_parquet_bytes as dataframe_parquet_bytes
 from .domain import DetailEntry, StageResult, StageStatus, deterministic_data
+
+
+class _ResourceLimitExceeded(RuntimeError):
+    def __init__(self, gate: str) -> None:
+        super().__init__(f"configured resource cap exceeded: {gate}")
+        self.gate = gate
+
+
+@dataclass(slots=True)
+class _ResourceGuard:
+    started: float
+    wall_seconds: int
+    memory_bytes: int
+    peak_rss_bytes: int = 0
+    peak_declared_bytes: int = 0
+
+    def checkpoint(self, declared_bytes: int = 0) -> None:
+        self.peak_declared_bytes = max(self.peak_declared_bytes, declared_bytes)
+        rss = psutil.Process().memory_info().rss
+        self.peak_rss_bytes = max(self.peak_rss_bytes, rss)
+        if time.perf_counter() - self.started > self.wall_seconds:
+            raise _ResourceLimitExceeded("wall_clock")
+        if rss > self.memory_bytes:
+            raise _ResourceLimitExceeded("memory_rss")
+        if declared_bytes > self.memory_bytes:
+            raise _ResourceLimitExceeded("dataframe_or_output_bytes")
+
+    def sample_without_enforcement(self) -> None:
+        self.peak_rss_bytes = max(
+            self.peak_rss_bytes, psutil.Process().memory_info().rss
+        )
 
 
 class DefaultPilotServices:
@@ -82,6 +115,91 @@ class DefaultPilotServices:
             return result.model_copy(update={"message": "validate-data already successful"})
         return result.model_copy(update={"message": f"validate-data already {status.lower()}"})
 
+    @staticmethod
+    def _publish_resource_invalid(
+        *,
+        store: RunStore,
+        config: PilotConfig,
+        source_path: Path,
+        expected_hash: object,
+        register_external_input: bool,
+        guard: _ResourceGuard,
+        gate: str,
+    ) -> StageResult:
+        """Publish bounded INVALID diagnostics without re-enforcing an expired budget."""
+
+        include_daylight = config.data.columns.daylight is not None
+        canonical = empty_canonical_frame(include_daylight=include_daylight)
+        canonical_bytes, exclusion_bytes = diagnostic_parquet_bytes(include_daylight)
+        guard.sample_without_enforcement()
+        elapsed = time.perf_counter() - guard.started
+        card = {
+            "accepted_input_row_count": 0,
+            "canonical_row_count": 0,
+            "canonical_schema_version": CANONICAL_SCHEMA_VERSION,
+            "canonical_sha256": canonical_checksum(canonical),
+            "cadence_minutes": config.data.raw_cadence_minutes,
+            "end_utc": None,
+            "excluded_by_reason": {},
+            "excluded_row_count": 0,
+            "exclusion_record_count": 0,
+            "input_row_count": 0,
+            "input_sha256": expected_hash,
+            "missing_expected_interval_count": 0,
+            "provenance": config.protocol.provenance.value,
+            "schema_version": "1.0",
+            "scientific_decision": "NOT_EVALUATED",
+            "site_counts": {},
+            "start_utc": None,
+            "status": StageStatus.INVALID.value,
+            "synthetic": config.protocol.provenance.value == "synthetic",
+        }
+        ledger = {
+            "elapsed_seconds": elapsed,
+            "human_cleaning_hours": None,
+            "peak_declared_bytes_observed": guard.peak_declared_bytes,
+            "peak_rss_bytes_observed": guard.peak_rss_bytes,
+            "resource_status": "EXCEEDED",
+            "schema_version": "1.0",
+            "status": StageStatus.INVALID.value,
+            "timebox_seconds": config.resources.max_wall_clock_seconds,
+        }
+        result = StageResult(
+            stage="validate-data",
+            status=StageStatus.INVALID,
+            message="data validation exceeded a configured resource cap",
+            artifacts=(
+                Path("validate-data/canonical.parquet"),
+                Path("validate-data/qc_exclusions.parquet"),
+                Path("validate-data/data_card.json"),
+                Path("validate-data/cleaning_ledger.json"),
+            ),
+            details=(
+                DetailEntry(key="input_sha256", value=expected_hash),
+                DetailEntry(key="resource_gate", value=gate),
+                DetailEntry(key="scientific_decision", value="NOT_EVALUATED"),
+            ),
+        )
+        with store.stage(
+            "validate-data",
+            external_input_hashes=(
+                {source_path: expected_hash}
+                if register_external_input and isinstance(expected_hash, str)
+                else None
+            ),
+            terminal_status="INVALID",
+            details={
+                "result_status": "invalid",
+                "scientific_decision": "NOT_EVALUATED",
+            },
+        ) as transaction:
+            transaction.write_bytes("canonical.parquet", canonical_bytes)
+            transaction.write_bytes("qc_exclusions.parquet", exclusion_bytes)
+            transaction.write_json("data_card.json", card)
+            transaction.write_json("cleaning_ledger.json", ledger)
+            transaction.write_json("stage_result.json", deterministic_data(result))
+        return result
+
     def validate_data(self, run_dir: Path) -> StageResult:
         started = time.perf_counter()
         store = RunStore.open(run_dir)
@@ -102,6 +220,11 @@ class DefaultPilotServices:
         failure_details: dict[str, object] = {}
         resource_status = "WITHIN_LIMIT"
         memory_limit_bytes = int(config.resources.max_memory_gb * 1024**3)
+        guard = _ResourceGuard(
+            started=started,
+            wall_seconds=config.resources.max_wall_clock_seconds,
+            memory_bytes=memory_limit_bytes,
+        )
         register_external_input = False
         if source_record.get("status") == "MISSING":
             status = StageStatus.BLOCKED
@@ -149,11 +272,29 @@ class DefaultPilotServices:
             )
         else:
             register_external_input = True
-            if source_path.stat().st_size > memory_limit_bytes:
+            try:
+                guard.checkpoint(source_path.stat().st_size)
+                result = canonicalize_data(
+                    source_path,
+                    config.data,
+                    config.data.format,
+                    resource_checkpoint=guard.checkpoint,
+                )
+                guard.checkpoint()
+            except _ResourceLimitExceeded as error:
+                return self._publish_resource_invalid(
+                    store=store,
+                    config=config,
+                    source_path=source_path,
+                    expected_hash=expected_hash,
+                    register_external_input=register_external_input,
+                    guard=guard,
+                    gate=error.gate,
+                )
+            except (DataContractError, OSError, ValueError) as error:
                 status = StageStatus.INVALID
-                resource_status = "EXCEEDED"
-                message = "input dataset exceeds configured memory resource cap"
-                failure_details = {"resource_gate": "input_file_size"}
+                message = f"input dataset violates its configured contract: {error}"
+                failure_details = {"error_type": type(error).__name__}
                 result = DataValidationResult(
                     status=status,
                     canonical=empty_canonical_frame(
@@ -164,12 +305,27 @@ class DefaultPilotServices:
                     accepted_input_row_count=0,
                 )
             else:
+                post_read_hash = sha256_file(source_path)
                 try:
-                    result = canonicalize_data(source_path, config.data, config.data.format)
-                except (DataContractError, OSError, ValueError) as error:
+                    guard.checkpoint()
+                except _ResourceLimitExceeded as error:
+                    return self._publish_resource_invalid(
+                        store=store,
+                        config=config,
+                        source_path=source_path,
+                        expected_hash=expected_hash,
+                        register_external_input=register_external_input,
+                        guard=guard,
+                        gate=error.gate,
+                    )
+                if post_read_hash != expected_hash:
+                    register_external_input = False
                     status = StageStatus.INVALID
-                    message = f"input dataset violates its configured contract: {error}"
-                    failure_details = {"error_type": type(error).__name__}
+                    message = "input dataset changed while it was being validated"
+                    failure_details = {
+                        "actual_sha256": post_read_hash,
+                        "expected_sha256": expected_hash,
+                    }
                     result = DataValidationResult(
                         status=status,
                         canonical=empty_canonical_frame(
@@ -180,49 +336,13 @@ class DefaultPilotServices:
                         accepted_input_row_count=0,
                     )
                 else:
-                    post_read_hash = sha256_file(source_path)
-                    if post_read_hash != expected_hash:
-                        register_external_input = False
-                        status = StageStatus.INVALID
-                        message = "input dataset changed while it was being validated"
-                        failure_details = {
-                            "actual_sha256": post_read_hash,
-                            "expected_sha256": expected_hash,
-                        }
-                        result = DataValidationResult(
-                            status=status,
-                            canonical=empty_canonical_frame(
-                                include_daylight=config.data.columns.daylight is not None
-                            ),
-                            exclusions=empty_exclusion_frame(),
-                            input_row_count=0,
-                            accepted_input_row_count=0,
-                        )
-                    else:
-                        status = result.status
-                        message = (
-                            "data validation successful"
-                            if status is StageStatus.SUCCESS
-                            else "no canonical observations survived quality control"
-                        )
+                    status = result.status
+                    message = (
+                        "data validation successful"
+                        if status is StageStatus.SUCCESS
+                        else "no canonical observations survived quality control"
+                    )
 
-        elapsed = time.perf_counter() - started
-        rss_bytes = psutil.Process().memory_info().rss
-        if (
-            status is StageStatus.SUCCESS
-            and (
-                elapsed > config.resources.max_wall_clock_seconds
-                or rss_bytes > memory_limit_bytes
-            )
-        ):
-            status = StageStatus.INVALID
-            resource_status = "EXCEEDED"
-            message = "data validation exceeded a configured resource cap"
-            failure_details["resource_gate"] = (
-                "wall_clock"
-                if elapsed > config.resources.max_wall_clock_seconds
-                else "memory_rss"
-            )
         canonical = result.canonical
         exclusions = result.exclusions
         site_counts = {
@@ -255,15 +375,6 @@ class DefaultPilotServices:
             "status": status.value,
             "synthetic": config.protocol.provenance.value == "synthetic",
         }
-        ledger = {
-            "elapsed_seconds": elapsed,
-            "human_cleaning_hours": None,
-            "peak_rss_bytes_observed": rss_bytes,
-            "resource_status": resource_status,
-            "schema_version": "1.0",
-            "status": status.value,
-            "timebox_seconds": config.resources.max_wall_clock_seconds,
-        }
         details = {
             "scientific_decision": "NOT_EVALUATED",
             "input_sha256": expected_hash,
@@ -282,26 +393,55 @@ class DefaultPilotServices:
             details=tuple(DetailEntry(key=key, value=value) for key, value in details.items()),
         )
         terminal = cast(Literal["SUCCESS", "BLOCKED", "INVALID"], status.value.upper())
-        with store.stage(
-            "validate-data",
-            external_input_hashes=(
-                {source_path: expected_hash}
-                if register_external_input and isinstance(expected_hash, str)
-                else None
-            ),
-            terminal_status=terminal,
-            details={"result_status": status.value, "scientific_decision": "NOT_EVALUATED"},
-        ) as transaction:
-            transaction.write_bytes(
-                "canonical.parquet", dataframe_parquet_bytes(canonical, kind="canonical")
+        try:
+            canonical_bytes = dataframe_parquet_bytes(canonical, kind="canonical")
+            guard.checkpoint(len(canonical_bytes))
+            exclusion_bytes = dataframe_parquet_bytes(exclusions, kind="exclusions")
+            guard.checkpoint(len(canonical_bytes) + len(exclusion_bytes))
+            with store.stage(
+                "validate-data",
+                external_input_hashes=(
+                    {source_path: expected_hash}
+                    if register_external_input and isinstance(expected_hash, str)
+                    else None
+                ),
+                terminal_status=terminal,
+                details={
+                    "result_status": status.value,
+                    "scientific_decision": "NOT_EVALUATED",
+                },
+            ) as transaction:
+                transaction.write_bytes("canonical.parquet", canonical_bytes)
+                guard.checkpoint(len(canonical_bytes) + len(exclusion_bytes))
+                transaction.write_bytes("qc_exclusions.parquet", exclusion_bytes)
+                guard.checkpoint(len(canonical_bytes) + len(exclusion_bytes))
+                transaction.write_json("data_card.json", card)
+                guard.checkpoint(len(canonical_bytes) + len(exclusion_bytes))
+                transaction.write_json("stage_result.json", deterministic_data(stage_result))
+                guard.checkpoint(len(canonical_bytes) + len(exclusion_bytes))
+                elapsed = time.perf_counter() - started
+                ledger = {
+                    "elapsed_seconds": elapsed,
+                    "human_cleaning_hours": None,
+                    "peak_declared_bytes_observed": guard.peak_declared_bytes,
+                    "peak_rss_bytes_observed": guard.peak_rss_bytes,
+                    "resource_status": resource_status,
+                    "schema_version": "1.0",
+                    "status": status.value,
+                    "timebox_seconds": config.resources.max_wall_clock_seconds,
+                }
+                transaction.write_json("cleaning_ledger.json", ledger)
+                guard.checkpoint(len(canonical_bytes) + len(exclusion_bytes))
+        except _ResourceLimitExceeded as error:
+            return self._publish_resource_invalid(
+                store=store,
+                config=config,
+                source_path=source_path,
+                expected_hash=expected_hash,
+                register_external_input=register_external_input,
+                guard=guard,
+                gate=error.gate,
             )
-            transaction.write_bytes(
-                "qc_exclusions.parquet",
-                dataframe_parquet_bytes(exclusions, kind="exclusions"),
-            )
-            transaction.write_json("data_card.json", card)
-            transaction.write_json("cleaning_ledger.json", ledger)
-            transaction.write_json("stage_result.json", deterministic_data(stage_result))
         return stage_result
 
     def build_splits(self, run_dir: Path) -> None:

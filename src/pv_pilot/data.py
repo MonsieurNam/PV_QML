@@ -7,9 +7,11 @@ import hashlib
 import json
 import math
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC
 from itertools import pairwise
+from numbers import Real
 from pathlib import Path
 from typing import Literal
 
@@ -47,6 +49,9 @@ EXCLUSION_COLUMNS = (
 
 class DataContractError(ValueError):
     """The source cannot be interpreted under the frozen data contract."""
+
+
+ResourceCheckpoint = Callable[[int], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,13 +167,23 @@ def _exclusion_frame(records: list[dict[str, object]]) -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
-def _read_source(path: Path, format_: Literal["csv", "parquet"]) -> pd.DataFrame:
+def _read_source(
+    path: Path,
+    format_: Literal["csv", "parquet"],
+    resource_checkpoint: ResourceCheckpoint | None,
+) -> pd.DataFrame:
     if format_ == "csv":
         with path.open("r", encoding="utf-8-sig", newline="") as stream:
-            try:
-                header = next(csv.reader(stream))
-            except StopIteration as error:
-                raise DataContractError("CSV input has no header") from error
+            header = next(
+                (
+                    row
+                    for row in csv.reader(stream)
+                    if row and any(field.strip() for field in row)
+                ),
+                None,
+            )
+        if header is None:
+            raise DataContractError("CSV input has no header")
         duplicates = sorted(
             name for name, count in Counter(header).items() if count > 1
         )
@@ -176,24 +191,36 @@ def _read_source(path: Path, format_: Literal["csv", "parquet"]) -> pd.DataFrame
             raise DataContractError(
                 f"duplicate CSV header columns: {', '.join(duplicates)}"
             )
-        return pd.read_csv(
+        frame = pd.read_csv(
             path,
             encoding="utf-8-sig",
             keep_default_na=False,
             na_filter=False,
         )
-    return pd.read_parquet(path)
+    else:
+        parquet = pq.ParquetFile(path)
+        metadata = parquet.metadata
+        uncompressed_bytes = sum(
+            metadata.row_group(index).total_byte_size
+            for index in range(metadata.num_row_groups)
+        )
+        if resource_checkpoint is not None:
+            resource_checkpoint(uncompressed_bytes)
+        frame = pd.read_parquet(path)
+    if resource_checkpoint is not None:
+        resource_checkpoint(int(frame.memory_usage(index=True, deep=True).sum()))
+    return frame
 
 
 def canonical_arrow_schema(include_daylight: bool) -> pa.Schema:
-    """Return the stable physical canonical schema (UTC timestamps use microseconds)."""
+    """Return the stable physical canonical schema (UTC timestamps use nanoseconds)."""
 
     fields = [
         pa.field("sample_id", pa.string(), nullable=False),
         pa.field("site_id", pa.string(), nullable=False),
-        pa.field("interval_end_utc", pa.timestamp("us", tz="UTC"), nullable=False),
-        pa.field("power_available_at_utc", pa.timestamp("us", tz="UTC"), nullable=False),
-        pa.field("weather_available_at_utc", pa.timestamp("us", tz="UTC"), nullable=False),
+        pa.field("interval_end_utc", pa.timestamp("ns", tz="UTC"), nullable=False),
+        pa.field("power_available_at_utc", pa.timestamp("ns", tz="UTC"), nullable=False),
+        pa.field("weather_available_at_utc", pa.timestamp("ns", tz="UTC"), nullable=False),
         pa.field("ac_power_kw", pa.float64(), nullable=False),
         pa.field("capacity_kw", pa.float64(), nullable=False),
         pa.field("ghi_w_m2", pa.float64(), nullable=False),
@@ -216,8 +243,8 @@ def exclusion_arrow_schema() -> pa.Schema:
         [
             pa.field("source_row_id", pa.string(), nullable=False),
             pa.field("site_id", pa.string(), nullable=False),
-            pa.field("source_timestamp_utc", pa.timestamp("us", tz="UTC"), nullable=True),
-            pa.field("bin_interval_end_utc", pa.timestamp("us", tz="UTC"), nullable=True),
+            pa.field("source_timestamp_utc", pa.timestamp("ns", tz="UTC"), nullable=True),
+            pa.field("bin_interval_end_utc", pa.timestamp("ns", tz="UTC"), nullable=True),
             pa.field("reason", pa.string(), nullable=False),
             pa.field("detail", pa.string(), nullable=False),
         ]
@@ -228,6 +255,7 @@ def canonicalize_data(
     path: str | Path,
     config: DataConfig,
     format_: Literal["csv", "parquet"] | None = None,
+    resource_checkpoint: ResourceCheckpoint | None = None,
 ) -> DataValidationResult:
     """Read and canonicalize source data without interpolation or input mutation.
 
@@ -238,7 +266,11 @@ def canonicalize_data(
     """
 
     source_path = Path(path)
-    source = _read_source(source_path, format_ or config.format).copy(deep=True)
+    source = _read_source(
+        source_path, format_ or config.format, resource_checkpoint
+    ).copy(deep=True)
+    if resource_checkpoint is not None:
+        resource_checkpoint(int(source.memory_usage(index=True, deep=True).sum()))
     mapping = config.columns
     required = {
         mapping.site,
@@ -442,7 +474,7 @@ def canonicalize_data(
                     continue
                 if isinstance(raw_daylight, (bool, np.bool_)):
                     record["is_daylight"] = raw_daylight
-                elif isinstance(raw_daylight, (int, float)) and raw_daylight in (0, 1):
+                elif isinstance(raw_daylight, Real) and raw_daylight in (0, 1):
                     record["is_daylight"] = bool(raw_daylight)
                 else:
                     exclude(
@@ -508,7 +540,7 @@ def canonicalize_data(
                     not pd.isna(value)
                     and (
                         isinstance(value, (bool, np.bool_))
-                        or (isinstance(value, (int, float)) and value in (0, 1))
+                        or (isinstance(value, Real) and value in (0, 1))
                     )
                     for value in daylight_values
                 )
@@ -576,6 +608,11 @@ def canonicalize_data(
                     )
 
     exclusion_frame = _exclusion_frame(exclusions)
+    if resource_checkpoint is not None:
+        dataframe_bytes = int(source.memory_usage(index=True, deep=True).sum())
+        dataframe_bytes += int(canonical.memory_usage(index=True, deep=True).sum())
+        dataframe_bytes += int(exclusion_frame.memory_usage(index=True, deep=True).sum())
+        resource_checkpoint(dataframe_bytes)
     status = StageStatus.SUCCESS if not canonical.empty else StageStatus.INVALID
     return DataValidationResult(
         status=status,
@@ -609,6 +646,17 @@ def dataframe_parquet_bytes(
     return buffer.getvalue()
 
 
+def diagnostic_parquet_bytes(include_daylight: bool) -> tuple[bytes, bytes]:
+    """Create bounded empty artifacts without using the candidate serialization hook."""
+
+    return (
+        dataframe_parquet_bytes(
+            empty_canonical_frame(include_daylight=include_daylight), kind="canonical"
+        ),
+        dataframe_parquet_bytes(empty_exclusion_frame(), kind="exclusions"),
+    )
+
+
 def canonical_checksum(frame: pd.DataFrame) -> str:
     """Hash semantic canonical content, independent of a filesystem path."""
 
@@ -633,6 +681,7 @@ __all__ = [
     "canonical_checksum",
     "canonicalize_data",
     "dataframe_parquet_bytes",
+    "diagnostic_parquet_bytes",
     "empty_canonical_frame",
     "empty_exclusion_frame",
     "exclusion_arrow_schema",
