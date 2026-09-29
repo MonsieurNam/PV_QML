@@ -6,14 +6,23 @@ import hashlib
 import io
 import json
 import math
+import multiprocessing as mp
+import pickle
+import shutil
+import stat
+import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.metadata import version
+from multiprocessing.process import BaseProcess
+from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
 import pandas as pd
+import psutil
 import pyarrow as pa
 import pyarrow.parquet as pq
 from numpy.typing import NDArray
@@ -33,6 +42,176 @@ TIE_TOLERANCE = 1e-12
 
 class BaselineContractError(ValueError):
     """Input or model output violates the frozen baseline contract."""
+
+
+class FitDeadlineExceeded(RuntimeError):
+    """A model operation exceeded the stage's hard wall-clock deadline."""
+
+
+class FitMemoryExceeded(RuntimeError):
+    """A model subprocess exceeded the configured RSS ceiling."""
+
+
+class FitExecutor(Protocol):
+    """Isolation boundary for one estimator fit or predict operation."""
+
+    def run(
+        self,
+        operation: str,
+        function: Callable[..., Any],
+        *args: Any,
+        declared_bytes: int = 0,
+        **kwargs: Any,
+    ) -> Any: ...
+
+
+@dataclass(slots=True)
+class DirectFitExecutor:
+    """In-process executor used by focused unit tests and pure library callers."""
+
+    resource_checkpoint: Callable[[int], None]
+
+    @property
+    def active_child_pid(self) -> None:
+        return None
+
+    def run(
+        self,
+        operation: str,
+        function: Callable[..., Any],
+        *args: Any,
+        declared_bytes: int = 0,
+        **kwargs: Any,
+    ) -> Any:
+        del operation
+        self.resource_checkpoint(declared_bytes)
+        result = function(*args, **kwargs)
+        self.resource_checkpoint(declared_bytes)
+        return result
+
+
+def _fit_process_worker(
+    result_path: str,
+    function: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> None:
+    try:
+        payload = (True, function(*args, **kwargs))
+    except BaseException as error:
+        payload = (False, (type(error).__name__, str(error)))
+    with Path(result_path).open("xb") as stream:
+        pickle.dump(payload, stream, protocol=5)
+
+
+@dataclass(slots=True)
+class DeadlineProcessFitExecutor:
+    """Spawn-isolated executor with a hard deadline and child RSS enforcement."""
+
+    deadline_monotonic: float
+    resource_checkpoint: Callable[[int], None]
+    private_directory: Path
+    max_child_rss_bytes: int | None = None
+    poll_seconds: float = 0.025
+    _active_child_pid: int | None = None
+
+    @property
+    def active_child_pid(self) -> int | None:
+        return self._active_child_pid
+
+    @staticmethod
+    def _stop(process: BaseProcess) -> None:
+        if not process.is_alive():
+            process.join()
+            return
+        process.terminate()
+        process.join(timeout=1.0)
+        if process.is_alive():
+            process.kill()
+            process.join()
+
+    def run(
+        self,
+        operation: str,
+        function: Callable[..., Any],
+        *args: Any,
+        declared_bytes: int = 0,
+        **kwargs: Any,
+    ) -> Any:
+        self.resource_checkpoint(declared_bytes)
+        remaining = self.deadline_monotonic - time.monotonic()
+        if remaining <= 0:
+            raise FitDeadlineExceeded(f"{operation} exceeded the fit deadline")
+        self.private_directory.mkdir(parents=True, exist_ok=True)
+        operation_root = Path(
+            tempfile.mkdtemp(prefix=".fit-operation-", dir=self.private_directory)
+        )
+        result_path = operation_root / "result.pkl"
+        private_root = self.private_directory.resolve()
+        if (
+            operation_root.resolve().parent != private_root
+            or result_path.resolve(strict=False).parent != operation_root.resolve()
+        ):
+            shutil.rmtree(operation_root, ignore_errors=True)
+            raise RuntimeError("fit result path escaped its private directory")
+        context = mp.get_context("spawn")
+        process = context.Process(
+            target=_fit_process_worker,
+            args=(str(result_path), function, args, kwargs),
+            daemon=False,
+        )
+        started = False
+        try:
+            process.start()
+            started = True
+            self._active_child_pid = process.pid
+            while process.is_alive():
+                remaining = self.deadline_monotonic - time.monotonic()
+                if remaining <= 0:
+                    self._stop(process)
+                    raise FitDeadlineExceeded(f"{operation} exceeded the fit deadline")
+                process.join(timeout=min(self.poll_seconds, remaining))
+                self.resource_checkpoint(declared_bytes)
+                if self.max_child_rss_bytes is not None and process.pid is not None:
+                    try:
+                        child_rss = psutil.Process(process.pid).memory_info().rss
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        child_rss = 0
+                    if child_rss > self.max_child_rss_bytes:
+                        self._stop(process)
+                        raise FitMemoryExceeded(
+                            f"{operation} exceeded the child RSS limit"
+                        )
+            process.join()
+            if process.exitcode != 0 or not result_path.is_file():
+                raise RuntimeError(
+                    f"{operation} fit subprocess failed with exit code {process.exitcode}"
+                )
+            result_stat = result_path.lstat()
+            if (
+                result_path.is_symlink()
+                or not stat.S_ISREG(result_stat.st_mode)
+                or result_stat.st_nlink != 1
+                or result_path.resolve().parent != operation_root.resolve()
+            ):
+                raise RuntimeError(f"{operation} produced an unsafe fit result")
+            with result_path.open("rb") as stream:
+                succeeded, payload = pickle.load(stream)
+            if not succeeded:
+                error_name, message = payload
+                raise RuntimeError(f"{operation} failed: {error_name}: {message}")
+            self.resource_checkpoint(declared_bytes)
+            return payload
+        except BaseException:
+            if started:
+                self._stop(process)
+            raise
+        finally:
+            self._active_child_pid = None
+            result_path.unlink(missing_ok=True)
+            if started:
+                process.close()
+            shutil.rmtree(operation_root, ignore_errors=True)
 
 
 class Predictor(Protocol):
@@ -297,18 +476,55 @@ class BaselineTrainingResult:
     models: dict[str, Any]
 
 
+def _fit_quantile_estimator(
+    features: FloatArray,
+    target: FloatArray,
+    quantile: float,
+    alpha: float,
+) -> QuantileRegressor:
+    estimator = QuantileRegressor(quantile=quantile, alpha=alpha, solver="highs")
+    estimator.fit(features, target)
+    return estimator
+
+
 def _fit_linear_heads(
     features: FloatArray,
     target: FloatArray,
     quantiles: tuple[float, ...],
     alpha: float,
+    executor: FitExecutor,
 ) -> QuantileHeads:
     estimators: list[Predictor] = []
     for quantile in quantiles:
-        estimator = QuantileRegressor(quantile=quantile, alpha=alpha, solver="highs")
-        estimator.fit(features, target)
+        estimator = executor.run(
+            f"quantile-regressor:q={quantile}:alpha={alpha}",
+            _fit_quantile_estimator,
+            features,
+            target,
+            quantile,
+            alpha,
+            declared_bytes=features.nbytes + target.nbytes,
+        )
         estimators.append(estimator)
     return QuantileHeads(quantiles=quantiles, estimators=tuple(estimators))
+
+
+def _fit_xgboost_estimator(
+    features: FloatArray,
+    target: FloatArray,
+    quantile: float,
+    max_depth: int,
+    learning_rate: float,
+    seed: int,
+) -> XGBRegressor:
+    estimator = xgboost_estimator(
+        quantile=quantile,
+        max_depth=max_depth,
+        learning_rate=learning_rate,
+        seed=seed,
+    )
+    estimator.fit(features, target)
+    return estimator
 
 
 def _fit_xgboost_heads(
@@ -319,6 +535,7 @@ def _fit_xgboost_heads(
     max_depth: int,
     learning_rate: float,
     seed_manager: SeedManager,
+    executor: FitExecutor,
 ) -> QuantileHeads:
     estimators: list[Predictor] = []
     for quantile in quantiles:
@@ -328,15 +545,62 @@ def _fit_xgboost_heads(
             format(learning_rate, ".17g"),
             format(quantile, ".17g"),
         )
-        estimator = xgboost_estimator(
-            quantile=quantile,
-            max_depth=max_depth,
-            learning_rate=learning_rate,
-            seed=seed,
+        estimator = executor.run(
+            f"xgboost:q={quantile}:depth={max_depth}:lr={learning_rate}",
+            _fit_xgboost_estimator,
+            features,
+            target,
+            quantile,
+            max_depth,
+            learning_rate,
+            seed,
+            declared_bytes=features.nbytes + target.nbytes,
         )
-        estimator.fit(features, target)
         estimators.append(estimator)
     return QuantileHeads(quantiles=quantiles, estimators=tuple(estimators))
+
+
+def _predict_estimator(estimator: Predictor, features: FloatArray) -> NDArray[Any]:
+    return np.asarray(estimator.predict(features), dtype=np.float64)
+
+
+def _predict_heads(
+    heads: QuantileHeads, features: FloatArray, executor: FitExecutor
+) -> FloatArray:
+    columns = [
+        np.asarray(
+            executor.run(
+                f"predict:q={quantile}",
+                _predict_estimator,
+                estimator,
+                features,
+                declared_bytes=features.nbytes,
+            ),
+            dtype=np.float64,
+        )
+        for quantile, estimator in zip(
+            heads.quantiles, heads.estimators, strict=True
+        )
+    ]
+    result = np.column_stack(columns)
+    if result.shape != (len(features), len(heads.quantiles)) or not np.isfinite(result).all():
+        raise BaselineContractError("quantile estimator returned invalid predictions")
+    return np.asarray(result, dtype=np.float64)
+
+
+def _apply_transform(transformer: Any, features: FloatArray) -> FloatArray:
+    return np.asarray(transformer.transform(features), dtype=np.float64)
+
+
+def _fit_standard_transform(
+    train: FloatArray, validation: FloatArray
+) -> tuple[StandardScaler, FloatArray, FloatArray]:
+    scaler = StandardScaler().fit(train)
+    return (
+        scaler,
+        np.asarray(scaler.transform(train), dtype=np.float64),
+        np.asarray(scaler.transform(validation), dtype=np.float64),
+    )
 
 
 def _mean_validation_wis(
@@ -444,6 +708,7 @@ def _prediction_records(
     models: dict[str, Any],
     quantiles: tuple[float, ...],
     selected: dict[str, dict[str, Any]],
+    executor: FitExecutor,
 ) -> tuple[Any, dict[str, Any]]:
     records: list[dict[str, Any]] = []
     diagnostics: dict[str, Any] = {}
@@ -451,10 +716,42 @@ def _prediction_records(
     for branch in ("persistence", "raw", "rff", "xgboost"):
         model = models[branch]
         if branch == "persistence":
-            raw = model.predict(test["power_lag_0m_kw"].to_numpy(dtype=np.float64))
+            point = test["power_lag_0m_kw"].to_numpy(dtype=np.float64)
+            raw = executor.run(
+                "persistence-predict",
+                model.predict,
+                point,
+                declared_bytes=point.nbytes,
+            )
         else:
             columns = tuple(selected[branch]["feature_columns"])
-            raw = model.predict(test.loc[:, columns].to_numpy(dtype=np.float64))
+            values = test.loc[:, columns].to_numpy(dtype=np.float64)
+            transformed = values
+            if model.scaler is not None:
+                transformed = executor.run(
+                    f"{branch}-scaler-transform",
+                    _apply_transform,
+                    model.scaler,
+                    transformed,
+                    declared_bytes=transformed.nbytes,
+                )
+            if model.rff is not None:
+                transformed = executor.run(
+                    f"{branch}-rff-transform",
+                    _apply_transform,
+                    model.rff,
+                    transformed,
+                    declared_bytes=transformed.nbytes,
+                )
+            if isinstance(model.predictor, QuantileHeads):
+                raw = _predict_heads(model.predictor, transformed, executor)
+            else:
+                raw = executor.run(
+                    f"{branch}-predict",
+                    model.predictor.predict,
+                    transformed,
+                    declared_bytes=transformed.nbytes,
+                )
         prediction, branch_diagnostics = postprocess_quantiles(raw, capacity)
         diagnostics[branch] = branch_diagnostics
         for row_index, row in enumerate(test.itertuples(index=False)):
@@ -483,10 +780,14 @@ def predict_test_models(
     models: dict[str, Any],
     quantiles: tuple[float, ...],
     selected: dict[str, dict[str, Any]],
+    executor: FitExecutor | None = None,
 ) -> Any:
     """Predict one already-materialized test frame using frozen final model bundles."""
 
-    predictions, _ = _prediction_records(test, models, quantiles, selected)
+    active_executor = executor or DirectFitExecutor(lambda _declared: None)
+    predictions, _ = _prediction_records(
+        test, models, quantiles, selected, active_executor
+    )
     return predictions
 
 
@@ -495,6 +796,8 @@ def train_baseline_models(
     config: PilotConfig,
     *,
     holdout_loader: Callable[[str], Any],
+    resource_checkpoint: Callable[[int], None] | None = None,
+    fit_executor: FitExecutor | None = None,
 ) -> BaselineTrainingResult:
     """Select on validation, freeze choices, refit, and open test once for inference."""
 
@@ -504,6 +807,9 @@ def train_baseline_models(
         expected_splits=frozenset({"train", "validation"}),
         label="development",
     )
+    checkpoint = resource_checkpoint or (lambda _declared: None)
+    executor = fit_executor or DirectFitExecutor(checkpoint)
+    checkpoint(int(work.memory_usage(index=True, deep=True).sum()))
     quantiles = tuple(config.evaluation.quantiles)
     if quantiles != LOCKED_QUANTILES:
         raise BaselineContractError("quantile grid does not match the frozen protocol")
@@ -518,13 +824,25 @@ def train_baseline_models(
     validation_diagnostics: dict[str, Any] = {}
     selected_state: dict[tuple[Any, ...], Any] = {}
 
-    persistence_validation = train_persistence(
-        train["power_lag_0m_kw"].to_numpy(dtype=np.float64), target_train, quantiles
+    persistence_point_train = train["power_lag_0m_kw"].to_numpy(dtype=np.float64)
+    persistence_validation = executor.run(
+        "persistence-validation-fit",
+        train_persistence,
+        persistence_point_train,
+        target_train,
+        quantiles,
+        declared_bytes=persistence_point_train.nbytes + target_train.nbytes,
+    )
+    persistence_point_validation = validation["power_lag_0m_kw"].to_numpy(
+        dtype=np.float64
     )
     persistence_score, persistence_diagnostics = _mean_validation_wis(
         target_validation,
-        persistence_validation.predict(
-            validation["power_lag_0m_kw"].to_numpy(dtype=np.float64)
+        executor.run(
+            "persistence-validation-predict",
+            persistence_validation.predict,
+            persistence_point_validation,
+            declared_bytes=persistence_point_validation.nbytes,
         ),
         capacity_validation,
         quantiles,
@@ -542,21 +860,27 @@ def train_baseline_models(
     profiles = {4: tuple(MATCHED4_COLUMNS), 6: tuple(MATCHED6_COLUMNS)}
     for modes in config.photonics.modes:
         columns = profiles[modes]
-        raw_scaler = StandardScaler().fit(train.loc[:, columns].to_numpy(dtype=np.float64))
-        train_raw = np.asarray(
-            raw_scaler.transform(train.loc[:, columns].to_numpy(dtype=np.float64)),
-            dtype=np.float64,
-        )
-        validation_raw = np.asarray(
-            raw_scaler.transform(validation.loc[:, columns].to_numpy(dtype=np.float64)),
-            dtype=np.float64,
+        raw_train_values = train.loc[:, columns].to_numpy(dtype=np.float64)
+        raw_validation_values = validation.loc[:, columns].to_numpy(dtype=np.float64)
+        raw_scaler, train_raw, validation_raw = executor.run(
+            f"raw:m{modes}:scale",
+            _fit_standard_transform,
+            raw_train_values,
+            raw_validation_values,
+            declared_bytes=raw_train_values.nbytes + raw_validation_values.nbytes,
         )
         selected_state[("raw", modes)] = (raw_scaler, train_raw, validation_raw)
         for alpha in config.models.quantile_alpha_grid:
-            heads = _fit_linear_heads(train_raw, target_train, quantiles, alpha)
-            score, diagnostics = _mean_validation_wis(
-                target_validation, heads.predict(validation_raw), capacity_validation, quantiles
+            heads = _fit_linear_heads(
+                train_raw, target_train, quantiles, alpha, executor
             )
+            score, diagnostics = _mean_validation_wis(
+                target_validation,
+                _predict_heads(heads, validation_raw, executor),
+                capacity_validation,
+                quantiles,
+            )
+            checkpoint(train_raw.nbytes + validation_raw.nbytes)
             key = f"raw:m{modes}:alpha={alpha:.17g}"
             validation_diagnostics[key] = diagnostics
             candidates.append(
@@ -576,23 +900,31 @@ def train_baseline_models(
             rff_seed = seed_manager.seed(
                 SeedComponent.RFF, f"matched{modes}", format(gamma, ".17g")
             )
-            transform = fit_rff_transform(
-                train.loc[:, columns].to_numpy(dtype=np.float64),
-                validation.loc[:, columns].to_numpy(dtype=np.float64),
+            rff_train_values = train.loc[:, columns].to_numpy(dtype=np.float64)
+            rff_validation_values = validation.loc[:, columns].to_numpy(dtype=np.float64)
+            transform = executor.run(
+                f"rff:m{modes}:gamma={gamma}:transform",
+                fit_rff_transform,
+                rff_train_values,
+                rff_validation_values,
                 gamma=gamma,
                 modes=modes,
                 photons=config.photonics.primary_photons,
                 seed=rff_seed,
+                declared_bytes=rff_train_values.nbytes + rff_validation_values.nbytes,
             )
             selected_state[("rff", modes, gamma)] = transform
             for alpha in config.models.quantile_alpha_grid:
-                heads = _fit_linear_heads(transform.train, target_train, quantiles, alpha)
+                heads = _fit_linear_heads(
+                    transform.train, target_train, quantiles, alpha, executor
+                )
                 score, diagnostics = _mean_validation_wis(
                     target_validation,
-                    heads.predict(transform.other),
+                    _predict_heads(heads, transform.other, executor),
                     capacity_validation,
                     quantiles,
                 )
+                checkpoint(transform.train.nbytes + transform.other.nbytes)
                 key = f"rff:m{modes}:gamma={gamma:.17g}:alpha={alpha:.17g}"
                 validation_diagnostics[key] = diagnostics
                 candidates.append(
@@ -625,13 +957,15 @@ def train_baseline_models(
                 max_depth=max_depth,
                 learning_rate=learning_rate,
                 seed_manager=seed_manager,
+                executor=executor,
             )
             score, diagnostics = _mean_validation_wis(
                 target_validation,
-                heads.predict(xgb_validation),
+                _predict_heads(heads, xgb_validation, executor),
                 capacity_validation,
                 quantiles,
             )
+            checkpoint(xgb_train.nbytes + xgb_validation.nbytes)
             key = f"xgboost:depth={max_depth}:lr={learning_rate:.17g}"
             validation_diagnostics[key] = diagnostics
             candidates.append(
@@ -688,19 +1022,35 @@ def train_baseline_models(
     combined = work.loc[work["split"].isin(("train", "validation"))].copy()
     combined_target = combined["target_ac_power_kw"].to_numpy(dtype=np.float64)
     models: dict[str, Any] = {}
-    models["persistence"] = train_persistence(
-        combined["power_lag_0m_kw"].to_numpy(dtype=np.float64), combined_target, quantiles
+    combined_persistence_point = combined["power_lag_0m_kw"].to_numpy(dtype=np.float64)
+    models["persistence"] = executor.run(
+        "persistence-refit",
+        train_persistence,
+        combined_persistence_point,
+        combined_target,
+        quantiles,
+        declared_bytes=combined_persistence_point.nbytes + combined_target.nbytes,
     )
 
     raw_selected = selected["raw"]
     raw_columns = tuple(raw_selected["feature_columns"])
     raw_scaler = selected_state[("raw", raw_selected["modes"])][0]
     combined_raw = np.asarray(
-        raw_scaler.transform(combined.loc[:, raw_columns].to_numpy(dtype=np.float64)),
+        executor.run(
+            "raw-selected-transform",
+            _apply_transform,
+            raw_scaler,
+            combined.loc[:, raw_columns].to_numpy(dtype=np.float64),
+            declared_bytes=combined.loc[:, raw_columns].to_numpy(dtype=np.float64).nbytes,
+        ),
         dtype=np.float64,
     )
     raw_heads = _fit_linear_heads(
-        combined_raw, combined_target, quantiles, float(raw_selected["alpha"])
+        combined_raw,
+        combined_target,
+        quantiles,
+        float(raw_selected["alpha"]),
+        executor,
     )
     models["raw"] = BaselineModelBundle(
         branch="raw", feature_columns=raw_columns, predictor=raw_heads, scaler=raw_scaler
@@ -711,12 +1061,27 @@ def train_baseline_models(
     transform = selected_state[
         ("rff", rff_selected["modes"], rff_selected["gamma"])
     ]
-    combined_scaled = transform.scaler.transform(
-        combined.loc[:, rff_columns].to_numpy(dtype=np.float64)
+    combined_rff_values = combined.loc[:, rff_columns].to_numpy(dtype=np.float64)
+    combined_scaled = executor.run(
+        "rff-selected-scale",
+        _apply_transform,
+        transform.scaler,
+        combined_rff_values,
+        declared_bytes=combined_rff_values.nbytes,
     )
-    combined_rff = np.asarray(transform.sampler.transform(combined_scaled), dtype=np.float64)
+    combined_rff = executor.run(
+        "rff-selected-transform",
+        _apply_transform,
+        transform.sampler,
+        combined_scaled,
+        declared_bytes=combined_scaled.nbytes,
+    )
     rff_heads = _fit_linear_heads(
-        combined_rff, combined_target, quantiles, float(rff_selected["alpha"])
+        combined_rff,
+        combined_target,
+        quantiles,
+        float(rff_selected["alpha"]),
+        executor,
     )
     models["rff"] = BaselineModelBundle(
         branch="rff",
@@ -734,6 +1099,7 @@ def train_baseline_models(
         max_depth=int(xgb_selected["max_depth"]),
         learning_rate=float(xgb_selected["learning_rate"]),
         seed_manager=seed_manager,
+        executor=executor,
     )
     models["xgboost"] = BaselineModelBundle(
         branch="xgboost", feature_columns=xgb_columns, predictor=xgb_heads
@@ -771,8 +1137,9 @@ def train_baseline_models(
         "prediction_passes": 1,
     }
     predictions, final_diagnostics = _prediction_records(
-        test, models, quantiles, selected
+        test, models, quantiles, selected, executor
     )
+    checkpoint(int(predictions.memory_usage(index=True, deep=True).sum()))
     output_diagnostics: dict[str, Any] = {
         "schema_version": "1.0",
         "postprocess_order": ["clip_[0,capacity_kw]", "stable_row_sort"],

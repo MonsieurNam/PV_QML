@@ -930,6 +930,68 @@ class RunStore:
         verified.add(stage)
         return sha256_file(path)
 
+    def _verify_stage_marker_only(
+        self,
+        stage: str,
+        *,
+        verified: set[str] | None = None,
+    ) -> str:
+        """Verify immutable prerequisite markers without opening their data outputs.
+
+        This deliberately narrow mode exists only so a downstream stage can publish a
+        bounded INVALID diagnostic after its resource budget expires.  A SUCCESS stage
+        must always use the full prerequisite verification above.
+        """
+
+        if verified is None:
+            verified = set()
+        path = self.root / stage / "stage_manifest.json"
+        if stage in verified:
+            return sha256_file(path)
+        prerequisite_hashes = {
+            prerequisite: self._verify_stage_marker_only(
+                prerequisite, verified=verified
+            )
+            for prerequisite in STAGE_PREREQUISITES[stage]
+        }
+        if not path.is_file() or path.is_symlink():
+            raise ValueError(f"prerequisite stage {stage!r} has no SUCCESS marker")
+        manifest = self._read_json_file(path)
+        if (
+            manifest.get("schema_version") != SCHEMA_VERSION
+            or manifest.get("stage") != stage
+            or manifest.get("status") != "SUCCESS"
+            or manifest.get("config_hash") != self.config_hash
+            or manifest.get("prerequisite_manifest_hashes") != prerequisite_hashes
+        ):
+            raise ValueError(f"stage {stage!r} has an invalid SUCCESS marker")
+        for field in ("input_hashes", "outputs"):
+            records = manifest.get(field)
+            if field == "input_hashes":
+                valid = isinstance(records, dict) and all(
+                    isinstance(key, str) and isinstance(value, str)
+                    for key, value in records.items()
+                )
+            else:
+                valid = isinstance(records, list) and all(
+                    isinstance(record, dict)
+                    and isinstance(record.get("path"), str)
+                    and isinstance(record.get("sha256"), str)
+                    for record in records
+                )
+            if not valid:
+                raise ValueError(f"stage {stage!r} marker has invalid {field}")
+        external_inputs = manifest.get("external_input_hashes")
+        if not isinstance(external_inputs, list) or not all(
+            isinstance(record, dict)
+            and isinstance(record.get("path"), str)
+            and isinstance(record.get("sha256"), str)
+            for record in external_inputs
+        ):
+            raise ValueError(f"stage {stage!r} marker has invalid external input hashes")
+        verified.add(stage)
+        return sha256_file(path)
+
     def _verify_terminal_result_contract(self, manifest: Mapping[str, object]) -> None:
         """Bind the conventional JSON result to its marker even if declaration is removed."""
 
@@ -991,6 +1053,7 @@ class RunStore:
         external_input_hashes: Mapping[str | Path, str] | None = None,
         details: Mapping[str, object] | None = None,
         terminal_status: Literal["SUCCESS", "BLOCKED", "INVALID"] = "SUCCESS",
+        prerequisite_verification: Literal["full", "marker_only"] = "full",
         commit_guard: CommitGuard | None = None,
         config_hash: str | None = None,
         now: Now = None,
@@ -1001,6 +1064,10 @@ class RunStore:
             raise ValueError(f"unknown pipeline stage: {stage!r}")
         if terminal_status not in _TERMINAL_STATUSES:
             raise ValueError("terminal status must be SUCCESS, BLOCKED, or INVALID")
+        if prerequisite_verification not in {"full", "marker_only"}:
+            raise ValueError("prerequisite verification mode is invalid")
+        if prerequisite_verification == "marker_only" and terminal_status != "INVALID":
+            raise ValueError("marker_only prerequisite verification is limited to INVALID stages")
         with self._publication_lock():
             self._recover_publication_journals()
             self._cleanup_stale_stage_directories()
@@ -1010,7 +1077,12 @@ class RunStore:
             raise FileExistsError(f"stage {stage!r} is already completed")
         prerequisite_hashes: dict[str, str] = {}
         for prerequisite in STAGE_PREREQUISITES[stage]:
-            prerequisite_hashes[prerequisite] = self._verify_stage(prerequisite)
+            if prerequisite_verification == "marker_only":
+                prerequisite_hashes[prerequisite] = self._verify_stage_marker_only(
+                    prerequisite
+                )
+            else:
+                prerequisite_hashes[prerequisite] = self._verify_stage(prerequisite)
         inputs: dict[str, str] = {}
         for input_path in input_paths:
             target = self._validated_target(input_path)
@@ -1035,7 +1107,14 @@ class RunStore:
             input_hashes=inputs,
             external_input_hashes=external_inputs,
             prerequisite_manifest_hashes=prerequisite_hashes,
-            details=dict(details or {}),
+            details={
+                **dict(details or {}),
+                **(
+                    {"prerequisite_verification": "marker_only"}
+                    if prerequisite_verification == "marker_only"
+                    else {}
+                ),
+            },
             terminal_status=terminal_status,
             commit_guard=commit_guard,
             clock=_clock(now),

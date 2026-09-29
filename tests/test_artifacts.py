@@ -194,6 +194,49 @@ def test_parallel_stage_prerequisites_and_upstream_tamper_are_checked(tmp_path: 
         pytest.fail("stage body must not run")
 
 
+def test_marker_only_prerequisite_check_is_limited_to_diagnostic_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pv_pilot.artifacts as artifacts_module
+
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    with store.stage("validate-data", now=FIXED_NOW) as transaction:
+        transaction.write_text("validated.csv", "ok")
+    with store.stage("build-splits", now=FIXED_NOW) as transaction:
+        transaction.write_bytes("holdout.bin", b"opaque holdout")
+
+    original_sha256 = artifacts_module.sha256_file
+
+    def reject_holdout_read(path: Path) -> str:
+        if path.name == "holdout.bin":
+            raise AssertionError("diagnostic publication read the holdout")
+        return original_sha256(path)
+
+    monkeypatch.setattr(artifacts_module, "sha256_file", reject_holdout_read)
+    with pytest.raises(ValueError, match="INVALID"):
+        store.stage(
+            "train-baselines",
+            terminal_status="SUCCESS",
+            prerequisite_verification="marker_only",
+            now=FIXED_NOW,
+        )
+
+    with store.stage(
+        "train-baselines",
+        terminal_status="INVALID",
+        prerequisite_verification="marker_only",
+        now=FIXED_NOW,
+    ) as transaction:
+        transaction.write_json(
+            "stage_result.json",
+            {"stage": "train-baselines", "status": "INVALID"},
+        )
+
+    manifest = read_json(store.root / "train-baselines/stage_manifest.json")
+    assert manifest["status"] == "INVALID"
+    assert manifest["details"]["prerequisite_verification"] == "marker_only"
+
+
 def test_stage_exception_leaves_no_outputs_or_success_marker(tmp_path: Path) -> None:
     store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
 

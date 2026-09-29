@@ -39,6 +39,7 @@ from .splits import (
     diagnostic_split_parquet_bytes,
     empty_clip_metrics,
     feature_dataframe_parquet_bytes,
+    feature_schema_sha256,
     split_exclusion_dataframe_parquet_bytes,
 )
 
@@ -222,11 +223,12 @@ class DefaultPilotServices:
         with store.stage(
             "train-baselines",
             input_paths=(
-                Path("build-splits/feature_matrix.parquet"),
+                Path("build-splits/development_features.parquet"),
                 Path("build-splits/feature_manifest.json"),
                 Path("build-splits/minmax_scalers.json"),
             ),
             terminal_status="INVALID",
+            prerequisite_verification="marker_only",
             details={
                 "result_status": StageStatus.INVALID.value,
                 "scientific_decision": "NOT_EVALUATED",
@@ -588,6 +590,8 @@ class DefaultPilotServices:
     def _split_artifacts() -> tuple[Path, ...]:
         return (
             Path("build-splits/feature_matrix.parquet"),
+            Path("build-splits/development_features.parquet"),
+            Path("build-splits/holdout_features.parquet"),
             Path("build-splits/exclusions.parquet"),
             Path("build-splits/feature_manifest.json"),
             Path("build-splits/minmax_scalers.json"),
@@ -634,6 +638,27 @@ class DefaultPilotServices:
             "scientific_decision": "NOT_EVALUATED",
             "split_counts": {"train": 0, "validation": 0, "test": 0},
             "exclusion_counts": {},
+            "partitions": {
+                "development": {
+                    "path": "build-splits/development_features.parquet",
+                    "splits": ["train", "validation"],
+                    "row_count": 0,
+                    "schema_sha256": feature_schema_sha256(config),
+                    "sample_id_order_sha256": hashlib.sha256(b"[]").hexdigest(),
+                },
+                "holdout": {
+                    "path": "build-splits/holdout_features.parquet",
+                    "splits": ["test"],
+                    "row_count": 0,
+                    "schema_sha256": feature_schema_sha256(config),
+                    "sample_id_order_sha256": hashlib.sha256(b"[]").hexdigest(),
+                },
+                "combined": {
+                    "row_count": 0,
+                    "schema_sha256": feature_schema_sha256(config),
+                    "sample_id_order_sha256": hashlib.sha256(b"[]").hexdigest(),
+                },
+            },
             "diagnostic": failure_details,
         }
         details = {
@@ -664,6 +689,8 @@ class DefaultPilotServices:
             },
         ) as transaction:
             transaction.write_bytes("feature_matrix.parquet", feature_bytes)
+            transaction.write_bytes("development_features.parquet", feature_bytes)
+            transaction.write_bytes("holdout_features.parquet", feature_bytes)
             transaction.write_bytes("exclusions.parquet", exclusion_bytes)
             transaction.write_json("feature_manifest.json", manifest)
             transaction.write_json("minmax_scalers.json", {})
@@ -720,8 +747,26 @@ class DefaultPilotServices:
         try:
             feature_bytes = feature_dataframe_parquet_bytes(build.features, config)
             guard.checkpoint(declared + len(feature_bytes))
+            development_bytes = feature_dataframe_parquet_bytes(
+                build.features.loc[
+                    build.features["split"].isin(("train", "validation"))
+                ],
+                config,
+            )
+            holdout_bytes = feature_dataframe_parquet_bytes(
+                build.features.loc[build.features["split"] == "test"], config
+            )
+            guard.checkpoint(
+                declared + len(feature_bytes) + len(development_bytes) + len(holdout_bytes)
+            )
             exclusion_bytes = split_exclusion_dataframe_parquet_bytes(build.exclusions)
-            guard.checkpoint(declared + len(feature_bytes) + len(exclusion_bytes))
+            guard.checkpoint(
+                declared
+                + len(feature_bytes)
+                + len(development_bytes)
+                + len(holdout_bytes)
+                + len(exclusion_bytes)
+            )
         except _ResourceLimitExceeded as error:
             return self._publish_split_invalid(
                 store=store,
@@ -779,19 +824,27 @@ class DefaultPilotServices:
                 commit_guard=guard.checkpoint,
             ) as transaction:
                 transaction.write_bytes("feature_matrix.parquet", feature_bytes)
-                guard.checkpoint(declared + len(feature_bytes) + len(exclusion_bytes))
+                transaction.write_bytes("development_features.parquet", development_bytes)
+                transaction.write_bytes("holdout_features.parquet", holdout_bytes)
+                output_bytes = (
+                    len(feature_bytes)
+                    + len(development_bytes)
+                    + len(holdout_bytes)
+                    + len(exclusion_bytes)
+                )
+                guard.checkpoint(declared + output_bytes)
                 transaction.write_bytes("exclusions.parquet", exclusion_bytes)
-                guard.checkpoint(declared + len(feature_bytes) + len(exclusion_bytes))
+                guard.checkpoint(declared + output_bytes)
                 transaction.write_json("feature_manifest.json", build.feature_manifest)
-                guard.checkpoint(declared + len(feature_bytes) + len(exclusion_bytes))
+                guard.checkpoint(declared + output_bytes)
                 transaction.write_json("minmax_scalers.json", build.scalers)
-                guard.checkpoint(declared + len(feature_bytes) + len(exclusion_bytes))
+                guard.checkpoint(declared + output_bytes)
                 transaction.write_json("clip_rates.json", build.clip_rates)
-                guard.checkpoint(declared + len(feature_bytes) + len(exclusion_bytes))
+                guard.checkpoint(declared + output_bytes)
                 transaction.write_json("stage_result.json", deterministic_data(result))
-                guard.checkpoint(declared + len(feature_bytes) + len(exclusion_bytes))
+                guard.checkpoint(declared + output_bytes)
                 transaction.write_json("resource_ledger.json", ledger)
-                guard.checkpoint(declared + len(feature_bytes) + len(exclusion_bytes))
+                guard.checkpoint(declared + output_bytes)
         except _ResourceLimitExceeded as error:
             return self._publish_split_invalid(
                 store=store,
@@ -810,20 +863,73 @@ class DefaultPilotServices:
         existing = self._existing_train_baselines_result(store)
         if existing is not None:
             return existing
-        store.verify_terminal_stage("build-splits")
+        store.verify_terminal_stage("validate-data")
         config = self._run_config(store)
-        feature_path = store.root / "build-splits/feature_matrix.parquet"
+        development_path = store.root / "build-splits/development_features.parquet"
+        holdout_path = store.root / "build-splits/holdout_features.parquet"
         manifest_path = store.root / "build-splits/feature_manifest.json"
+        split_stage_manifest = self._read_object(
+            store.root / "build-splits/stage_manifest.json"
+        )
+        if (
+            split_stage_manifest.get("schema_version") != "1.0"
+            or split_stage_manifest.get("prerequisite_manifest_hashes")
+            != {
+                "validate-data": sha256_file(
+                    store.root / "validate-data/stage_manifest.json"
+                )
+            }
+            or
+            split_stage_manifest.get("stage") != "build-splits"
+            or split_stage_manifest.get("status") != "SUCCESS"
+            or split_stage_manifest.get("config_hash") != store.config_hash
+        ):
+            raise ValueError("build-splits has an invalid SUCCESS marker")
+        split_outputs = split_stage_manifest.get("outputs")
+        if not isinstance(split_outputs, list):
+            raise ValueError("build-splits marker has invalid outputs")
+        expected_output_hashes = {
+            str(record.get("path")): str(record.get("sha256"))
+            for record in split_outputs
+            if isinstance(record, dict)
+        }
+        development_relative = "build-splits/development_features.parquet"
+        holdout_relative = "build-splits/holdout_features.parquet"
+        for required in (
+            development_relative,
+            holdout_relative,
+            "build-splits/feature_manifest.json",
+            "build-splits/minmax_scalers.json",
+        ):
+            if required not in expected_output_hashes:
+                raise ValueError(f"build-splits marker is missing partition output: {required}")
+        if (
+            not development_path.is_file()
+            or sha256_file(development_path)
+            != expected_output_hashes[development_relative]
+        ):
+            raise ValueError("development partition checksum mismatch")
+        for relative_path in (
+            "build-splits/feature_manifest.json",
+            "build-splits/minmax_scalers.json",
+        ):
+            path = store.root / relative_path
+            if (
+                not path.is_file()
+                or sha256_file(path) != expected_output_hashes[relative_path]
+            ):
+                raise ValueError(f"split metadata checksum mismatch: {relative_path}")
+        if not holdout_path.is_file():
+            raise ValueError("holdout partition is missing")
         guard = _ResourceGuard(
             started=started,
             wall_seconds=config.resources.max_wall_clock_seconds,
             memory_bytes=int(config.resources.max_memory_gb * 1024**3),
         )
         try:
-            guard.checkpoint(feature_path.stat().st_size)
-            feature_dataset = pds.dataset(feature_path, format="parquet")
-            development = feature_dataset.scanner(
-                filter=pds.field("split").isin(["train", "validation"])
+            guard.checkpoint(development_path.stat().st_size)
+            development = pds.dataset(
+                development_path, format="parquet"
             ).to_table().to_pandas()
             declared = int(development.memory_usage(index=True, deep=True).sum())
             guard.checkpoint(declared)
@@ -871,6 +977,48 @@ class DefaultPilotServices:
                 ),
                 resource_status="WITHIN_LIMIT",
             )
+        partitions = feature_manifest.get("partitions")
+        if not isinstance(partitions, dict):
+            raise baseline_models.BaselineContractError(
+                "feature manifest has no immutable partition contract"
+            )
+        development_contract = partitions.get("development")
+        holdout_contract = partitions.get("holdout")
+        combined_contract = partitions.get("combined")
+        if not isinstance(development_contract, dict):
+            raise baseline_models.BaselineContractError(
+                "feature manifest development partition record is invalid"
+            )
+        if not isinstance(holdout_contract, dict):
+            raise baseline_models.BaselineContractError(
+                "feature manifest holdout partition record is invalid"
+            )
+        if not isinstance(combined_contract, dict):
+            raise baseline_models.BaselineContractError(
+                "feature manifest combined partition record is invalid"
+            )
+        if (
+            development_contract.get("row_count") != len(development)
+            or development_contract.get("schema_sha256")
+            != feature_schema_sha256(config)
+            or set(development["split"].astype(str)) != {"train", "validation"}
+        ):
+            raise baseline_models.BaselineContractError(
+                "development partition violates its manifest contract"
+            )
+        development_sample_payload = json.dumps(
+            development["sample_id"].astype(str).tolist(), separators=(",", ":")
+        )
+        development_sample_hash = hashlib.sha256(
+            development_sample_payload.encode("utf-8")
+        ).hexdigest()
+        declared_development_hash = development_contract.get(
+            "sample_id_order_sha256"
+        )
+        if declared_development_hash != development_sample_hash:
+            raise baseline_models.BaselineContractError(
+                "development partition sample order hash mismatch"
+            )
 
         holdout_open_count = 0
         holdout_declared = 0
@@ -882,18 +1030,76 @@ class DefaultPilotServices:
             if holdout_open_count != 0:
                 raise RuntimeError("holdout loader may be invoked exactly once")
             holdout_open_count += 1
-            holdout = feature_dataset.scanner(
-                filter=pds.field("split") == "test"
-            ).to_table().to_pandas()
+            if sha256_file(holdout_path) != expected_output_hashes[holdout_relative]:
+                raise ValueError("holdout partition checksum mismatch")
+            holdout = pds.dataset(holdout_path, format="parquet").to_table().to_pandas()
             holdout_declared = int(holdout.memory_usage(index=True, deep=True).sum())
+            if holdout_contract.get("row_count") != len(holdout):
+                raise baseline_models.BaselineContractError(
+                    "holdout partition violates its manifest row count"
+                )
+            if (
+                holdout_contract.get("schema_sha256")
+                != feature_schema_sha256(config)
+                or combined_contract.get("schema_sha256")
+                != feature_schema_sha256(config)
+            ):
+                raise baseline_models.BaselineContractError(
+                    "feature partition schema hash mismatch"
+                )
+            if combined_contract.get("row_count") != len(development) + len(holdout):
+                raise baseline_models.BaselineContractError(
+                    "feature partitions do not reproduce the combined row count"
+                )
+            holdout_sample_payload = json.dumps(
+                holdout["sample_id"].astype(str).tolist(), separators=(",", ":")
+            )
+            holdout_sample_hash = hashlib.sha256(
+                holdout_sample_payload.encode("utf-8")
+            ).hexdigest()
+            declared_holdout_hash = holdout_contract.get("sample_id_order_sha256")
+            if declared_holdout_hash != holdout_sample_hash:
+                raise baseline_models.BaselineContractError(
+                    "holdout partition sample order hash mismatch"
+                )
+            combined_sample_payload = json.dumps(
+                [
+                    *development["sample_id"].astype(str).tolist(),
+                    *holdout["sample_id"].astype(str).tolist(),
+                ],
+                separators=(",", ":"),
+            )
+            declared_combined_hash = combined_contract.get("sample_id_order_sha256")
+            if (
+                hashlib.sha256(combined_sample_payload.encode("utf-8")).hexdigest()
+                != declared_combined_hash
+            ):
+                raise baseline_models.BaselineContractError(
+                    "feature partitions do not reproduce the combined sample order hash"
+                )
             guard.checkpoint(declared + holdout_declared)
             return holdout
 
         try:
+            fit_executor = baseline_models.DeadlineProcessFitExecutor(
+                deadline_monotonic=(
+                    time.monotonic()
+                    + max(
+                        0.0,
+                        config.resources.max_wall_clock_seconds
+                        - (time.perf_counter() - started),
+                    )
+                ),
+                resource_checkpoint=guard.checkpoint,
+                private_directory=store.root,
+                max_child_rss_bytes=guard.memory_bytes,
+            )
             training = baseline_models.train_baseline_models(
                 development,
                 config,
                 holdout_loader=load_holdout,
+                resource_checkpoint=guard.checkpoint,
+                fit_executor=fit_executor,
             )
             if holdout_open_count != 1:
                 raise RuntimeError("baseline trainer did not open holdout exactly once")
@@ -905,6 +1111,20 @@ class DefaultPilotServices:
         except _ResourceLimitExceeded as error:
             return self._publish_baseline_resource_invalid(
                 store=store, config=config, guard=guard, gate=error.gate
+            )
+        except baseline_models.FitDeadlineExceeded:
+            return self._publish_baseline_resource_invalid(
+                store=store,
+                config=config,
+                guard=guard,
+                gate="fit_wall_clock_deadline",
+            )
+        except baseline_models.FitMemoryExceeded:
+            return self._publish_baseline_resource_invalid(
+                store=store,
+                config=config,
+                guard=guard,
+                gate="fit_memory_rss",
             )
         except baseline_models.BaselineContractError as error:
             return self._publish_baseline_resource_invalid(
@@ -924,18 +1144,39 @@ class DefaultPilotServices:
         serialization_probe = development.loc[
             development["split"] == "train"
         ].iloc[:3].copy()
-        original_probe_predictions = baseline_models.predict_test_models(
-            serialization_probe,
-            training.models,
-            tuple(config.evaluation.quantiles),
-            selected_object,
-        )
-        restored_predictions = baseline_models.predict_test_models(
-            serialization_probe,
-            restored,
-            tuple(config.evaluation.quantiles),
-            selected_object,
-        )
+        try:
+            original_probe_predictions = baseline_models.predict_test_models(
+                serialization_probe,
+                training.models,
+                tuple(config.evaluation.quantiles),
+                selected_object,
+                executor=fit_executor,
+            )
+            restored_predictions = baseline_models.predict_test_models(
+                serialization_probe,
+                restored,
+                tuple(config.evaluation.quantiles),
+                selected_object,
+                executor=fit_executor,
+            )
+        except _ResourceLimitExceeded as error:
+            return self._publish_baseline_resource_invalid(
+                store=store, config=config, guard=guard, gate=error.gate
+            )
+        except baseline_models.FitDeadlineExceeded:
+            return self._publish_baseline_resource_invalid(
+                store=store,
+                config=config,
+                guard=guard,
+                gate="fit_wall_clock_deadline",
+            )
+        except baseline_models.FitMemoryExceeded:
+            return self._publish_baseline_resource_invalid(
+                store=store,
+                config=config,
+                guard=guard,
+                gate="fit_memory_rss",
+            )
         prediction_columns = baseline_models.quantile_columns(
             tuple(config.evaluation.quantiles)
         )
@@ -1004,7 +1245,8 @@ class DefaultPilotServices:
             with store.stage(
                 "train-baselines",
                 input_paths=(
-                    Path("build-splits/feature_matrix.parquet"),
+                    Path("build-splits/development_features.parquet"),
+                    Path("build-splits/holdout_features.parquet"),
                     Path("build-splits/feature_manifest.json"),
                     Path("build-splits/minmax_scalers.json"),
                 ),

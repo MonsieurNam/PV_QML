@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import hashlib
+import importlib
 import json
 import pickle
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -20,6 +24,10 @@ from pv_pilot.baselines import (
     BaselineContractError,
     BaselineModelBundle,
     BaselineTrainingResult,
+    DeadlineProcessFitExecutor,
+    DirectFitExecutor,
+    FitDeadlineExceeded,
+    FitMemoryExceeded,
     PersistenceModel,
     QuantileHeads,
     candidate_sort_key,
@@ -37,7 +45,7 @@ from pv_pilot.config import PilotConfig, load_config
 from pv_pilot.domain import StageResult, StageStatus, deterministic_data
 from pv_pilot.seeds import SeedManager
 from pv_pilot.services import DefaultPilotServices
-from pv_pilot.splits import feature_dataframe_parquet_bytes
+from pv_pilot.splits import feature_dataframe_parquet_bytes, feature_schema_sha256
 
 QUANTILES = (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95)
 
@@ -50,8 +58,19 @@ class ConstantEstimator:
         return np.full(len(values), self.value)
 
 
+def _raise_fit_error() -> None:
+    raise ValueError("expected child failure")
+
+
 @pytest.fixture
 def fast_baseline_fits(monkeypatch: pytest.MonkeyPatch) -> None:
+    import pv_pilot.baselines as baseline_module
+
+    monkeypatch.setattr(
+        baseline_module,
+        "DeadlineProcessFitExecutor",
+        lambda **kwargs: DirectFitExecutor(kwargs["resource_checkpoint"]),
+    )
     import pv_pilot.baselines as module
 
     def fit_linear(
@@ -59,8 +78,9 @@ def fast_baseline_fits(monkeypatch: pytest.MonkeyPatch) -> None:
         target: np.ndarray,
         quantiles: tuple[float, ...],
         alpha: float,
+        executor: object,
     ) -> QuantileHeads:
-        del features
+        del features, executor
         center = float(np.mean(target)) + alpha
         return QuantileHeads(
             quantiles=quantiles,
@@ -77,8 +97,9 @@ def fast_baseline_fits(monkeypatch: pytest.MonkeyPatch) -> None:
         max_depth: int,
         learning_rate: float,
         seed_manager: SeedManager,
+        executor: object,
     ) -> QuantileHeads:
-        del features, seed_manager
+        del features, seed_manager, executor
         center = float(np.mean(target)) + max_depth + learning_rate
         return QuantileHeads(
             quantiles=quantiles,
@@ -173,12 +194,28 @@ def make_feature_run(tmp_path: Path) -> RunStore:
         transaction.write_bytes("canonical.parquet", b"canonical")
         transaction.write_json("stage_result.json", deterministic_data(result))
     split_result = StageResult(stage="build-splits", status=StageStatus.SUCCESS)
+    complete_features = feature_frame()
+    development_features, holdout_features = development_and_holdout()
+
+    def sample_hash(frame: pd.DataFrame) -> str:
+        payload = json.dumps(
+            frame["sample_id"].astype(str).tolist(), separators=(",", ":")
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
     with store.stage(
         "build-splits", input_paths=(Path("validate-data/canonical.parquet"),)
     ) as transaction:
         transaction.write_bytes(
             "feature_matrix.parquet",
-            feature_dataframe_parquet_bytes(feature_frame(), loaded.config),
+            feature_dataframe_parquet_bytes(complete_features, loaded.config),
+        )
+        transaction.write_bytes(
+            "development_features.parquet",
+            feature_dataframe_parquet_bytes(development_features, loaded.config),
+        )
+        transaction.write_bytes(
+            "holdout_features.parquet",
+            feature_dataframe_parquet_bytes(holdout_features, loaded.config),
         )
         transaction.write_json(
             "feature_manifest.json",
@@ -209,6 +246,28 @@ def make_feature_run(tmp_path: Path) -> RunStore:
                     "ghi_w_m2",
                     "air_temp_c",
                 ],
+                "split_counts": {"train": 12, "validation": 12, "test": 12},
+                "partitions": {
+                    "development": {
+                        "path": "build-splits/development_features.parquet",
+                        "splits": ["train", "validation"],
+                        "row_count": 24,
+                        "schema_sha256": feature_schema_sha256(loaded.config),
+                        "sample_id_order_sha256": sample_hash(development_features),
+                    },
+                    "holdout": {
+                        "path": "build-splits/holdout_features.parquet",
+                        "splits": ["test"],
+                        "row_count": 12,
+                        "schema_sha256": feature_schema_sha256(loaded.config),
+                        "sample_id_order_sha256": sample_hash(holdout_features),
+                    },
+                    "combined": {
+                        "row_count": 36,
+                        "schema_sha256": feature_schema_sha256(loaded.config),
+                        "sample_id_order_sha256": sample_hash(complete_features),
+                    },
+                },
             },
         )
         transaction.write_json("minmax_scalers.json", {})
@@ -445,6 +504,74 @@ def test_holdout_is_opened_once_only_after_selection_freezes_and_fits_complete(
     assert len(loader_calls) == 1
 
 
+def test_resource_checkpoint_runs_through_candidate_and_refit_boundaries(
+    fast_baseline_fits: None,
+) -> None:
+    development, holdout = development_and_holdout()
+    checkpoints: list[int] = []
+
+    train_baseline_models(
+        development,
+        pilot_config(),
+        holdout_loader=lambda _selection_hash: holdout,
+        resource_checkpoint=checkpoints.append,
+    )
+
+    assert len(checkpoints) >= 250
+    assert all(value >= 0 for value in checkpoints)
+
+
+def test_deadline_fit_executor_terminates_long_fit_without_lingering_child(
+    tmp_path: Path,
+) -> None:
+    executor = DeadlineProcessFitExecutor(
+        deadline_monotonic=time.monotonic() + 0.25,
+        resource_checkpoint=lambda _declared: None,
+        private_directory=tmp_path,
+    )
+    started = time.monotonic()
+
+    with pytest.raises(FitDeadlineExceeded, match="deadline"):
+        executor.run("sleeping-fit", time.sleep, 5.0)
+
+    assert time.monotonic() - started < 2.0
+    assert executor.active_child_pid is None
+    assert not list(tmp_path.iterdir())
+
+
+def test_deadline_fit_executor_enforces_child_rss_and_cleans_private_files(
+    tmp_path: Path,
+) -> None:
+    executor = DeadlineProcessFitExecutor(
+        deadline_monotonic=time.monotonic() + 5.0,
+        resource_checkpoint=lambda _declared: None,
+        private_directory=tmp_path,
+        max_child_rss_bytes=1,
+    )
+
+    with pytest.raises(FitMemoryExceeded, match="RSS"):
+        executor.run("memory-capped-fit", time.sleep, 5.0)
+
+    assert executor.active_child_pid is None
+    assert not list(tmp_path.iterdir())
+
+
+def test_deadline_fit_executor_propagates_child_error_and_cleans_private_files(
+    tmp_path: Path,
+) -> None:
+    executor = DeadlineProcessFitExecutor(
+        deadline_monotonic=time.monotonic() + 5.0,
+        resource_checkpoint=lambda _declared: None,
+        private_directory=tmp_path,
+    )
+
+    with pytest.raises(RuntimeError, match="ValueError: expected child failure"):
+        executor.run("failing-fit", _raise_fit_error)
+
+    assert executor.active_child_pid is None
+    assert not list(tmp_path.iterdir())
+
+
 def test_selected_raw_and_rff_scalers_are_fit_on_train_only(fast_baseline_fits: None) -> None:
     result = train_fixture()
     raw = result.models["raw"]
@@ -545,18 +672,33 @@ def test_service_scans_development_before_lazy_holdout_and_opens_holdout_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import pv_pilot.baselines as baseline_module
+    services_module: Any = importlib.import_module("pv_pilot.services")
 
     store = make_feature_run(tmp_path)
     original = baseline_module.train_baseline_models
+    original_dataset = services_module.pds.dataset
+    original_sha256 = services_module.sha256_file
     events: list[str] = []
+    partition_reads: list[str] = []
+
+    def audited_dataset(path: object, *args: object, **kwargs: object) -> object:
+        partition_reads.append(Path(path).name)  # type: ignore[arg-type]
+        return original_dataset(path, *args, **kwargs)
+
+    def audited_sha256(path: Path) -> str:
+        if path.name == "holdout_features.parquet":
+            partition_reads.append("holdout_checksum")
+        return str(original_sha256(path))
 
     def audited_train(
         development_frame: pd.DataFrame,
         config: PilotConfig,
         *,
         holdout_loader: Callable[[str], pd.DataFrame],
+        **_kwargs: object,
     ) -> BaselineTrainingResult:
         assert set(development_frame["split"]) == {"train", "validation"}
+        assert partition_reads == ["development_features.parquet"]
         events.append("development_received")
 
         def audited_loader(selection_hash: str) -> pd.DataFrame:
@@ -571,10 +713,17 @@ def test_service_scans_development_before_lazy_holdout_and_opens_holdout_once(
         )
 
     monkeypatch.setattr(baseline_module, "train_baseline_models", audited_train)
+    monkeypatch.setattr(services_module.pds, "dataset", audited_dataset)
+    monkeypatch.setattr(services_module, "sha256_file", audited_sha256)
     result = DefaultPilotServices().train_baselines(store.root)
 
     assert result.status is StageStatus.SUCCESS
     assert events == ["development_received", "holdout_opened"]
+    assert partition_reads[:3] == [
+        "development_features.parquet",
+        "holdout_checksum",
+        "holdout_features.parquet",
+    ]
     selection = json.loads(
         (store.root / "train-baselines/selection_manifest.json").read_text(
             encoding="utf-8"
@@ -592,7 +741,7 @@ def test_train_baselines_rejects_feature_input_tamper(
     fast_baseline_fits: None,
 ) -> None:
     store = make_feature_run(tmp_path)
-    feature_path = store.root / "build-splits/feature_matrix.parquet"
+    feature_path = store.root / "build-splits/development_features.parquet"
     feature_path.write_bytes(b"tampered")
 
     with pytest.raises(ValueError, match="checksum"):
@@ -625,6 +774,48 @@ def test_train_baselines_resource_limit_publishes_bounded_invalid(
     assert pd.read_parquet(store.root / "train-baselines/predictions.parquet").empty
 
 
+def test_train_baselines_hard_deadline_is_durable_without_pre_freeze_holdout_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pv_pilot.baselines as baseline_module
+
+    services_module: Any = importlib.import_module("pv_pilot.services")
+    store = make_feature_run(tmp_path)
+    original_sha256 = services_module.sha256_file
+    executor_created = False
+
+    class AlwaysDeadlineExecutor:
+        def __init__(self, **_kwargs: object) -> None:
+            nonlocal executor_created
+            executor_created = True
+
+        def run(self, *_args: object, **_kwargs: object) -> object:
+            raise FitDeadlineExceeded("injected hard deadline")
+
+    def reject_holdout_hash(path: Path) -> str:
+        if path.name == "holdout_features.parquet":
+            raise AssertionError("deadline INVALID publication read the holdout")
+        return str(original_sha256(path))
+
+    monkeypatch.setattr(
+        baseline_module, "DeadlineProcessFitExecutor", AlwaysDeadlineExecutor
+    )
+    monkeypatch.setattr(services_module, "sha256_file", reject_holdout_hash)
+
+    result = DefaultPilotServices().train_baselines(store.root)
+
+    assert executor_created
+    assert result.status is StageStatus.INVALID
+    marker = json.loads(
+        (store.root / "train-baselines/stage_manifest.json").read_text(encoding="utf-8")
+    )
+    assert marker["status"] == "INVALID"
+    assert marker["details"]["resource_gate"] == "fit_wall_clock_deadline"
+    assert marker["details"]["prerequisite_verification"] == "marker_only"
+    assert not list(store.root.glob(".fit-operation-*"))
+
+
 def test_train_baselines_contract_error_publishes_invalid_not_failed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -634,7 +825,11 @@ def test_train_baselines_contract_error_publishes_invalid_not_failed(
     store = make_feature_run(tmp_path)
 
     def reject(
-        frame: pd.DataFrame, config: object, *, holdout_loader: object
+        frame: pd.DataFrame,
+        config: object,
+        *,
+        holdout_loader: object,
+        **_kwargs: object,
     ) -> object:
         del frame, config, holdout_loader
         raise BaselineContractError("bad split schema")

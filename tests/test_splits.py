@@ -399,6 +399,8 @@ def test_build_splits_service_publishes_and_resumes(tmp_path: Path) -> None:
     assert "already successful" in (second.message or "")
     for name in (
         "feature_matrix.parquet",
+        "development_features.parquet",
+        "holdout_features.parquet",
         "exclusions.parquet",
         "feature_manifest.json",
         "minmax_scalers.json",
@@ -408,6 +410,19 @@ def test_build_splits_service_publishes_and_resumes(tmp_path: Path) -> None:
         "stage_manifest.json",
     ):
         assert (store.root / "build-splits" / name).is_file()
+    development = pd.read_parquet(
+        store.root / "build-splits/development_features.parquet"
+    )
+    holdout = pd.read_parquet(store.root / "build-splits/holdout_features.parquet")
+    assert set(development["split"]) == {"train", "validation"}
+    assert set(holdout["split"]) == {"test"}
+    manifest = read_json(store.root / "build-splits/feature_manifest.json")
+    assert manifest["partitions"]["development"]["row_count"] == len(development)
+    assert manifest["partitions"]["holdout"]["row_count"] == len(holdout)
+    assert len(manifest["partitions"]["development"]["schema_sha256"]) == 64
+    assert len(manifest["partitions"]["development"]["sample_id_order_sha256"]) == 64
+    assert len(manifest["partitions"]["holdout"]["schema_sha256"]) == 64
+    assert len(manifest["partitions"]["holdout"]["sample_id_order_sha256"]) == 64
     store.verify_terminal_stage("build-splits")
     assert read_json(store.root / "build-splits/stage_result.json")["status"] == "success"
 

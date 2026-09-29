@@ -192,6 +192,12 @@ def _sample_hash(sample_ids: pd.Series) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def feature_schema_sha256(config: PilotConfig) -> str:
+    """Return the stable hash of the physical Arrow feature schema."""
+
+    return hashlib.sha256(feature_arrow_schema(config).serialize().to_pybytes()).hexdigest()
+
+
 def _fit_and_apply_scaler(
     features: pd.DataFrame,
     columns: tuple[str, ...],
@@ -499,6 +505,33 @@ def build_feature_splits(
         "xgb_columns": xgb_columns,
         "solar_geometry": solar_policy,
         "split_counts": {name: int(split_counts[name]) for name in _SPLIT_NAMES},
+        "partitions": {
+            "development": {
+                "path": "build-splits/development_features.parquet",
+                "splits": ["train", "validation"],
+                "row_count": int(features["split"].isin(("train", "validation")).sum()),
+                "schema_sha256": feature_schema_sha256(config),
+                "sample_id_order_sha256": _sample_hash(
+                    features.loc[
+                        features["split"].isin(("train", "validation")), "sample_id"
+                    ]
+                ),
+            },
+            "holdout": {
+                "path": "build-splits/holdout_features.parquet",
+                "splits": ["test"],
+                "row_count": int((features["split"] == "test").sum()),
+                "schema_sha256": feature_schema_sha256(config),
+                "sample_id_order_sha256": _sample_hash(
+                    features.loc[features["split"] == "test", "sample_id"]
+                ),
+            },
+            "combined": {
+                "row_count": len(features),
+                "schema_sha256": feature_schema_sha256(config),
+                "sample_id_order_sha256": _sample_hash(features["sample_id"]),
+            },
+        },
         "exclusion_counts": {
             key: int(value) for key, value in sorted(Counter(exclusions_frame["reason"]).items())
         },
@@ -616,6 +649,7 @@ __all__ = [
     "empty_clip_metrics",
     "feature_arrow_schema",
     "feature_dataframe_parquet_bytes",
+    "feature_schema_sha256",
     "split_exclusion_arrow_schema",
     "split_exclusion_dataframe_parquet_bytes",
 ]
