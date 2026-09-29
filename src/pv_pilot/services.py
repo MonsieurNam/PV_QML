@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import pickle
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -12,6 +14,7 @@ from typing import Any, Literal, cast
 import pandas as pd
 import psutil
 
+from . import baselines as baseline_models
 from .artifacts import RunStore, sha256_file
 from .config import PilotConfig, load_config
 from .data import (
@@ -28,6 +31,8 @@ from .data import dataframe_parquet_bytes as dataframe_parquet_bytes
 from .domain import DetailEntry, StageResult, StageStatus, deterministic_data
 from .splits import (
     FEATURE_SCHEMA_VERSION,
+    MATCHED4_COLUMNS,
+    MATCHED6_COLUMNS,
     SplitContractError,
     build_feature_splits,
     diagnostic_split_parquet_bytes,
@@ -145,6 +150,108 @@ class DefaultPilotServices:
             else "build-splits already invalid"
         )
         return result.model_copy(update={"message": message})
+
+    @classmethod
+    def _existing_train_baselines_result(cls, store: RunStore) -> StageResult | None:
+        marker = store.root / "train-baselines/stage_manifest.json"
+        if not marker.is_file():
+            return None
+        manifest = cls._read_object(marker)
+        status = manifest.get("status")
+        if status not in {"SUCCESS", "INVALID"}:
+            raise ValueError("train-baselines has an invalid terminal marker")
+        store.verify_terminal_stage(
+            "train-baselines", accepted_statuses=frozenset({str(status)})
+        )
+        result_path = store.root / "train-baselines/stage_result.json"
+        result = StageResult.model_validate_json(result_path.read_text(encoding="utf-8"))
+        message = (
+            "train-baselines already successful"
+            if status == "SUCCESS"
+            else "train-baselines already invalid"
+        )
+        return result.model_copy(update={"message": message})
+
+    @staticmethod
+    def _publish_baseline_resource_invalid(
+        *,
+        store: RunStore,
+        config: PilotConfig,
+        guard: _ResourceGuard,
+        gate: str,
+        message: str = "baseline training exceeded a configured resource cap",
+        resource_status: str = "EXCEEDED",
+    ) -> StageResult:
+        del config
+        empty_predictions = pd.DataFrame(columns=baseline_models.prediction_arrow_schema().names)
+        empty_scores = pd.DataFrame(
+            columns=baseline_models.validation_score_arrow_schema().names
+        )
+        prediction_bytes = baseline_models.prediction_parquet_bytes(empty_predictions)
+        validation_bytes = baseline_models.validation_scores_parquet_bytes(empty_scores)
+        model_bytes = pickle.dumps({}, protocol=5)
+        result = StageResult(
+            stage="train-baselines",
+            status=StageStatus.INVALID,
+            message=message,
+            artifacts=(
+                Path("train-baselines/selection_manifest.json"),
+                Path("train-baselines/predictions.parquet"),
+                Path("train-baselines/validation_scores.parquet"),
+                Path("train-baselines/diagnostics.json"),
+                Path("train-baselines/models/baseline_models.pkl"),
+                Path("train-baselines/models/manifest.json"),
+                Path("train-baselines/resource_ledger.json"),
+            ),
+            details=(
+                DetailEntry(key="resource_gate", value=gate),
+                DetailEntry(key="scientific_decision", value="NOT_EVALUATED"),
+            ),
+        )
+        ledger = {
+            "schema_version": "1.0",
+            "stage": "train-baselines",
+            "status": StageStatus.INVALID.value,
+            "resource_status": resource_status,
+            "resource_gate": gate,
+            "peak_rss_bytes": guard.peak_rss_bytes,
+            "peak_declared_bytes": guard.peak_declared_bytes,
+            "cpu_only": True,
+        }
+        with store.stage(
+            "train-baselines",
+            input_paths=(
+                Path("build-splits/feature_matrix.parquet"),
+                Path("build-splits/feature_manifest.json"),
+                Path("build-splits/minmax_scalers.json"),
+            ),
+            terminal_status="INVALID",
+            details={
+                "result_status": StageStatus.INVALID.value,
+                "scientific_decision": "NOT_EVALUATED",
+                "resource_gate": gate,
+            },
+        ) as transaction:
+            transaction.write_json(
+                "selection_manifest.json",
+                {"schema_version": "1.0", "status": "invalid", "candidates": []},
+            )
+            transaction.write_bytes("predictions.parquet", prediction_bytes)
+            transaction.write_bytes("validation_scores.parquet", validation_bytes)
+            transaction.write_json("diagnostics.json", {"schema_version": "1.0"})
+            transaction.write_bytes("models/baseline_models.pkl", model_bytes)
+            transaction.write_json(
+                "models/manifest.json",
+                {
+                    "schema_version": "1.0",
+                    "status": "invalid",
+                    "models": [],
+                    "scientific_decision": "NOT_EVALUATED",
+                },
+            )
+            transaction.write_json("stage_result.json", deterministic_data(result))
+            transaction.write_json("resource_ledger.json", ledger)
+        return result
 
     @staticmethod
     def _publish_resource_invalid(
@@ -696,8 +803,195 @@ class DefaultPilotServices:
             )
         return result
 
-    def train_baselines(self, run_dir: Path) -> None:
-        self._unimplemented("train-baselines")
+    def train_baselines(self, run_dir: Path) -> StageResult:
+        started = time.perf_counter()
+        store = RunStore.open(run_dir)
+        existing = self._existing_train_baselines_result(store)
+        if existing is not None:
+            return existing
+        store.verify_terminal_stage("build-splits")
+        config = self._run_config(store)
+        feature_path = store.root / "build-splits/feature_matrix.parquet"
+        manifest_path = store.root / "build-splits/feature_manifest.json"
+        guard = _ResourceGuard(
+            started=started,
+            wall_seconds=config.resources.max_wall_clock_seconds,
+            memory_bytes=int(config.resources.max_memory_gb * 1024**3),
+        )
+        try:
+            guard.checkpoint(feature_path.stat().st_size)
+            features = pd.read_parquet(feature_path)
+            declared = int(features.memory_usage(index=True, deep=True).sum())
+            guard.checkpoint(declared)
+        except _ResourceLimitExceeded as error:
+            return self._publish_baseline_resource_invalid(
+                store=store, config=config, guard=guard, gate=error.gate
+            )
+        feature_manifest = self._read_object(manifest_path)
+        expected_profiles = {
+            "matched4_columns": list(MATCHED4_COLUMNS),
+            "matched6_columns": list(MATCHED6_COLUMNS),
+        }
+        for key, expected in expected_profiles.items():
+            if feature_manifest.get(key) != expected:
+                return self._publish_baseline_resource_invalid(
+                    store=store,
+                    config=config,
+                    guard=guard,
+                    gate="data_or_split_contract",
+                    message=(
+                        f"feature manifest {key} does not match the frozen baseline contract"
+                    ),
+                    resource_status="WITHIN_LIMIT",
+                )
+        expected_xgb = [
+            "power_lag_0m_kw",
+            "power_lag_5m_kw",
+            "power_lag_10m_kw",
+            "power_lag_15m_kw",
+            "power_lag_30m_kw",
+            "power_lag_60m_kw",
+            "ghi_w_m2",
+            "air_temp_c",
+        ]
+        if config.daylight.source.value == "solar_elevation":
+            expected_xgb.extend(("solar_elevation_deg", "solar_azimuth_deg"))
+        if feature_manifest.get("xgb_columns") != expected_xgb:
+            return self._publish_baseline_resource_invalid(
+                store=store,
+                config=config,
+                guard=guard,
+                gate="data_or_split_contract",
+                message=(
+                    "feature manifest xgb_columns does not match the frozen baseline contract"
+                ),
+                resource_status="WITHIN_LIMIT",
+            )
+
+        try:
+            training = baseline_models.train_baseline_models(features, config)
+            guard.checkpoint(declared)
+            prediction_bytes = baseline_models.prediction_parquet_bytes(training.predictions)
+            validation_frame = pd.DataFrame.from_records(training.validation_scores)
+            validation_bytes = baseline_models.validation_scores_parquet_bytes(validation_frame)
+            model_bytes = pickle.dumps(training.models, protocol=5)
+        except _ResourceLimitExceeded as error:
+            return self._publish_baseline_resource_invalid(
+                store=store, config=config, guard=guard, gate=error.gate
+            )
+        except baseline_models.BaselineContractError as error:
+            return self._publish_baseline_resource_invalid(
+                store=store,
+                config=config,
+                guard=guard,
+                gate="data_or_split_contract",
+                message=f"baseline input violates the data contract: {error}",
+                resource_status="WITHIN_LIMIT",
+            )
+        restored: object = pickle.loads(model_bytes)
+        if not isinstance(restored, dict) or set(restored) != set(training.models):
+            raise RuntimeError("serialized baseline model bundle failed round-trip validation")
+        selected_object = training.selection_manifest.get("selected")
+        if not isinstance(selected_object, dict):
+            raise RuntimeError("baseline selection manifest lost selected configurations")
+        serialization_probe = features.loc[features["split"] == "train"].iloc[:3].copy()
+        original_probe_predictions = baseline_models.predict_test_models(
+            serialization_probe,
+            training.models,
+            tuple(config.evaluation.quantiles),
+            selected_object,
+        )
+        restored_predictions = baseline_models.predict_test_models(
+            serialization_probe,
+            restored,
+            tuple(config.evaluation.quantiles),
+            selected_object,
+        )
+        prediction_columns = baseline_models.quantile_columns(
+            tuple(config.evaluation.quantiles)
+        )
+        if not (
+            original_probe_predictions.loc[:, prediction_columns].to_numpy(dtype=float)
+            == restored_predictions.loc[:, prediction_columns].to_numpy(dtype=float)
+        ).all():
+            raise RuntimeError("serialized baseline predictions changed after round-trip")
+        model_sha256 = hashlib.sha256(model_bytes).hexdigest()
+        model_manifest = {
+            "schema_version": "1.0",
+            "format": "python_pickle_protocol_5",
+            "warning": "load only artifacts produced by this trusted pilot run",
+            "models": sorted(training.models),
+            "models_sha256": model_sha256,
+            "serialization_roundtrip_verified": True,
+            "serialization_probe": "first_three_train_rows",
+            "scientific_decision": "NOT_EVALUATED",
+        }
+        total_bytes = declared + len(prediction_bytes) + len(validation_bytes) + len(model_bytes)
+        try:
+            guard.checkpoint(total_bytes)
+        except _ResourceLimitExceeded as error:
+            return self._publish_baseline_resource_invalid(
+                store=store, config=config, guard=guard, gate=error.gate
+            )
+        artifacts = (
+            Path("train-baselines/selection_manifest.json"),
+            Path("train-baselines/predictions.parquet"),
+            Path("train-baselines/validation_scores.parquet"),
+            Path("train-baselines/diagnostics.json"),
+            Path("train-baselines/models/baseline_models.pkl"),
+            Path("train-baselines/models/manifest.json"),
+            Path("train-baselines/resource_ledger.json"),
+        )
+        result = StageResult(
+            stage="train-baselines",
+            status=StageStatus.SUCCESS,
+            message="classical probabilistic baselines trained successfully",
+            artifacts=artifacts,
+            details=(
+                DetailEntry(key="scientific_decision", value="NOT_EVALUATED"),
+                DetailEntry(key="test_prediction_passes", value=1),
+            ),
+        )
+        guard.sample_without_enforcement()
+        ledger = {
+            "schema_version": "1.0",
+            "stage": "train-baselines",
+            "status": StageStatus.SUCCESS.value,
+            "resource_status": "WITHIN_LIMIT",
+            "wall_clock_seconds": time.perf_counter() - started,
+            "peak_rss_bytes": guard.peak_rss_bytes,
+            "peak_declared_bytes": guard.peak_declared_bytes,
+            "max_wall_clock_seconds": config.resources.max_wall_clock_seconds,
+            "max_memory_bytes": guard.memory_bytes,
+            "cpu_only": True,
+        }
+        try:
+            with store.stage(
+                "train-baselines",
+                input_paths=(
+                    Path("build-splits/feature_matrix.parquet"),
+                    Path("build-splits/feature_manifest.json"),
+                    Path("build-splits/minmax_scalers.json"),
+                ),
+                details={
+                    "result_status": StageStatus.SUCCESS.value,
+                    "scientific_decision": "NOT_EVALUATED",
+                },
+                commit_guard=guard.checkpoint,
+            ) as transaction:
+                transaction.write_json("selection_manifest.json", training.selection_manifest)
+                transaction.write_bytes("predictions.parquet", prediction_bytes)
+                transaction.write_bytes("validation_scores.parquet", validation_bytes)
+                transaction.write_json("diagnostics.json", training.diagnostics)
+                transaction.write_bytes("models/baseline_models.pkl", model_bytes)
+                transaction.write_json("models/manifest.json", model_manifest)
+                transaction.write_json("stage_result.json", deterministic_data(result))
+                transaction.write_json("resource_ledger.json", ledger)
+        except _ResourceLimitExceeded as error:
+            return self._publish_baseline_resource_invalid(
+                store=store, config=config, guard=guard, gate=error.gate
+            )
+        return result
 
     def build_photonic_features(self, run_dir: Path) -> None:
         self._unimplemented("build-photonic-features")
