@@ -28,6 +28,13 @@ Every published `stage_result.json` is declared by its stage manifest. Its norma
 status must match the marker before publication, during crash recovery, on resume, and whenever a
 downstream stage verifies prerequisites.
 
+Canonical and QC Parquet artifacts use explicit Arrow schemas: UTC timestamps are stored at
+microsecond precision, quality flags are non-null `list<string>`, and a configured daylight field
+is a non-null boolean after invalid/missing values are excluded. CSV headers are parsed before
+pandas ingestion so duplicate names are rejected and identifier strings such as `NA` are retained.
+Gap reporting is compact and never materializes the complete missing timestamp range; a per-site
+span above 3,660 days is treated as an invalid source timestamp contract.
+
 The bundled fixture is synthetic and exists only for software acceptance:
 
 ```powershell

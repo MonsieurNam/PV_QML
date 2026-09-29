@@ -254,6 +254,21 @@ def test_post_link_interruption_rolls_back_and_stage_can_rerun(
     assert marker.is_file()
 
 
+def test_invalid_runtime_terminal_status_fails_before_private_or_public_write(
+    tmp_path: Path,
+) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+
+    with pytest.raises(ValueError, match="terminal status"):
+        store.stage("validate-data", terminal_status="TYPO")  # type: ignore[arg-type]
+
+    assert not list(store.root.glob(".stage-*"))
+    assert not (store.root / "validate-data").exists()
+    with store.stage("validate-data", terminal_status="SUCCESS") as transaction:
+        transaction.write_text("validated.csv", "retry")
+    assert (store.root / "validate-data/stage_manifest.json").is_file()
+
+
 @pytest.mark.parametrize("interrupted_publish", ["output", "marker"])
 def test_publish_return_interruption_uses_pre_registered_ownership(
     tmp_path: Path,

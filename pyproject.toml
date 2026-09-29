@@ -61,3 +61,7 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = ["pandas", "pandas.*"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["psutil", "pyarrow", "pyarrow.*"]
+ignore_missing_imports = true

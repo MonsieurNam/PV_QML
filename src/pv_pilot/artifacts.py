@@ -997,6 +997,8 @@ class RunStore:
 
         if stage not in STAGE_PREREQUISITES:
             raise ValueError(f"unknown pipeline stage: {stage!r}")
+        if terminal_status not in _TERMINAL_STATUSES:
+            raise ValueError("terminal status must be SUCCESS, BLOCKED, or INVALID")
         with self._publication_lock():
             self._recover_publication_journals()
             self._cleanup_stale_stage_directories()
@@ -1052,6 +1054,8 @@ class StageTransaction:
         terminal_status: Literal["SUCCESS", "BLOCKED", "INVALID"],
         clock: Clock,
     ) -> None:
+        if terminal_status not in _TERMINAL_STATUSES:
+            raise ValueError("terminal status must be SUCCESS, BLOCKED, or INVALID")
         self._store = store
         self.stage = stage
         self._input_hashes = input_hashes

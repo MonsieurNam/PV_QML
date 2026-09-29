@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import yaml
 from test_config import valid_config
@@ -15,7 +18,15 @@ import pv_pilot.services as services_module
 from pv_pilot.artifacts import RunStore, sha256_file
 from pv_pilot.cli import app
 from pv_pilot.config import DataConfig, load_config
-from pv_pilot.data import CANONICAL_COLUMNS, EXCLUSION_COLUMNS, canonicalize_data
+from pv_pilot.data import (
+    CANONICAL_COLUMNS,
+    EXCLUSION_COLUMNS,
+    MAX_SITE_SPAN_DAYS,
+    canonical_arrow_schema,
+    canonicalize_data,
+    dataframe_parquet_bytes,
+    exclusion_arrow_schema,
+)
 from pv_pilot.domain import StageStatus
 from pv_pilot.services import DefaultPilotServices
 
@@ -173,6 +184,24 @@ def test_explicit_availability_uses_latest_constituent_and_preserves_delay(
         "2025-01-01T00:30:00Z"
     )
     assert result.exclusions.empty
+
+
+def test_nullable_daylight_is_excluded_without_ambiguous_boolean_error(
+    tmp_path: Path,
+) -> None:
+    frame = frame_5m().iloc[:2].copy()
+    frame["is_daylight"] = pd.Series([True, pd.NA], dtype="boolean")
+    path = tmp_path / "nullable-daylight.parquet"
+    frame.to_parquet(path, index=False)
+    config = data_config()
+    payload = config.model_dump()
+    payload["columns"]["daylight"] = "is_daylight"
+
+    result = canonicalize_data(path, DataConfig.model_validate(payload), "parquet")
+
+    assert result.status is StageStatus.SUCCESS
+    assert result.canonical["is_daylight"].tolist() == [True]
+    assert result.exclusions["reason"].tolist() == ["invalid_daylight"]
 
 
 @pytest.mark.parametrize(
@@ -513,7 +542,9 @@ def test_source_change_during_serialization_cannot_publish_success(
     original_serializer = services_module.dataframe_parquet_bytes
     mutated = False
 
-    def mutate_then_serialize(frame: pd.DataFrame) -> bytes:
+    def mutate_then_serialize(
+        frame: pd.DataFrame, *, kind: Literal["canonical", "exclusions"]
+    ) -> bytes:
         nonlocal mutated
         if not mutated:
             mutated = True
@@ -521,7 +552,7 @@ def test_source_change_during_serialization_cannot_publish_success(
                 input_path.write_text("mutated during publication\n", encoding="utf-8")
             else:
                 input_path.unlink()
-        return original_serializer(frame)
+        return original_serializer(frame, kind=kind)
 
     monkeypatch.setattr(services_module, "dataframe_parquet_bytes", mutate_then_serialize)
 
@@ -555,6 +586,93 @@ def test_empty_exclusion_parquet_has_stable_schema(tmp_path: Path) -> None:
     assert tuple(result.exclusions.columns) == EXCLUSION_COLUMNS
     assert str(result.exclusions["source_row_id"].dtype) == "string"
     assert str(result.exclusions["source_timestamp_utc"].dtype) == "datetime64[ns, UTC]"
+
+
+def test_parquet_physical_schemas_are_stable_for_empty_and_nonempty_frames(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "good.csv"
+    frame_5m().to_csv(path, index=False)
+    nonempty = canonicalize_data(path, data_config(), "csv")
+    empty_path = tmp_path / "empty-invalid.csv"
+    invalid = frame_5m().iloc[:1].copy()
+    invalid["ghi_w_m2"] = ""
+    invalid.to_csv(empty_path, index=False)
+    empty = canonicalize_data(empty_path, data_config(), "csv")
+
+    canonical_schemas = {
+        pq.read_schema(pa.BufferReader(dataframe_parquet_bytes(frame, kind="canonical")))
+        for frame in (nonempty.canonical, empty.canonical)
+    }
+    exclusion_schemas = {
+        pq.read_schema(pa.BufferReader(dataframe_parquet_bytes(frame, kind="exclusions")))
+        for frame in (nonempty.exclusions, empty.exclusions)
+    }
+
+    assert canonical_schemas == {canonical_arrow_schema(include_daylight=False)}
+    assert exclusion_schemas == {exclusion_arrow_schema()}
+    assert canonical_arrow_schema(False).field("quality_flags").type.value_type == pa.string()
+    assert canonical_arrow_schema(False).field("interval_end_utc").type == pa.timestamp(
+        "us", tz="UTC"
+    )
+
+
+def test_csv_identifier_na_is_preserved_and_matches_parquet(tmp_path: Path) -> None:
+    frame = frame_5m().iloc[:1].copy()
+    frame["site_id"] = "NA"
+    csv_path = tmp_path / "identifier.csv"
+    parquet_path = tmp_path / "identifier.parquet"
+    frame.to_csv(csv_path, index=False)
+    frame.to_parquet(parquet_path, index=False)
+
+    csv_result = canonicalize_data(csv_path, data_config(), "csv")
+    parquet_result = canonicalize_data(parquet_path, data_config(), "parquet")
+
+    assert csv_result.canonical["site_id"].tolist() == ["NA"]
+    pd.testing.assert_frame_equal(csv_result.canonical, parquet_result.canonical)
+
+
+def test_csv_duplicate_quoted_or_bom_header_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate.csv"
+    path.write_text(
+        '\ufeff"site_id","timestamp","power_kw","capacity_kw","ghi_w_m2",'
+        '"temperature_c","site_id"\nA,2025-01-01T00:00:00Z,1,10,100,20,A\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate CSV header"):
+        canonicalize_data(path, data_config(), "csv")
+
+
+def test_hundred_year_timestamp_typo_is_bounded_and_invalid(tmp_path: Path) -> None:
+    frame = frame_5m().iloc[:2].copy()
+    frame["timestamp"] = ["1925-01-01T00:00:00Z", "2025-01-01T00:00:00Z"]
+    path = tmp_path / "century.csv"
+    frame.to_csv(path, index=False)
+    started = time.perf_counter()
+
+    with pytest.raises(ValueError, match="maximum site span"):
+        canonicalize_data(path, data_config(), "csv")
+
+    assert time.perf_counter() - started < 2
+    assert MAX_SITE_SPAN_DAYS < 36500
+
+
+def test_hundred_year_typo_service_is_durable_invalid_with_bounded_ledger(
+    tmp_path: Path,
+) -> None:
+    frame = frame_5m().iloc[:2].copy()
+    frame["timestamp"] = ["1925-01-01T00:00:00Z", "2025-01-01T00:00:00Z"]
+    store, _ = make_run(tmp_path, frame)
+
+    result = DefaultPilotServices().validate_data(store.root)
+    ledger = read_json(store.root / "validate-data/cleaning_ledger.json")
+    card = read_json(store.root / "validate-data/data_card.json")
+
+    assert result.status is StageStatus.INVALID
+    assert ledger["resource_status"] == "WITHIN_LIMIT"
+    assert card["excluded_row_count"] == 0
+    assert card["missing_expected_interval_count"] == 0
 
 
 runner = CliRunner()

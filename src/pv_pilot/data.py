@@ -2,21 +2,27 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import math
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC
+from itertools import pairwise
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from .config import DataConfig
 from .domain import StageStatus
 
 CANONICAL_SCHEMA_VERSION = "1.0"
+MAX_SITE_SPAN_DAYS = 3660
 CANONICAL_COLUMNS = (
     "sample_id",
     "site_id",
@@ -52,6 +58,7 @@ class DataValidationResult:
     exclusions: pd.DataFrame
     input_row_count: int
     accepted_input_row_count: int
+    missing_expected_interval_count: int = 0
 
     @property
     def excluded_input_row_count(self) -> int:
@@ -122,6 +129,8 @@ def _parse_timestamp(value: object, timezone: str) -> tuple[pd.Timestamp | None,
         stamp = pd.Timestamp(value)
     except (TypeError, ValueError):
         return None, "invalid_timestamp"
+    if pd.isna(stamp):
+        return None, "invalid_timestamp"
     try:
         if stamp.tzinfo is None:
             stamp = stamp.tz_localize(timezone, ambiguous="raise", nonexistent="raise")
@@ -155,8 +164,64 @@ def _exclusion_frame(records: list[dict[str, object]]) -> pd.DataFrame:
 
 def _read_source(path: Path, format_: Literal["csv", "parquet"]) -> pd.DataFrame:
     if format_ == "csv":
-        return pd.read_csv(path)
+        with path.open("r", encoding="utf-8-sig", newline="") as stream:
+            try:
+                header = next(csv.reader(stream))
+            except StopIteration as error:
+                raise DataContractError("CSV input has no header") from error
+        duplicates = sorted(
+            name for name, count in Counter(header).items() if count > 1
+        )
+        if duplicates:
+            raise DataContractError(
+                f"duplicate CSV header columns: {', '.join(duplicates)}"
+            )
+        return pd.read_csv(
+            path,
+            encoding="utf-8-sig",
+            keep_default_na=False,
+            na_filter=False,
+        )
     return pd.read_parquet(path)
+
+
+def canonical_arrow_schema(include_daylight: bool) -> pa.Schema:
+    """Return the stable physical canonical schema (UTC timestamps use microseconds)."""
+
+    fields = [
+        pa.field("sample_id", pa.string(), nullable=False),
+        pa.field("site_id", pa.string(), nullable=False),
+        pa.field("interval_end_utc", pa.timestamp("us", tz="UTC"), nullable=False),
+        pa.field("power_available_at_utc", pa.timestamp("us", tz="UTC"), nullable=False),
+        pa.field("weather_available_at_utc", pa.timestamp("us", tz="UTC"), nullable=False),
+        pa.field("ac_power_kw", pa.float64(), nullable=False),
+        pa.field("capacity_kw", pa.float64(), nullable=False),
+        pa.field("ghi_w_m2", pa.float64(), nullable=False),
+        pa.field("air_temp_c", pa.float64(), nullable=False),
+        pa.field(
+            "quality_flags",
+            pa.list_(pa.field("element", pa.string(), nullable=True)),
+            nullable=False,
+        ),
+    ]
+    if include_daylight:
+        fields.append(pa.field("is_daylight", pa.bool_(), nullable=False))
+    return pa.schema(fields)
+
+
+def exclusion_arrow_schema() -> pa.Schema:
+    """Return the stable physical QC-exclusion schema."""
+
+    return pa.schema(
+        [
+            pa.field("source_row_id", pa.string(), nullable=False),
+            pa.field("site_id", pa.string(), nullable=False),
+            pa.field("source_timestamp_utc", pa.timestamp("us", tz="UTC"), nullable=True),
+            pa.field("bin_interval_end_utc", pa.timestamp("us", tz="UTC"), nullable=True),
+            pa.field("reason", pa.string(), nullable=False),
+            pa.field("detail", pa.string(), nullable=False),
+        ]
+    )
 
 
 def canonicalize_data(
@@ -282,6 +347,15 @@ def canonicalize_data(
             )
 
     valid = source.loc[~source.index.isin(invalid_rows)]
+    for site, group in valid.groupby("_pv_pilot_site", sort=True):
+        timestamps = group["_pv_pilot_timestamp"]
+        if len(timestamps) > 1:
+            span = timestamps.max() - timestamps.min()
+            if span > pd.Timedelta(days=MAX_SITE_SPAN_DAYS):
+                raise DataContractError(
+                    f"site {site!r} exceeds maximum site span of "
+                    f"{MAX_SITE_SPAN_DAYS} days"
+                )
     duplicate_groups = valid.groupby(
         ["_pv_pilot_site", "_pv_pilot_timestamp"], dropna=False
     ).groups
@@ -358,9 +432,17 @@ def canonicalize_data(
             }
             if include_daylight:
                 raw_daylight = source.at[index, mapping.daylight]
-                if isinstance(raw_daylight, bool):
+                if pd.isna(raw_daylight):
+                    exclude(
+                        int(index),
+                        "invalid_daylight",
+                        "daylight is missing",
+                        timestamp=stamp,
+                    )
+                    continue
+                if isinstance(raw_daylight, (bool, np.bool_)):
                     record["is_daylight"] = raw_daylight
-                elif raw_daylight in (0, 1):
+                elif isinstance(raw_daylight, (int, float)) and raw_daylight in (0, 1):
                     record["is_daylight"] = bool(raw_daylight)
                 else:
                     exclude(
@@ -422,7 +504,15 @@ def canonicalize_data(
             }
             if include_daylight:
                 daylight_values = group[mapping.daylight].tolist()
-                if not all(isinstance(value, bool) or value in (0, 1) for value in daylight_values):
+                valid_daylight = all(
+                    not pd.isna(value)
+                    and (
+                        isinstance(value, (bool, np.bool_))
+                        or (isinstance(value, (int, float)) and value in (0, 1))
+                    )
+                    for value in daylight_values
+                )
+                if not valid_daylight:
                     for index in group.index:
                         exclude(
                             int(index),
@@ -451,6 +541,7 @@ def canonicalize_data(
             ["site_id", "interval_end_utc"], kind="stable"
         ).reset_index(drop=True)
 
+    missing_expected_interval_count = 0
     if cadence == 5:
         grid_source = source.loc[
             source["_pv_pilot_timestamp"].map(
@@ -462,20 +553,25 @@ def canonicalize_data(
             )
         ]
         for site, group in grid_source.groupby("_pv_pilot_site", sort=True):
-            observed = set(group["_pv_pilot_timestamp"])
-            if len(observed) < 2:
+            sorted_observed = sorted(set(group["_pv_pilot_timestamp"]))
+            if len(sorted_observed) < 2:
                 continue
-            expected = pd.date_range(min(observed), max(observed), freq="5min", tz="UTC")
-            for missing_stamp in expected:
-                if missing_stamp not in observed:
+            for left, right in pairwise(sorted_observed):
+                missing_count = int((right - left) / pd.Timedelta(minutes=5)) - 1
+                if missing_count > 0:
+                    missing_expected_interval_count += missing_count
+                    first_missing = left + pd.Timedelta(minutes=5)
                     exclusions.append(
                         {
-                            "source_row_id": f"gap:{site}:{missing_stamp.isoformat()}",
+                            "source_row_id": f"gap:{site}:{first_missing.isoformat()}",
                             "site_id": str(site),
-                            "source_timestamp_utc": missing_stamp,
-                            "bin_interval_end_utc": missing_stamp,
+                            "source_timestamp_utc": first_missing,
+                            "bin_interval_end_utc": right - pd.Timedelta(minutes=5),
                             "reason": "missing_interval",
-                            "detail": "no source observation for expected 5-minute interval",
+                            "detail": (
+                                f"{missing_count} consecutive expected 5-minute intervals "
+                                "have no source observation"
+                            ),
                         }
                     )
 
@@ -487,16 +583,29 @@ def canonicalize_data(
         exclusions=exclusion_frame,
         input_row_count=len(source),
         accepted_input_row_count=accepted_input_row_count,
+        missing_expected_interval_count=missing_expected_interval_count,
     )
 
 
-def dataframe_parquet_bytes(frame: pd.DataFrame) -> bytes:
-    """Serialize a dataframe deterministically enough for immutable stage storage."""
+def dataframe_parquet_bytes(
+    frame: pd.DataFrame,
+    *,
+    kind: Literal["canonical", "exclusions"],
+) -> bytes:
+    """Serialize using an explicit stable Arrow schema for every empty/nonempty path."""
 
     import io
 
     buffer = io.BytesIO()
-    frame.to_parquet(buffer, index=False, engine="pyarrow", compression="zstd")
+    schema = (
+        canonical_arrow_schema(include_daylight="is_daylight" in frame.columns)
+        if kind == "canonical"
+        else exclusion_arrow_schema()
+    )
+    table = pa.Table.from_pandas(
+        frame, schema=schema, preserve_index=False, safe=True
+    ).replace_schema_metadata(None)
+    pq.write_table(table, buffer, compression="zstd")
     return buffer.getvalue()
 
 
@@ -517,11 +626,14 @@ __all__ = [
     "CANONICAL_COLUMNS",
     "CANONICAL_SCHEMA_VERSION",
     "EXCLUSION_COLUMNS",
+    "MAX_SITE_SPAN_DAYS",
     "DataContractError",
     "DataValidationResult",
+    "canonical_arrow_schema",
     "canonical_checksum",
     "canonicalize_data",
     "dataframe_parquet_bytes",
     "empty_canonical_frame",
     "empty_exclusion_frame",
+    "exclusion_arrow_schema",
 ]

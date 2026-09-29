@@ -8,6 +8,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Literal, cast
 
+import psutil
+
 from .artifacts import RunStore, sha256_file
 from .config import PilotConfig, load_config
 from .data import (
@@ -98,6 +100,8 @@ class DefaultPilotServices:
         status: StageStatus
         message: str
         failure_details: dict[str, object] = {}
+        resource_status = "WITHIN_LIMIT"
+        memory_limit_bytes = int(config.resources.max_memory_gb * 1024**3)
         register_external_input = False
         if source_record.get("status") == "MISSING":
             status = StageStatus.BLOCKED
@@ -145,12 +149,11 @@ class DefaultPilotServices:
             )
         else:
             register_external_input = True
-            try:
-                result = canonicalize_data(source_path, config.data, config.data.format)
-            except (DataContractError, OSError, ValueError) as error:
+            if source_path.stat().st_size > memory_limit_bytes:
                 status = StageStatus.INVALID
-                message = f"input dataset violates its configured contract: {error}"
-                failure_details = {"error_type": type(error).__name__}
+                resource_status = "EXCEEDED"
+                message = "input dataset exceeds configured memory resource cap"
+                failure_details = {"resource_gate": "input_file_size"}
                 result = DataValidationResult(
                     status=status,
                     canonical=empty_canonical_frame(
@@ -161,15 +164,12 @@ class DefaultPilotServices:
                     accepted_input_row_count=0,
                 )
             else:
-                post_read_hash = sha256_file(source_path)
-                if post_read_hash != expected_hash:
-                    register_external_input = False
+                try:
+                    result = canonicalize_data(source_path, config.data, config.data.format)
+                except (DataContractError, OSError, ValueError) as error:
                     status = StageStatus.INVALID
-                    message = "input dataset changed while it was being validated"
-                    failure_details = {
-                        "actual_sha256": post_read_hash,
-                        "expected_sha256": expected_hash,
-                    }
+                    message = f"input dataset violates its configured contract: {error}"
+                    failure_details = {"error_type": type(error).__name__}
                     result = DataValidationResult(
                         status=status,
                         canonical=empty_canonical_frame(
@@ -180,14 +180,49 @@ class DefaultPilotServices:
                         accepted_input_row_count=0,
                     )
                 else:
-                    status = result.status
-                    message = (
-                        "data validation successful"
-                        if status is StageStatus.SUCCESS
-                        else "no canonical observations survived quality control"
-                    )
+                    post_read_hash = sha256_file(source_path)
+                    if post_read_hash != expected_hash:
+                        register_external_input = False
+                        status = StageStatus.INVALID
+                        message = "input dataset changed while it was being validated"
+                        failure_details = {
+                            "actual_sha256": post_read_hash,
+                            "expected_sha256": expected_hash,
+                        }
+                        result = DataValidationResult(
+                            status=status,
+                            canonical=empty_canonical_frame(
+                                include_daylight=config.data.columns.daylight is not None
+                            ),
+                            exclusions=empty_exclusion_frame(),
+                            input_row_count=0,
+                            accepted_input_row_count=0,
+                        )
+                    else:
+                        status = result.status
+                        message = (
+                            "data validation successful"
+                            if status is StageStatus.SUCCESS
+                            else "no canonical observations survived quality control"
+                        )
 
         elapsed = time.perf_counter() - started
+        rss_bytes = psutil.Process().memory_info().rss
+        if (
+            status is StageStatus.SUCCESS
+            and (
+                elapsed > config.resources.max_wall_clock_seconds
+                or rss_bytes > memory_limit_bytes
+            )
+        ):
+            status = StageStatus.INVALID
+            resource_status = "EXCEEDED"
+            message = "data validation exceeded a configured resource cap"
+            failure_details["resource_gate"] = (
+                "wall_clock"
+                if elapsed > config.resources.max_wall_clock_seconds
+                else "memory_rss"
+            )
         canonical = result.canonical
         exclusions = result.exclusions
         site_counts = {
@@ -210,6 +245,7 @@ class DefaultPilotServices:
             "exclusion_record_count": len(exclusions),
             "input_row_count": result.input_row_count,
             "accepted_input_row_count": result.accepted_input_row_count,
+            "missing_expected_interval_count": result.missing_expected_interval_count,
             "input_sha256": expected_hash,
             "provenance": config.protocol.provenance.value,
             "schema_version": "1.0",
@@ -222,6 +258,8 @@ class DefaultPilotServices:
         ledger = {
             "elapsed_seconds": elapsed,
             "human_cleaning_hours": None,
+            "peak_rss_bytes_observed": rss_bytes,
+            "resource_status": resource_status,
             "schema_version": "1.0",
             "status": status.value,
             "timebox_seconds": config.resources.max_wall_clock_seconds,
@@ -254,8 +292,13 @@ class DefaultPilotServices:
             terminal_status=terminal,
             details={"result_status": status.value, "scientific_decision": "NOT_EVALUATED"},
         ) as transaction:
-            transaction.write_bytes("canonical.parquet", dataframe_parquet_bytes(canonical))
-            transaction.write_bytes("qc_exclusions.parquet", dataframe_parquet_bytes(exclusions))
+            transaction.write_bytes(
+                "canonical.parquet", dataframe_parquet_bytes(canonical, kind="canonical")
+            )
+            transaction.write_bytes(
+                "qc_exclusions.parquet",
+                dataframe_parquet_bytes(exclusions, kind="exclusions"),
+            )
             transaction.write_json("data_card.json", card)
             transaction.write_json("cleaning_ledger.json", ledger)
             transaction.write_json("stage_result.json", deterministic_data(stage_result))
