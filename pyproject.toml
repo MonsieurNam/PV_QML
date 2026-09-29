@@ -57,3 +57,7 @@ files = ["src", "tests"]
 [[tool.mypy.overrides]]
 module = ["perceval", "perceval.*"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["pandas", "pandas.*"]
+ignore_missing_imports = true

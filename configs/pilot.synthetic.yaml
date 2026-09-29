@@ -27,9 +27,9 @@ target:
   interval_minutes: 5
   horizon_minutes: 15
 split:
-  train_end_utc: "2024-12-31T23:59:59Z"
-  validation_end_utc: "2025-06-30T23:59:59Z"
-  test_end_utc: "2025-12-31T23:59:59Z"
+  train_end_utc: "2025-01-15T23:59:59Z"
+  validation_end_utc: "2025-01-25T23:59:59Z"
+  test_end_utc: "2025-02-14T23:59:59Z"
 daylight:
   source: column
 features:

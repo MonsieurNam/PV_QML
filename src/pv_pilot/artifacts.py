@@ -867,6 +867,7 @@ class RunStore:
         *,
         input_paths: Iterable[str | Path] = (),
         details: Mapping[str, object] | None = None,
+        terminal_status: Literal["SUCCESS", "BLOCKED", "INVALID"] = "SUCCESS",
         config_hash: str | None = None,
         now: Now = None,
     ) -> StageTransaction:
@@ -897,6 +898,7 @@ class RunStore:
             input_hashes=inputs,
             prerequisite_manifest_hashes=prerequisite_hashes,
             details=dict(details or {}),
+            terminal_status=terminal_status,
             clock=_clock(now),
         )
 
@@ -912,6 +914,7 @@ class StageTransaction:
         input_hashes: dict[str, str],
         prerequisite_manifest_hashes: dict[str, str],
         details: dict[str, object],
+        terminal_status: Literal["SUCCESS", "BLOCKED", "INVALID"],
         clock: Clock,
     ) -> None:
         self._store = store
@@ -919,6 +922,7 @@ class StageTransaction:
         self._input_hashes = input_hashes
         self._prerequisite_manifest_hashes = prerequisite_manifest_hashes
         self._details = details
+        self._terminal_status = terminal_status
         self._clock = clock
         self._started_at: datetime | None = None
         self._temporary_root: Path | None = None
@@ -1049,7 +1053,7 @@ class StageTransaction:
                     "schema_version": SCHEMA_VERSION,
                     "stage": self.stage,
                     "started_at": _timestamp(self._started_at),
-                    "status": "SUCCESS",
+                    "status": self._terminal_status,
                     "transaction_id": transaction_id,
                 }
                 self._store._write_bytes(

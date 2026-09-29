@@ -65,7 +65,7 @@ def test_run_pilot_requires_exactly_one_config_source() -> None:
 
 
 def test_unimplemented_service_has_clear_error() -> None:
-    result = runner.invoke(app, ["validate-data", "--run-dir", "artifacts/run"])
+    result = runner.invoke(app, ["build-splits", "--run-dir", "artifacts/run"])
     assert result.exit_code == 1
     assert "pipeline stages are not implemented" in result.output.lower()
     assert "traceback" not in result.output.lower()

@@ -8,6 +8,7 @@ from typing import Annotated, Protocol
 
 import typer
 
+from .domain import StageResult, StageStatus
 from .services import DefaultPilotServices
 
 app = typer.Typer(no_args_is_help=True, help="Photonic photovoltaic pilot runner.")
@@ -18,7 +19,7 @@ class PilotServices(Protocol):
 
     def init_run(self, config: Path) -> Path | None: ...
 
-    def validate_data(self, run_dir: Path) -> None: ...
+    def validate_data(self, run_dir: Path) -> StageResult | None: ...
 
     def build_splits(self, run_dir: Path) -> None: ...
 
@@ -36,12 +37,17 @@ class PilotServices(Protocol):
 services: PilotServices = DefaultPilotServices()
 
 
-def _run_service(action: Callable[[], None]) -> None:
+def _run_service(action: Callable[[], StageResult | None]) -> None:
     try:
-        action()
+        result = action()
     except NotImplementedError as error:
         typer.echo(f"Error: {error}", err=True)
         raise typer.Exit(code=1) from None
+    if result is None:
+        return
+    typer.echo(f"{result.status.value.upper()}: {result.message or result.stage}")
+    if result.status in {StageStatus.BLOCKED, StageStatus.INVALID, StageStatus.FAILED}:
+        raise typer.Exit(code=2)
 
 
 @app.command("init-run")
