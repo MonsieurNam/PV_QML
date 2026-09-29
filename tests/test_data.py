@@ -305,6 +305,8 @@ def make_run(
     tmp_path: Path,
     frame: pd.DataFrame | None,
     *,
+    format_: Literal["csv", "parquet"] = "csv",
+    availability_columns: bool = False,
     max_wall_seconds: int = 3600,
     max_memory_gb: float = 8.0,
 ) -> tuple[RunStore, Path]:
@@ -322,21 +324,28 @@ def make_run(
         "approved_at": None,
     }
     payload["paths"] = {
-        "input_data": "../data/input.csv",
+        "input_data": f"../data/input.{format_}",
         "artifact_dir": "../artifacts",
     }
+    payload["data"]["format"] = format_
     payload["data"]["timezone"] = "UTC"
-    payload["data"]["availability"] = {
-        "power": {"fixed_latency_minutes": 0},
-        "weather": {"fixed_latency_minutes": 0},
-    }
+    if availability_columns:
+        payload["data"]["availability"] = {
+            "power": {"column": "power_available"},
+            "weather": {"column": "weather_available"},
+        }
+    else:
+        payload["data"]["availability"] = {
+            "power": {"fixed_latency_minutes": 0},
+            "weather": {"fixed_latency_minutes": 0},
+        }
     payload["resources"]["max_wall_clock_seconds"] = max_wall_seconds
     payload["resources"]["max_memory_gb"] = max_memory_gb
     config_path = config_dir / "pilot.yaml"
     config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
-    input_path = data_dir / "input.csv"
+    input_path = data_dir / f"input.{format_}"
     if frame is not None:
-        frame.to_csv(input_path, index=False)
+        write_input(input_path, frame, format_)
     loaded = load_config(config_path, project_root=project)
     return RunStore.create(
         loaded, now=datetime(2026, 9, 29, 1, 2, 3, tzinfo=UTC)
@@ -750,6 +759,75 @@ def test_resource_memory_guard_publishes_durable_invalid(tmp_path: Path) -> None
     assert result.status is StageStatus.INVALID
     assert ledger["resource_status"] == "EXCEEDED"
     assert ledger["peak_rss_bytes_observed"] > 0
+
+
+@pytest.mark.parametrize("format_", ["csv", "parquet"])
+@pytest.mark.parametrize("year", [1500, 2500])
+def test_out_of_nanosecond_interval_is_durable_invalid(
+    tmp_path: Path, format_: Literal["csv", "parquet"], year: int
+) -> None:
+    frame = frame_5m().iloc[:1].copy()
+    frame["timestamp"] = [f"{year}-01-01T00:00:00Z"]
+    store, _ = make_run(tmp_path, frame, format_=format_)
+
+    result = DefaultPilotServices().validate_data(store.root)
+    exclusions = pd.read_parquet(store.root / "validate-data/qc_exclusions.parquet")
+
+    assert result.status is StageStatus.INVALID
+    assert exclusions["reason"].tolist() == ["invalid_timestamp"]
+    assert exclusions["source_timestamp_utc"].isna().all()
+    assert read_json(store.root / "validate-data/stage_manifest.json")["status"] == "INVALID"
+
+
+@pytest.mark.parametrize("format_", ["csv", "parquet"])
+@pytest.mark.parametrize("year", [1500, 2500])
+def test_out_of_nanosecond_availability_is_durable_invalid(
+    tmp_path: Path, format_: Literal["csv", "parquet"], year: int
+) -> None:
+    frame = frame_5m().iloc[:1].copy()
+    frame["power_available"] = [f"{year}-01-01T00:00:00Z"]
+    frame["weather_available"] = ["2025-01-01T00:00:00Z"]
+    store, _ = make_run(
+        tmp_path, frame, format_=format_, availability_columns=True
+    )
+
+    result = DefaultPilotServices().validate_data(store.root)
+    exclusions = pd.read_parquet(store.root / "validate-data/qc_exclusions.parquet")
+
+    assert result.status is StageStatus.INVALID
+    assert exclusions["reason"].tolist() == ["invalid_availability"]
+    assert read_json(store.root / "validate-data/stage_manifest.json")["status"] == "INVALID"
+
+
+def test_resource_guard_covers_atomic_stage_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, _ = make_run(tmp_path, frame_5m(), max_wall_seconds=1)
+    original_publish = RunStore._publish_temp
+
+    def slow_publish(
+        self: RunStore,
+        source: Path,
+        destination: Path,
+        publications: list[Any] | None = None,
+    ) -> None:
+        time.sleep(0.22)
+        original_publish(self, source, destination, publications)
+
+    monkeypatch.setattr(RunStore, "_publish_temp", slow_publish)
+
+    first = DefaultPilotServices().validate_data(store.root)
+    resumed = DefaultPilotServices().validate_data(store.root)
+    ledger = read_json(store.root / "validate-data/cleaning_ledger.json")
+
+    assert first.status is StageStatus.INVALID
+    assert resumed.status is StageStatus.INVALID
+    assert ledger["resource_status"] == "EXCEEDED"
+    assert ledger["elapsed_seconds"] >= 1
+    assert read_json(store.root / "validate-data/stage_manifest.json")["status"] == "INVALID"
+    assert not list(store.root.rglob(".rollback-*"))
+    assert not list(store.root.glob(".publication-abort-*"))
+    assert not list(store.root.glob(".stage-*"))
 
 
 def test_hundred_year_timestamp_typo_is_bounded_and_invalid(tmp_path: Path) -> None:

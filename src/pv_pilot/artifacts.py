@@ -25,6 +25,7 @@ from .seeds import SeedManager
 
 SCHEMA_VERSION = "1.0"
 Clock = Callable[[], datetime]
+CommitGuard = Callable[[], None]
 Now = datetime | Clock | None
 
 STAGE_PREREQUISITES: dict[str, tuple[str, ...]] = {
@@ -990,6 +991,7 @@ class RunStore:
         external_input_hashes: Mapping[str | Path, str] | None = None,
         details: Mapping[str, object] | None = None,
         terminal_status: Literal["SUCCESS", "BLOCKED", "INVALID"] = "SUCCESS",
+        commit_guard: CommitGuard | None = None,
         config_hash: str | None = None,
         now: Now = None,
     ) -> StageTransaction:
@@ -1035,6 +1037,7 @@ class RunStore:
             prerequisite_manifest_hashes=prerequisite_hashes,
             details=dict(details or {}),
             terminal_status=terminal_status,
+            commit_guard=commit_guard,
             clock=_clock(now),
         )
 
@@ -1052,6 +1055,7 @@ class StageTransaction:
         prerequisite_manifest_hashes: dict[str, str],
         details: dict[str, object],
         terminal_status: Literal["SUCCESS", "BLOCKED", "INVALID"],
+        commit_guard: CommitGuard | None,
         clock: Clock,
     ) -> None:
         if terminal_status not in _TERMINAL_STATUSES:
@@ -1063,6 +1067,7 @@ class StageTransaction:
         self._prerequisite_manifest_hashes = prerequisite_manifest_hashes
         self._details = details
         self._terminal_status = terminal_status
+        self._commit_guard = commit_guard
         self._clock = clock
         self._started_at: datetime | None = None
         self._temporary_root: Path | None = None
@@ -1150,10 +1155,6 @@ class StageTransaction:
             self._release_lease()
             shutil.rmtree(temporary_root, ignore_errors=True)
             return False
-        output_records = [
-            {"path": logical, "sha256": sha256_file(temporary)}
-            for logical, temporary in sorted(self._outputs.items())
-        ]
         result_logical = f"{self.stage}/stage_result.json"
         terminal_result: dict[str, str] | None = None
         result_temporary = self._outputs.get(result_logical)
@@ -1179,24 +1180,44 @@ class StageTransaction:
             stage=self.stage,
             marker_relative=marker_relative,
             terminal_status=self._terminal_status,
-            output_hashes={
-                str(record["path"]): str(record["sha256"]) for record in output_records
-            },
+            output_hashes={},
         )
         try:
             with self._store._publication_lock():
                 self._store._recover_publication_journals()
+                if self._commit_guard is not None:
+                    self._commit_guard()
+                output_records = [
+                    {"path": logical, "sha256": sha256_file(temporary)}
+                    for logical, temporary in sorted(self._outputs.items())
+                ]
+                published.output_hashes.update(
+                    {
+                        str(record["path"]): str(record["sha256"])
+                        for record in output_records
+                    }
+                )
+                if self._commit_guard is not None:
+                    self._commit_guard()
                 for relative_path, expected in self._input_hashes.items():
+                    if self._commit_guard is not None:
+                        self._commit_guard()
                     target = self._store._validated_target(relative_path)
                     if not target.is_file() or sha256_file(target) != expected:
                         raise ValueError(f"stage input changed: {relative_path}")
+                    if self._commit_guard is not None:
+                        self._commit_guard()
                 for raw_path, expected in self._external_input_hashes.items():
+                    if self._commit_guard is not None:
+                        self._commit_guard()
                     external_path = Path(raw_path)
                     if (
                         not external_path.is_file()
                         or sha256_file(external_path) != expected
                     ):
                         raise ValueError(f"external stage input changed: {raw_path}")
+                    if self._commit_guard is not None:
+                        self._commit_guard()
                 marker = self._store._validated_target(marker_relative)
                 if marker.exists() or marker.is_symlink():
                     raise FileExistsError(f"stage {self.stage!r} is already completed")
@@ -1205,9 +1226,13 @@ class StageTransaction:
                     if destination.exists() or destination.is_symlink():
                         raise FileExistsError(f"stage output already exists: {logical}")
                 for logical, temporary in sorted(self._outputs.items()):
+                    if self._commit_guard is not None:
+                        self._commit_guard()
                     destination = self._store._validated_target(logical)
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     self._store._publish_temp(temporary, destination, published)
+                    if self._commit_guard is not None:
+                        self._commit_guard()
                 ended_at = self._clock()
                 manifest = {
                     "config_hash": self._store.config_hash,
@@ -1227,11 +1252,18 @@ class StageTransaction:
                     "terminal_result": terminal_result,
                     "transaction_id": transaction_id,
                 }
+                if self._commit_guard is not None:
+                    self._commit_guard()
                 self._store._write_bytes(
                     marker_relative,
                     _canonical_json(manifest).encode("utf-8"),
                     published,
                 )
+                if self._commit_guard is not None:
+                    self._commit_guard()
+                # The last guard is intentionally before journal release. A guard
+                # failure can still be durably rolled back while ownership records
+                # exist; checking after release would weaken crash recovery.
                 self._store._release_publications(published)
         except BaseException as error:
             with self._store._publication_lock():

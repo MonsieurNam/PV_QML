@@ -25,6 +25,8 @@ from .domain import StageStatus
 
 CANONICAL_SCHEMA_VERSION = "1.0"
 MAX_SITE_SPAN_DAYS = 3660
+ARROW_NS_MIN_UTC = pd.Timestamp.min.tz_localize(UTC)
+ARROW_NS_MAX_UTC = pd.Timestamp.max.tz_localize(UTC)
 CANONICAL_COLUMNS = (
     "sample_id",
     "site_id",
@@ -139,7 +141,8 @@ def _parse_timestamp(value: object, timezone: str) -> tuple[pd.Timestamp | None,
     try:
         if stamp.tzinfo is None:
             stamp = stamp.tz_localize(timezone, ambiguous="raise", nonexistent="raise")
-        return stamp.tz_convert(UTC), None
+        stamp = stamp.tz_convert(UTC)
+        return stamp.as_unit("ns"), None
     except Exception as error:  # pandas exposes backend-specific DST exception classes
         name = type(error).__name__.lower()
         message = str(error).lower()
@@ -424,7 +427,18 @@ def canonicalize_data(
         assert isinstance(interval, pd.Timestamp)
         if policy.column is None:
             assert policy.fixed_latency_minutes is not None
-            return interval + pd.Timedelta(minutes=policy.fixed_latency_minutes)
+            try:
+                return (
+                    interval + pd.Timedelta(minutes=policy.fixed_latency_minutes)
+                ).as_unit("ns")
+            except (OverflowError, ValueError):
+                exclude(
+                    index,
+                    "invalid_availability",
+                    f"{kind} availability exceeds timestamp[ns, UTC] range",
+                    timestamp=interval,
+                )
+                return None
         parsed_value, reason = _parse_timestamp(source.at[index, policy.column], config.timezone)
         if reason is not None:
             exclude(
@@ -671,6 +685,8 @@ def canonical_checksum(frame: pd.DataFrame) -> str:
 
 
 __all__ = [
+    "ARROW_NS_MAX_UTC",
+    "ARROW_NS_MIN_UTC",
     "CANONICAL_COLUMNS",
     "CANONICAL_SCHEMA_VERSION",
     "EXCLUSION_COLUMNS",

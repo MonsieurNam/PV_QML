@@ -410,6 +410,7 @@ class DefaultPilotServices:
                     "result_status": status.value,
                     "scientific_decision": "NOT_EVALUATED",
                 },
+                commit_guard=guard.checkpoint,
             ) as transaction:
                 transaction.write_bytes("canonical.parquet", canonical_bytes)
                 guard.checkpoint(len(canonical_bytes) + len(exclusion_bytes))

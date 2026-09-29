@@ -32,6 +32,9 @@ Canonical and QC Parquet artifacts use explicit Arrow schemas: UTC timestamps ar
 nanosecond precision, quality flags are non-null `list<string>`, and a configured daylight field
 is a non-null boolean after invalid/missing values are excluded. CSV headers are parsed before
 pandas ingestion so duplicate names are rejected and identifier strings such as `NA` are retained.
+Schema version 1.0 therefore accepts timestamps only in the physical `timestamp[ns, UTC]` range,
+from `1677-09-21T00:12:43.145224193Z` through `2262-04-11T23:47:16.854775807Z` inclusive;
+interval or availability values outside that range are deterministically excluded.
 Gap reporting is compact and never materializes the complete missing timestamp range; a per-site
 span above 3,660 days is treated as an invalid source timestamp contract.
 Validation checks the configured wall-clock and memory limits around source materialization,
