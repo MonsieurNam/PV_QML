@@ -810,7 +810,13 @@ class RunStore:
             ):
                 raise ValueError(f"base manifest config hash mismatch: {name}")
 
-    def _verify_stage(self, stage: str, *, verified: set[str] | None = None) -> str:
+    def _verify_stage(
+        self,
+        stage: str,
+        *,
+        verified: set[str] | None = None,
+        accepted_statuses: frozenset[str] = frozenset({"SUCCESS"}),
+    ) -> str:
         if verified is None:
             verified = set()
         if stage in verified:
@@ -827,10 +833,14 @@ class RunStore:
         if (
             manifest.get("schema_version") != SCHEMA_VERSION
             or manifest.get("stage") != stage
-            or manifest.get("status") != "SUCCESS"
+            or manifest.get("status") not in accepted_statuses
             or manifest.get("config_hash") != self.config_hash
         ):
-            raise ValueError(f"prerequisite stage {stage!r} has an invalid SUCCESS marker")
+            expected_statuses = ", ".join(sorted(accepted_statuses))
+            raise ValueError(
+                f"stage {stage!r} has an invalid marker; "
+                f"expected status in {{{expected_statuses}}}"
+            )
         if manifest.get("prerequisite_manifest_hashes") != prerequisite_hashes:
             raise ValueError(f"prerequisite manifest hash mismatch for stage {stage!r}")
         input_hashes = manifest.get("input_hashes")
@@ -860,6 +870,20 @@ class RunStore:
                 )
         verified.add(stage)
         return sha256_file(path)
+
+    def verify_terminal_stage(
+        self,
+        stage: str,
+        *,
+        accepted_statuses: frozenset[str] = frozenset({"SUCCESS"}),
+    ) -> str:
+        """Verify a terminal stage and all outputs without relaxing prerequisites."""
+
+        if stage not in STAGE_PREREQUISITES:
+            raise ValueError(f"unknown pipeline stage: {stage!r}")
+        if not accepted_statuses or not accepted_statuses <= {"SUCCESS", "BLOCKED", "INVALID"}:
+            raise ValueError("accepted terminal statuses are invalid")
+        return self._verify_stage(stage, accepted_statuses=accepted_statuses)
 
     def stage(
         self,

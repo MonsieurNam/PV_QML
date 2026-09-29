@@ -16,6 +16,7 @@ from pv_pilot.cli import app
 from pv_pilot.config import DataConfig, load_config
 from pv_pilot.data import CANONICAL_COLUMNS, EXCLUSION_COLUMNS, canonicalize_data
 from pv_pilot.domain import StageStatus
+from pv_pilot.services import DefaultPilotServices
 
 
 def data_config(
@@ -305,6 +306,19 @@ def test_missing_source_is_durable_blocked_not_evaluated(tmp_path: Path) -> None
     assert stage["status"] == "blocked"
     assert stage["details"]["scientific_decision"] == "NOT_EVALUATED"
     assert manifest["status"] == "BLOCKED"
+
+
+def test_resume_rejects_tampered_blocked_stage_outputs(tmp_path: Path) -> None:
+    store, _ = make_run(tmp_path, None)
+    service = DefaultPilotServices()
+    assert service.validate_data(store.root).status is StageStatus.BLOCKED
+    result_path = store.root / "validate-data/stage_result.json"
+    payload = read_json(result_path)
+    payload["message"] = "tampered"
+    result_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="checksum"):
+        service.validate_data(store.root)
 
 
 def test_source_tamper_after_init_is_durable_invalid(tmp_path: Path) -> None:

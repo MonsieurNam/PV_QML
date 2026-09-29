@@ -72,10 +72,13 @@ class DefaultPilotServices:
         result_path = store.root / "validate-data/stage_result.json"
         result = StageResult.model_validate_json(result_path.read_text(encoding="utf-8"))
         if status == "SUCCESS":
-            store._verify_stage("validate-data")
+            store.verify_terminal_stage("validate-data")
             return result.model_copy(update={"message": "validate-data already successful"})
         if status not in {"BLOCKED", "INVALID"}:
             raise ValueError("validate-data has an invalid terminal marker")
+        store.verify_terminal_stage(
+            "validate-data", accepted_statuses=frozenset({str(status)})
+        )
         return result.model_copy(update={"message": f"validate-data already {status.lower()}"})
 
     def validate_data(self, run_dir: Path) -> StageResult:

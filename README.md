@@ -15,5 +15,18 @@ uv run mypy
 uv run pytest
 ```
 
-The first milestone only bootstraps the package and verifies the Perceval 1.3 runtime.
-Configuration, command-line, and data-pipeline features are intentionally not included yet.
+The implemented G0/G1 surface initializes immutable run directories and validates CSV or
+Parquet PV observations into a canonical five-minute Parquet dataset. For one-minute input,
+bins are right-closed: the interval ending at `t` contains exactly `t-4m, ..., t`. Incomplete
+bins are excluded rather than interpolated. Source timestamps are normalized to UTC, data
+availability is preserved, and every exclusion is recorded in a typed QC ledger.
+
+The bundled fixture is synthetic and exists only for software acceptance:
+
+```powershell
+uv run pv-pilot init-run --config configs/pilot.synthetic.yaml
+uv run pv-pilot validate-data --run-dir <printed-run-directory>
+```
+
+Synthetic runs and unapproved protocols always remain `NOT_EVALUATED`; they cannot produce a
+scientific GO/STOP decision.
