@@ -7,6 +7,7 @@ import json
 import pickle
 import time
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
@@ -1337,6 +1338,8 @@ class DefaultPilotServices:
         guard: _ResourceGuard,
         gate: str,
         message: str,
+        verified_input_hashes: Mapping[str, str] | None = None,
+        prerequisite_manifest_hash: str | None = None,
     ) -> StageResult:
         empty_bytes = photonic_features.feature_parquet_bytes(
             pd.DataFrame(columns=photonic_features.feature_arrow_schema().names)
@@ -1370,20 +1373,19 @@ class DefaultPilotServices:
             "max_memory_bytes": guard.memory_bytes,
             "cpu_only": True,
             "scientific_decision": "NOT_EVALUATED",
+            "verified_input_hashes": dict(verified_input_hashes or {}),
+            "prerequisite_manifest_hash": prerequisite_manifest_hash,
         }
         with store.stage(
             "build-photonic-features",
-            input_paths=(
-                "build-splits/development_features.parquet",
-                "build-splits/feature_manifest.json",
-                "build-splits/minmax_scalers.json",
-            ),
             prerequisite_verification="marker_only",
             terminal_status="INVALID",
             details={
                 "result_status": "invalid",
                 "scientific_decision": "NOT_EVALUATED",
                 "resource_gate": gate,
+                "verified_input_hashes": dict(verified_input_hashes or {}),
+                "prerequisite_manifest_hash": prerequisite_manifest_hash,
             },
         ) as transaction:
             transaction.write_bytes("development_photonic_features.parquet", empty_bytes)
@@ -1422,8 +1424,24 @@ class DefaultPilotServices:
             "build-splits/feature_manifest.json",
             "build-splits/minmax_scalers.json",
         )
+        verified_input_hashes: dict[str, str] = {}
+        split_marker_hash: str | None = None
         try:
-            store.verify_selected_stage_outputs("build-splits", required_inputs)
+            split_marker_hash = store.verify_selected_stage_outputs("build-splits", required_inputs)
+            split_stage_marker = self._read_object(store.root / "build-splits/stage_manifest.json")
+            split_outputs = split_stage_marker.get("outputs")
+            if not isinstance(split_outputs, list):
+                raise photonic_features.PhotonicContractError(
+                    "build-splits marker has invalid output records"
+                )
+            declared_output_hashes = {
+                str(record.get("path")): str(record.get("sha256"))
+                for record in split_outputs
+                if isinstance(record, dict)
+            }
+            verified_input_hashes = {
+                path: declared_output_hashes[path] for path in required_inputs
+            }
             development_path = store.root / required_inputs[0]
             guard.checkpoint(development_path.stat().st_size)
             development = pds.dataset(development_path, format="parquet").to_table().to_pandas()
@@ -1490,12 +1508,20 @@ class DefaultPilotServices:
                 circuit_seeds=tuple(config.seeds.circuit_seeds),
                 resource_checkpoint=guard.checkpoint,
             )
+            guard.checkpoint(declared)
             feature_bytes = photonic_features.feature_parquet_bytes(extraction.features)
+            declared += len(feature_bytes)
+            guard.checkpoint(declared)
             circuit_payloads: dict[str, bytes] = {}
             circuit_records: list[dict[str, object]] = []
             for key, circuit in sorted(extraction.circuits.items()):
+                guard.checkpoint(declared)
                 payload = photonic_features.circuit_npz_bytes(circuit)
+                declared += len(payload)
+                guard.checkpoint(declared)
+                guard.checkpoint(declared)
                 restored = photonic_features.load_circuit_npz(payload)
+                guard.checkpoint(declared)
                 if photonic_features.circuit_checksum(
                     restored
                 ) != photonic_features.circuit_checksum(circuit):
@@ -1515,7 +1541,6 @@ class DefaultPilotServices:
                         "state_order_sha256": circuit.state_order_sha256,
                     }
                 )
-            declared += len(feature_bytes) + sum(map(len, circuit_payloads.values()))
             guard.checkpoint(declared)
         except _ResourceLimitExceeded as error:
             return self._publish_photonic_invalid(
@@ -1523,6 +1548,8 @@ class DefaultPilotServices:
                 guard=guard,
                 gate=error.gate,
                 message="photonic feature extraction exceeded a configured resource cap",
+                verified_input_hashes=verified_input_hashes,
+                prerequisite_manifest_hash=split_marker_hash,
             )
         except photonic_features.PhotonicContractError as error:
             return self._publish_photonic_invalid(
@@ -1530,6 +1557,8 @@ class DefaultPilotServices:
                 guard=guard,
                 gate="data_or_split_contract",
                 message=f"photonic input violates the data contract: {error}",
+                verified_input_hashes=verified_input_hashes,
+                prerequisite_manifest_hash=split_marker_hash,
             )
 
         state_spaces = {
@@ -1557,8 +1586,9 @@ class DefaultPilotServices:
                 for modes in config.photonics.modes
             ],
         }
-        split_marker_hash = sha256_file(store.root / "build-splits/stage_manifest.json")
-        input_hashes = {path: sha256_file(store.root / path) for path in required_inputs}
+        if split_marker_hash is None or set(verified_input_hashes) != set(required_inputs):
+            raise RuntimeError("verified photonic input metadata is incomplete")
+        input_hashes = verified_input_hashes
         circuit_manifest = {
             "schema_version": "1.0",
             "status": "success",
@@ -1614,7 +1644,7 @@ class DefaultPilotServices:
         }
         if feature_manifest["row_count"] != feature_manifest["expected_row_count"]:
             raise RuntimeError("photonic feature candidate matrix is incomplete")
-        guard.sample_without_enforcement()
+        guard.checkpoint(declared)
         ledger = {
             "schema_version": "1.0",
             "stage": "build-photonic-features",
@@ -1656,6 +1686,7 @@ class DefaultPilotServices:
                     "holdout_opened": False,
                 },
                 commit_guard=guard.checkpoint,
+                private_write_guard=guard.checkpoint,
             ) as transaction:
                 transaction.write_bytes("development_photonic_features.parquet", feature_bytes)
                 transaction.write_json("state_spaces.json", state_spaces)
@@ -1663,6 +1694,14 @@ class DefaultPilotServices:
                 for path, payload in sorted(circuit_payloads.items()):
                     transaction.write_bytes(path, payload)
                 transaction.write_json("feature_manifest.json", feature_manifest)
+                guard.checkpoint(declared)
+                ledger.update(
+                    {
+                        "wall_clock_seconds": time.perf_counter() - started,
+                        "peak_rss_bytes": guard.peak_rss_bytes,
+                        "peak_declared_bytes": guard.peak_declared_bytes,
+                    }
+                )
                 transaction.write_json("resource_ledger.json", ledger)
                 transaction.write_json("stage_result.json", deterministic_data(result))
         except _ResourceLimitExceeded as error:
@@ -1671,6 +1710,8 @@ class DefaultPilotServices:
                 guard=guard,
                 gate=error.gate,
                 message="photonic feature publication exceeded a configured resource cap",
+                verified_input_hashes=verified_input_hashes,
+                prerequisite_manifest_hash=split_marker_hash,
             )
         return result
 

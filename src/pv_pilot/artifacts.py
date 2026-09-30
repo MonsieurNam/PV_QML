@@ -1247,6 +1247,7 @@ class RunStore:
         ] = "full",
         prerequisite_output_allowlist: Mapping[str, Iterable[str | Path]] | None = None,
         commit_guard: CommitGuard | None = None,
+        private_write_guard: CommitGuard | None = None,
         config_hash: str | None = None,
         now: Now = None,
     ) -> StageTransaction:
@@ -1281,16 +1282,24 @@ class RunStore:
             raise ValueError(
                 "prerequisite output allowlist requires selected_outputs verification"
             )
+        if commit_guard is not None:
+            commit_guard()
         with self._publication_lock():
             self._recover_publication_journals()
             self._cleanup_stale_stage_directories()
+        if commit_guard is not None:
+            commit_guard()
         self._verify_base(expected_config_hash=config_hash)
+        if commit_guard is not None:
+            commit_guard()
         marker = self.root / stage / "stage_manifest.json"
         if marker.exists() or marker.is_symlink():
             raise FileExistsError(f"stage {stage!r} is already completed")
         prerequisite_hashes: dict[str, str] = {}
         normalized_allowlist: dict[str, list[str]] = {}
         for prerequisite in STAGE_PREREQUISITES[stage]:
+            if commit_guard is not None:
+                commit_guard()
             if prerequisite_verification == "marker_only":
                 prerequisite_hashes[prerequisite] = self._verify_stage_marker_only(
                     prerequisite
@@ -1307,6 +1316,8 @@ class RunStore:
                 normalized_allowlist[prerequisite] = sorted(paths)
             else:
                 prerequisite_hashes[prerequisite] = self._verify_stage(prerequisite)
+            if commit_guard is not None:
+                commit_guard()
         inputs: dict[str, str] = {}
         selected_paths = {
             path
@@ -1314,6 +1325,8 @@ class RunStore:
             for path in paths
         }
         for input_path in input_paths:
+            if commit_guard is not None:
+                commit_guard()
             target = self._validated_target(input_path)
             relative = target.relative_to(self.root).as_posix()
             if (
@@ -1326,8 +1339,12 @@ class RunStore:
             if not target.is_file():
                 raise FileNotFoundError(f"stage input is not a file: {relative}")
             inputs[relative] = sha256_file(target)
+            if commit_guard is not None:
+                commit_guard()
         external_inputs: dict[str, str] = {}
         for input_path, expected in (external_input_hashes or {}).items():
+            if commit_guard is not None:
+                commit_guard()
             target = Path(input_path).resolve()
             if (
                 len(expected) != 64
@@ -1337,6 +1354,10 @@ class RunStore:
             if not target.is_file() or sha256_file(target) != expected:
                 raise ValueError(f"external stage input changed: {target}")
             external_inputs[target.as_posix()] = expected
+            if commit_guard is not None:
+                commit_guard()
+        if commit_guard is not None:
+            commit_guard()
         return StageTransaction(
             store=self,
             stage=stage,
@@ -1361,6 +1382,7 @@ class RunStore:
             },
             terminal_status=terminal_status,
             commit_guard=commit_guard,
+            private_write_guard=private_write_guard,
             clock=_clock(now),
         )
 
@@ -1379,6 +1401,7 @@ class StageTransaction:
         details: dict[str, object],
         terminal_status: Literal["SUCCESS", "BLOCKED", "INVALID"],
         commit_guard: CommitGuard | None,
+        private_write_guard: CommitGuard | None,
         clock: Clock,
     ) -> None:
         if terminal_status not in _TERMINAL_STATUSES:
@@ -1391,6 +1414,7 @@ class StageTransaction:
         self._details = details
         self._terminal_status = terminal_status
         self._commit_guard = commit_guard
+        self._private_write_guard = private_write_guard
         self._clock = clock
         self._started_at: datetime | None = None
         self._temporary_root: Path | None = None
@@ -1398,6 +1422,8 @@ class StageTransaction:
         self._outputs: dict[str, Path] = {}
 
     def __enter__(self) -> Self:
+        if self._private_write_guard is not None:
+            self._private_write_guard()
         with self._store._publication_lock():
             self._started_at = self._clock()
             temporary_root = Path(
@@ -1443,12 +1469,16 @@ class StageTransaction:
         return logical, temporary
 
     def write_bytes(self, relative_path: str | Path, data: bytes) -> Path:
+        if self._private_write_guard is not None:
+            self._private_write_guard()
         logical, temporary = self._temporary_target(relative_path)
         temporary.parent.mkdir(parents=True, exist_ok=True)
         with temporary.open("xb") as stream:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
+        if self._private_write_guard is not None:
+            self._private_write_guard()
         self._outputs[logical] = temporary
         return self._store.root / logical
 
@@ -1459,10 +1489,20 @@ class StageTransaction:
         *,
         encoding: str = "utf-8",
     ) -> Path:
-        return self.write_bytes(relative_path, text.encode(encoding))
+        if self._private_write_guard is not None:
+            self._private_write_guard()
+        data = text.encode(encoding)
+        if self._private_write_guard is not None:
+            self._private_write_guard()
+        return self.write_bytes(relative_path, data)
 
     def write_json(self, relative_path: str | Path, value: object) -> Path:
-        return self.write_text(relative_path, _canonical_json(value))
+        if self._private_write_guard is not None:
+            self._private_write_guard()
+        payload = _canonical_json(value)
+        if self._private_write_guard is not None:
+            self._private_write_guard()
+        return self.write_text(relative_path, payload)
 
     def __exit__(
         self,

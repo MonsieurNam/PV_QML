@@ -6,12 +6,16 @@ import json
 import math
 import subprocess
 import sys
+import warnings
+import zipfile
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import perceval as pcvl
+import psutil
 import pytest
 import yaml
 
@@ -168,6 +172,20 @@ def _rewrite_circuit_npz(payload: bytes, **replacements: np.ndarray) -> bytes:
     return buffer.getvalue()
 
 
+def _npz_zip_members(payload: bytes) -> list[tuple[str, bytes]]:
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        return [(info.filename, archive.read(info)) for info in archive.infolist()]
+
+
+def _zip_members(members: list[tuple[str, bytes]]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w") as archive, warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        for name, value in members:
+            archive.writestr(name, value)
+    return buffer.getvalue()
+
+
 def test_circuit_npz_verifies_individual_matrix_checksums_and_swap() -> None:
     circuit = generate_circuit(circuit_seed=1234, modes=6, photons=2)
     payload = circuit_npz_bytes(circuit)
@@ -192,6 +210,90 @@ def test_circuit_npz_verifies_individual_matrix_checksums_and_swap() -> None:
     )
     with pytest.raises(PhotonicContractError, match="deterministic definition"):
         load_circuit_npz(swapped)
+
+
+@pytest.mark.parametrize("mutation", ["duplicate", "traversal", "extra", "missing"])
+def test_circuit_npz_rejects_non_exact_zip_member_sets(mutation: str) -> None:
+    circuit = generate_circuit(circuit_seed=1234, modes=6, photons=2)
+    members = _npz_zip_members(circuit_npz_bytes(circuit))
+    if mutation == "duplicate":
+        members.append(members[0])
+    elif mutation == "traversal":
+        members.append(("../escape.npy", members[0][1]))
+    elif mutation == "extra":
+        members.append(("extra.npy", members[0][1]))
+    else:
+        members = members[1:]
+
+    with pytest.raises(PhotonicContractError, match="member"):
+        load_circuit_npz(_zip_members(members))
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("modes", np.asarray([6], dtype="<u8")),
+        ("modes", np.asarray(6, dtype="<u4")),
+        ("v1", np.zeros((6, 5), dtype="<c16")),
+        ("v1", np.zeros((6, 6), dtype="<f8")),
+    ],
+    ids=("non-scalar", "wrong-integer-dtype", "wrong-shape", "wrong-matrix-dtype"),
+)
+def test_circuit_npz_rejects_invalid_npy_header_contract(
+    field: str, replacement: np.ndarray
+) -> None:
+    circuit = generate_circuit(circuit_seed=1234, modes=6, photons=2)
+    payload = circuit_npz_bytes(circuit)
+    with pytest.raises(PhotonicContractError, match="NPZ"):
+        load_circuit_npz(_rewrite_circuit_npz(payload, **{field: replacement}))
+
+
+def test_circuit_npz_rejects_declared_zip_bomb_before_numpy_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    circuit = generate_circuit(circuit_seed=1234, modes=6, photons=2)
+    members = _npz_zip_members(circuit_npz_bytes(circuit))
+    buffer = io.BytesIO()
+    one_megabyte = b"\0" * (1024**2)
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, value in members:
+            if name == "v1.npy":
+                with archive.open(name, mode="w", force_zip64=True) as stream:
+                    for _ in range(150):
+                        stream.write(one_megabyte)
+            else:
+                archive.writestr(name, value)
+
+    def reject_numpy_load(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("np.load ran before ZIP size validation")
+
+    def reject_member_open(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("ZIP member decompression ran before declared-size validation")
+
+    monkeypatch.setattr(np, "load", reject_numpy_load)
+    monkeypatch.setattr(zipfile.ZipFile, "open", reject_member_open)
+    process = psutil.Process()
+    rss_before = process.memory_info().rss
+    with pytest.raises(PhotonicContractError, match=r"size|ratio|large"):
+        load_circuit_npz(buffer.getvalue())
+    assert process.memory_info().rss - rss_before < 32 * 1024**2
+
+
+def test_circuit_npz_normalizes_bad_zip_and_npy_header_errors() -> None:
+    circuit = generate_circuit(circuit_seed=1234, modes=6, photons=2)
+    payload = circuit_npz_bytes(circuit)
+    with pytest.raises(PhotonicContractError, match="NPZ"):
+        load_circuit_npz(payload[:100])
+
+    members = _npz_zip_members(payload)
+    malformed = [
+        (name, b"not-a-npy-header" if name == "v1.npy" else value)
+        for name, value in members
+    ]
+    with pytest.raises(PhotonicContractError, match="NPZ"):
+        load_circuit_npz(_zip_members(malformed))
 
 
 def test_circuit_checksum_aggregates_ordered_individual_matrix_checksums() -> None:
@@ -567,3 +669,74 @@ def test_resource_exhaustion_publishes_bounded_invalid_without_holdout(
         store.root / "build-photonic-features/development_photonic_features.parquet"
     )
     assert output.empty
+
+
+def test_expiry_before_success_transaction_writes_only_bounded_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pv_pilot.artifacts as artifacts_module
+
+    store = _make_photonic_run(tmp_path)
+    original_stage = artifacts_module.RunStore.stage
+    original_hash = artifacts_module.sha256_file
+    original_private_write = artifacts_module.StageTransaction.write_bytes
+    expired = False
+    private_writes: list[tuple[str, str, int]] = []
+
+    def expire_success_before_enter(
+        self: RunStore, stage: str, **kwargs: Any
+    ) -> artifacts_module.StageTransaction:
+        nonlocal expired
+        transaction = original_stage(self, stage, **kwargs)
+        if (
+            stage == "build-photonic-features"
+            and kwargs.get("terminal_status", "SUCCESS") == "SUCCESS"
+        ):
+            commit_guard = kwargs.get("commit_guard")
+            assert callable(commit_guard)
+            resource_guard: Any = commit_guard.__self__
+            resource_guard.started -= resource_guard.wall_seconds + 1
+            expired = True
+        return transaction
+
+    def reject_large_hash_after_expiry(path: Path) -> str:
+        if expired and path.name == "development_features.parquet":
+            raise AssertionError("expired diagnostic re-read the large development input")
+        return original_hash(path)
+
+    def count_private_write(
+        self: artifacts_module.StageTransaction, relative_path: str | Path, data: bytes
+    ) -> Path:
+        private_writes.append((self._terminal_status, str(relative_path), len(data)))
+        return original_private_write(self, relative_path, data)
+
+    monkeypatch.setattr(artifacts_module.RunStore, "stage", expire_success_before_enter)
+    monkeypatch.setattr(artifacts_module, "sha256_file", reject_large_hash_after_expiry)
+    monkeypatch.setattr(artifacts_module.StageTransaction, "write_bytes", count_private_write)
+
+    result = DefaultPilotServices().build_photonic_features(store.root)
+    assert result.status is StageStatus.INVALID
+    assert [write for write in private_writes if write[0] == "SUCCESS"] == []
+    invalid_writes = [write for write in private_writes if write[0] == "INVALID"]
+    assert 1 <= len(invalid_writes) <= 6
+    assert sum(size for _, _, size in invalid_writes) < 100_000
+    marker = json.loads(
+        (store.root / "build-photonic-features/stage_manifest.json").read_text(encoding="utf-8")
+    )
+    assert marker["status"] == "INVALID"
+    assert marker["input_hashes"] == {}
+    assert set(marker["details"]["verified_input_hashes"]) == {
+        "build-splits/development_features.parquet",
+        "build-splits/feature_manifest.json",
+        "build-splits/minmax_scalers.json",
+    }
+    ledger = json.loads(
+        (store.root / "build-photonic-features/resource_ledger.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert ledger["resource_gate"] == "wall_clock"
+    assert ledger["resource_status"] == "EXCEEDED"
+    assert not any(
+        path.name.startswith(".stage-") for path in store.root.iterdir()
+    )

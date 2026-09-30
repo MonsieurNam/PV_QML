@@ -7,6 +7,7 @@ import io
 import json
 import math
 import time
+import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import product
@@ -22,6 +23,25 @@ import pyarrow.parquet as pq
 Control = Literal["indistinguishable", "distinguishable"]
 PROBABILITY_TOLERANCE = 1e-12
 PHOTONIC_FEATURE_SCHEMA_VERSION = "1.0"
+_CIRCUIT_NPZ_MEMBERS = frozenset(
+    {
+        "circuit_seed.npy",
+        "modes.npy",
+        "photons.npy",
+        "state_order_sha256.npy",
+        "v1.npy",
+        "v2.npy",
+        "v1_sha256.npy",
+        "v2_sha256.npy",
+        "circuit_sha256.npy",
+    }
+)
+_CIRCUIT_NPZ_MAX_ARCHIVE_BYTES = 2 * 1024**2
+_CIRCUIT_NPZ_MAX_MEMBER_COMPRESSED_BYTES = 1024**2
+_CIRCUIT_NPZ_MAX_MEMBER_UNCOMPRESSED_BYTES = 1024**2
+_CIRCUIT_NPZ_MAX_TOTAL_UNCOMPRESSED_BYTES = 2 * 1024**2
+_CIRCUIT_NPZ_MAX_COMPRESSION_RATIO = 100
+_CIRCUIT_NPY_MAX_HEADER_BYTES = 4096
 
 
 class PhotonicContractError(ValueError):
@@ -362,21 +382,183 @@ def circuit_npz_bytes(circuit: CircuitDefinition) -> bytes:
     return buffer.getvalue()
 
 
+@dataclass(frozen=True, slots=True)
+class _NpyHeader:
+    shape: tuple[int, ...]
+    fortran_order: bool
+    dtype: np.dtype[Any]
+    data_offset: int
+
+
+def _read_npy_header(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> _NpyHeader:
+    with archive.open(info, mode="r") as stream:
+        version = np.lib.format.read_magic(stream)
+        if version == (1, 0):
+            shape, fortran_order, dtype = np.lib.format.read_array_header_1_0(
+                stream, max_header_size=_CIRCUIT_NPY_MAX_HEADER_BYTES
+            )
+        elif version == (2, 0):
+            shape, fortran_order, dtype = np.lib.format.read_array_header_2_0(
+                stream, max_header_size=_CIRCUIT_NPY_MAX_HEADER_BYTES
+            )
+        else:
+            raise PhotonicContractError(f"circuit NPZ has unsupported NPY version: {version}")
+        data_offset = stream.tell()
+    normalized_shape = tuple(int(dimension) for dimension in shape)
+    if any(dimension < 0 for dimension in normalized_shape):
+        raise PhotonicContractError("circuit NPZ has an invalid NPY shape")
+    expected_size = data_offset + math.prod(normalized_shape, start=1) * dtype.itemsize
+    if expected_size != info.file_size:
+        raise PhotonicContractError("circuit NPZ member size does not match its NPY header")
+    return _NpyHeader(normalized_shape, bool(fortran_order), dtype, data_offset)
+
+
+def _read_uint64_scalar(
+    archive: zipfile.ZipFile, info: zipfile.ZipInfo, header: _NpyHeader
+) -> int:
+    with archive.open(info, mode="r") as stream:
+        prefix = stream.read(header.data_offset)
+        if len(prefix) != header.data_offset:
+            raise PhotonicContractError("circuit NPZ scalar header is truncated")
+        payload = stream.read(9)
+    if len(payload) != 8:
+        raise PhotonicContractError("circuit NPZ scalar payload is invalid")
+    return int(np.frombuffer(payload, dtype="<u8", count=1)[0])
+
+
+def _preflight_circuit_npz(payload: bytes) -> None:
+    if not isinstance(payload, bytes):
+        raise PhotonicContractError("circuit NPZ payload must be bytes")
+    if not payload or len(payload) > _CIRCUIT_NPZ_MAX_ARCHIVE_BYTES:
+        raise PhotonicContractError("circuit NPZ compressed size exceeds the limit")
+    with zipfile.ZipFile(io.BytesIO(payload), mode="r") as archive:
+        infos = archive.infolist()
+        names = [info.filename for info in infos]
+        if len(names) != len(_CIRCUIT_NPZ_MEMBERS) or set(names) != _CIRCUIT_NPZ_MEMBERS:
+            raise PhotonicContractError("circuit NPZ member set is not exact and unique")
+        total_uncompressed = 0
+        for info in infos:
+            if info.is_dir() or info.flag_bits & 0x1:
+                raise PhotonicContractError("circuit NPZ member is not a regular unencrypted file")
+            if info.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
+                raise PhotonicContractError("circuit NPZ member uses unsupported compression")
+            if info.compress_size > _CIRCUIT_NPZ_MAX_MEMBER_COMPRESSED_BYTES:
+                raise PhotonicContractError("circuit NPZ member compressed size exceeds the limit")
+            if info.file_size > _CIRCUIT_NPZ_MAX_MEMBER_UNCOMPRESSED_BYTES:
+                raise PhotonicContractError(
+                    "circuit NPZ member uncompressed size exceeds the limit"
+                )
+            if info.file_size > max(1, info.compress_size) * _CIRCUIT_NPZ_MAX_COMPRESSION_RATIO:
+                raise PhotonicContractError(
+                    "circuit NPZ member compression ratio exceeds the limit"
+                )
+            total_uncompressed += info.file_size
+        if total_uncompressed > _CIRCUIT_NPZ_MAX_TOTAL_UNCOMPRESSED_BYTES:
+            raise PhotonicContractError("circuit NPZ total uncompressed size exceeds the limit")
+
+        by_name = {info.filename: info for info in infos}
+        headers = {name: _read_npy_header(archive, by_name[name]) for name in sorted(by_name)}
+        scalar_dtype = np.dtype("<u8")
+        digest_dtype = np.dtype("<U64")
+        for name in ("circuit_seed.npy", "modes.npy", "photons.npy"):
+            header = headers[name]
+            if header.shape != () or header.dtype != scalar_dtype or header.fortran_order:
+                raise PhotonicContractError(f"circuit NPZ {name} has an invalid scalar header")
+        for name in (
+            "state_order_sha256.npy",
+            "v1_sha256.npy",
+            "v2_sha256.npy",
+            "circuit_sha256.npy",
+        ):
+            header = headers[name]
+            if header.shape != () or header.dtype != digest_dtype or header.fortran_order:
+                raise PhotonicContractError(f"circuit NPZ {name} has an invalid digest header")
+        modes = _read_uint64_scalar(archive, by_name["modes.npy"], headers["modes.npy"])
+        photons = _read_uint64_scalar(archive, by_name["photons.npy"], headers["photons.npy"])
+        if not 1 <= modes <= 6:
+            raise PhotonicContractError("circuit NPZ modes must be in [1, 6]")
+        if not 1 <= photons <= 3 or photons > modes:
+            raise PhotonicContractError("circuit NPZ photons violate the bounded profile")
+        matrix_dtype = np.dtype("<c16")
+        for name in ("v1.npy", "v2.npy"):
+            header = headers[name]
+            if (
+                header.shape != (modes, modes)
+                or header.dtype != matrix_dtype
+                or header.fortran_order
+            ):
+                raise PhotonicContractError(f"circuit NPZ {name} has an invalid matrix header")
+
+
 def load_circuit_npz(payload: bytes) -> CircuitDefinition:
     try:
+        _preflight_circuit_npz(payload)
         with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
+            if set(archive.files) != {name.removesuffix(".npy") for name in _CIRCUIT_NPZ_MEMBERS}:
+                raise PhotonicContractError("circuit NPZ materialized member set is invalid")
+            circuit_seed_array = archive["circuit_seed"]
+            modes_array = archive["modes"]
+            photons_array = archive["photons"]
+            state_order_array = archive["state_order_sha256"]
+            v1_array = archive["v1"]
+            v2_array = archive["v2"]
+            v1_checksum_array = archive["v1_sha256"]
+            v2_checksum_array = archive["v2_sha256"]
+            circuit_checksum_array = archive["circuit_sha256"]
+            if (
+                circuit_seed_array.shape != ()
+                or circuit_seed_array.dtype != np.dtype("<u8")
+                or modes_array.shape != ()
+                or modes_array.dtype != np.dtype("<u8")
+                or photons_array.shape != ()
+                or photons_array.dtype != np.dtype("<u8")
+                or state_order_array.shape != ()
+                or state_order_array.dtype != np.dtype("<U64")
+                or v1_checksum_array.shape != ()
+                or v1_checksum_array.dtype != np.dtype("<U64")
+                or v2_checksum_array.shape != ()
+                or v2_checksum_array.dtype != np.dtype("<U64")
+                or circuit_checksum_array.shape != ()
+                or circuit_checksum_array.dtype != np.dtype("<U64")
+            ):
+                raise PhotonicContractError("circuit NPZ materialized scalar contract is invalid")
+            modes = int(modes_array.item())
+            matrix_shape = (modes, modes)
+            if (
+                v1_array.shape != matrix_shape
+                or v1_array.dtype != np.dtype("<c16")
+                or not v1_array.flags.c_contiguous
+                or v2_array.shape != matrix_shape
+                or v2_array.dtype != np.dtype("<c16")
+                or not v2_array.flags.c_contiguous
+                or not np.isfinite(v1_array).all()
+                or not np.isfinite(v2_array).all()
+            ):
+                raise PhotonicContractError("circuit NPZ materialized matrix contract is invalid")
             circuit = CircuitDefinition(
-                circuit_seed=int(archive["circuit_seed"]),
-                modes=int(archive["modes"]),
-                photons=int(archive["photons"]),
-                state_order_sha256=str(archive["state_order_sha256"]),
-                v1=np.asarray(archive["v1"], dtype="<c16", order="C"),
-                v2=np.asarray(archive["v2"], dtype="<c16", order="C"),
+                circuit_seed=int(circuit_seed_array.item()),
+                modes=modes,
+                photons=int(photons_array.item()),
+                state_order_sha256=str(state_order_array.item()),
+                v1=v1_array,
+                v2=v2_array,
             )
-            declared_v1_sha256 = str(archive["v1_sha256"])
-            declared_v2_sha256 = str(archive["v2_sha256"])
-            declared_circuit_sha256 = str(archive["circuit_sha256"])
-    except (KeyError, OSError, ValueError) as error:
+            declared_v1_sha256 = str(v1_checksum_array.item())
+            declared_v2_sha256 = str(v2_checksum_array.item())
+            declared_circuit_sha256 = str(circuit_checksum_array.item())
+    except PhotonicContractError:
+        raise
+    except (
+        EOFError,
+        KeyError,
+        OSError,
+        OverflowError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ) as error:
         raise PhotonicContractError("circuit NPZ is invalid") from error
     if matrix_checksum(circuit.v1) != declared_v1_sha256:
         raise PhotonicContractError("circuit NPZ V1 checksum mismatch")
