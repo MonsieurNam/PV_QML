@@ -18,6 +18,7 @@ import psutil
 import pyarrow.dataset as pds
 
 from . import baselines as baseline_models
+from . import benchmark as photonic_benchmark
 from . import photonics as photonic_features
 from .artifacts import RunStore, sha256_file
 from .config import PilotConfig, load_config
@@ -33,6 +34,7 @@ from .data import (
 )
 from .data import dataframe_parquet_bytes as dataframe_parquet_bytes
 from .domain import DetailEntry, StageResult, StageStatus, deterministic_data
+from .seeds import SeedManager
 from .splits import (
     COMBINED_MEMBERSHIP_POLICY,
     FEATURE_SCHEMA_VERSION,
@@ -222,6 +224,119 @@ class DefaultPilotServices:
                 )
             }
         )
+
+    @classmethod
+    def _existing_benchmark_result(cls, store: RunStore) -> StageResult | None:
+        marker = store.root / "benchmark/stage_manifest.json"
+        if not marker.is_file():
+            return None
+        manifest = cls._read_object(marker)
+        status = manifest.get("status")
+        if status not in {"SUCCESS", "INVALID"}:
+            raise ValueError("benchmark has an invalid terminal marker")
+        if status == "SUCCESS":
+            store.verify_terminal_stage("benchmark", accepted_statuses=frozenset({"SUCCESS"}))
+        else:
+            store.verify_terminal_diagnostic_stage("benchmark")
+        result = StageResult.model_validate_json(
+            (store.root / "benchmark/stage_result.json").read_text(encoding="utf-8")
+        )
+        return result.model_copy(update={"message": f"benchmark already {status.lower()}"})
+
+    @staticmethod
+    def _publish_benchmark_invalid(
+        *,
+        store: RunStore,
+        guard: _ResourceGuard,
+        gate: str,
+        message: str,
+    ) -> StageResult:
+        empty_scores = photonic_benchmark.parquet_bytes(
+            pd.DataFrame(columns=photonic_benchmark.validation_score_arrow_schema().names),
+            photonic_benchmark.validation_score_arrow_schema(),
+        )
+        empty_exact = photonic_benchmark.parquet_bytes(
+            pd.DataFrame(columns=photonic_benchmark.exact_prediction_arrow_schema().names),
+            photonic_benchmark.exact_prediction_arrow_schema(),
+        )
+        empty_shots = photonic_benchmark.parquet_bytes(
+            pd.DataFrame(columns=photonic_benchmark.finite_shot_count_arrow_schema().names),
+            photonic_benchmark.finite_shot_count_arrow_schema(),
+        )
+        empty_shot_predictions = photonic_benchmark.parquet_bytes(
+            pd.DataFrame(columns=photonic_benchmark.finite_shot_prediction_arrow_schema().names),
+            photonic_benchmark.finite_shot_prediction_arrow_schema(),
+        )
+        empty_feature_bytes = photonic_features.feature_parquet_bytes(
+            pd.DataFrame(columns=photonic_features.feature_arrow_schema().names)
+        )
+        model_bytes = pickle.dumps({}, protocol=5)
+        result = StageResult(
+            stage="benchmark",
+            status=StageStatus.INVALID,
+            message=message,
+            artifacts=(
+                Path("benchmark/selection_manifest.json"),
+                Path("benchmark/validation_scores.parquet"),
+                Path("benchmark/holdout_photonic_features.parquet"),
+                Path("benchmark/exact_predictions.parquet"),
+                Path("benchmark/finite_shot_counts.parquet"),
+                Path("benchmark/finite_shot_predictions.parquet"),
+                Path("benchmark/models/photonic_models.pkl"),
+                Path("benchmark/models/manifest.json"),
+                Path("benchmark/diagnostics.json"),
+                Path("benchmark/resource_ledger.json"),
+            ),
+            details=(
+                DetailEntry(key="gate", value=gate),
+                DetailEntry(key="scientific_decision", value="NOT_EVALUATED"),
+            ),
+        )
+        ledger = {
+            "schema_version": "1.0",
+            "stage": "benchmark",
+            "status": "invalid",
+            "resource_status": "EXCEEDED" if gate.startswith("resource") else "WITHIN_LIMIT",
+            "gate": gate,
+            "wall_clock_seconds": time.perf_counter() - guard.started,
+            "peak_rss_bytes": guard.peak_rss_bytes,
+            "peak_declared_bytes": guard.peak_declared_bytes,
+            "max_wall_clock_seconds": guard.wall_seconds,
+            "max_memory_bytes": guard.memory_bytes,
+            "cpu_only": True,
+        }
+        with store.stage(
+            "benchmark",
+            terminal_status="INVALID",
+            prerequisite_verification="marker_only",
+            details={
+                "result_status": "invalid",
+                "scientific_decision": "NOT_EVALUATED",
+                "gate": gate,
+            },
+        ) as transaction:
+            transaction.write_json(
+                "selection_manifest.json",
+                {"schema_version": "1.0", "status": "invalid", "gate": gate},
+            )
+            transaction.write_bytes("validation_scores.parquet", empty_scores)
+            transaction.write_bytes("holdout_photonic_features.parquet", empty_feature_bytes)
+            transaction.write_bytes("exact_predictions.parquet", empty_exact)
+            transaction.write_bytes("finite_shot_counts.parquet", empty_shots)
+            transaction.write_bytes("finite_shot_predictions.parquet", empty_shot_predictions)
+            transaction.write_bytes("models/photonic_models.pkl", model_bytes)
+            transaction.write_json(
+                "models/manifest.json",
+                {
+                    "schema_version": "1.0",
+                    "status": "invalid",
+                    "models_sha256": hashlib.sha256(model_bytes).hexdigest(),
+                },
+            )
+            transaction.write_json("diagnostics.json", {"schema_version": "1.0", "gate": gate})
+            transaction.write_json("resource_ledger.json", ledger)
+            transaction.write_json("stage_result.json", deterministic_data(result))
+        return result
 
     @staticmethod
     def _publish_baseline_resource_invalid(
@@ -1439,9 +1554,7 @@ class DefaultPilotServices:
                 for record in split_outputs
                 if isinstance(record, dict)
             }
-            verified_input_hashes = {
-                path: declared_output_hashes[path] for path in required_inputs
-            }
+            verified_input_hashes = {path: declared_output_hashes[path] for path in required_inputs}
             development_path = store.root / required_inputs[0]
             guard.checkpoint(development_path.stat().st_size)
             development = pds.dataset(development_path, format="parquet").to_table().to_pandas()
@@ -1715,8 +1828,431 @@ class DefaultPilotServices:
             )
         return result
 
-    def benchmark(self, run_dir: Path) -> None:
-        self._unimplemented("benchmark")
+    def benchmark(self, run_dir: Path) -> StageResult:
+        started = time.perf_counter()
+        store = RunStore.open(run_dir)
+        existing = self._existing_benchmark_result(store)
+        if existing is not None:
+            return existing
+        config = self._run_config(store)
+        guard = _ResourceGuard(
+            started=started,
+            wall_seconds=config.resources.max_wall_clock_seconds,
+            memory_bytes=int(config.resources.max_memory_gb * 1024**3),
+        )
+        photonic_allowlist = self._photonic_allowlist()
+        development_relative = "build-photonic-features/development_photonic_features.parquet"
+        circuit_manifest_relative = "build-photonic-features/circuit_manifest.json"
+        feature_manifest_relative = "build-photonic-features/feature_manifest.json"
+        try:
+            # Holdout-safe boundary: this verifies Task 7 and only its fixed development
+            # prerequisites. It cannot hash/materialize the Task 5 holdout partition.
+            photonic_marker_hash = store.verify_terminal_stage(
+                "build-photonic-features",
+                accepted_statuses=frozenset({"SUCCESS"}),
+                prerequisite_output_allowlist=photonic_allowlist,
+            )
+            task7_manifest = self._read_object(
+                store.root / "build-photonic-features/stage_manifest.json"
+            )
+            task7_outputs = task7_manifest.get("outputs")
+            if not isinstance(task7_outputs, list):
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "photonic stage output manifest is invalid"
+                )
+            task7_hashes = {
+                str(record.get("path")): str(record.get("sha256"))
+                for record in task7_outputs
+                if isinstance(record, dict)
+            }
+            for relative in (
+                development_relative,
+                circuit_manifest_relative,
+                feature_manifest_relative,
+            ):
+                if relative not in task7_hashes:
+                    raise photonic_benchmark.PhotonicBenchmarkContractError(
+                        f"photonic stage did not declare {relative}"
+                    )
+            development_path = store.root / development_relative
+            guard.checkpoint(development_path.stat().st_size)
+            development = pds.dataset(development_path, format="parquet").to_table().to_pandas()
+            declared = int(development.memory_usage(index=True, deep=True).sum())
+            guard.checkpoint(declared)
+            task7_feature_manifest = self._read_object(store.root / feature_manifest_relative)
+            if (
+                task7_feature_manifest.get("holdout_opened") is not False
+                or task7_feature_manifest.get("photons") != 2
+                or task7_feature_manifest.get("circuit_seeds") != list(config.seeds.circuit_seeds)
+            ):
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "development photonic manifest violates the G3 firewall"
+                )
+            fit_executor = baseline_models.DeadlineProcessFitExecutor(
+                deadline_monotonic=(
+                    time.monotonic()
+                    + max(
+                        0.0,
+                        config.resources.max_wall_clock_seconds - (time.perf_counter() - started),
+                    )
+                ),
+                resource_checkpoint=guard.checkpoint,
+                private_directory=store.root,
+                max_memory_bytes=guard.memory_bytes,
+                telemetry_callback=guard.record_fit_rss,
+            )
+            selection = photonic_benchmark.select_photonic_models(
+                development,
+                config,
+                fit_executor=fit_executor,
+            )
+            freeze_hash = selection.selection_manifest["selection_freeze_sha256"]
+            if not isinstance(freeze_hash, str) or len(freeze_hash) != 64:
+                raise RuntimeError("photonic selection did not produce a freeze hash")
+
+            # All holdout-bound verification is deliberately below the immutable freeze.
+            baseline_marker_hash = store.verify_terminal_stage(
+                "train-baselines", accepted_statuses=frozenset({"SUCCESS"})
+            )
+            baseline_predictions_relative = "train-baselines/predictions.parquet"
+            baseline_predictions_path = store.root / baseline_predictions_relative
+            baseline_predictions_sha256 = sha256_file(baseline_predictions_path)
+
+            split_marker_hash = store.verify_terminal_stage(
+                "build-splits", accepted_statuses=frozenset({"SUCCESS"})
+            )
+            split_manifest = self._read_object(store.root / "build-splits/feature_manifest.json")
+            split_stage_manifest = self._read_object(
+                store.root / "build-splits/stage_manifest.json"
+            )
+            raw_split_outputs = split_stage_manifest.get("outputs")
+            if not isinstance(raw_split_outputs, list):
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "split stage output manifest is invalid"
+                )
+            split_hashes = {
+                str(record.get("path")): str(record.get("sha256"))
+                for record in raw_split_outputs
+                if isinstance(record, dict)
+            }
+            holdout_relative = "build-splits/holdout_features.parquet"
+            holdout_path = store.root / holdout_relative
+            if split_hashes.get(holdout_relative) != sha256_file(holdout_path):
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "holdout checksum changed after selection freeze"
+                )
+            partitions = split_manifest.get("partitions")
+            holdout_contract = partitions.get("holdout") if isinstance(partitions, dict) else None
+            if not isinstance(holdout_contract, dict):
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "holdout partition contract is missing"
+                )
+            # Exactly one dataframe materialization of the test partition.
+            holdout = pds.dataset(holdout_path, format="parquet").to_table().to_pandas()
+            holdout_declared = int(holdout.memory_usage(index=True, deep=True).sum())
+            declared += holdout_declared
+            guard.checkpoint(declared)
+            ordered_ids = (
+                holdout.sort_values(list(PARTITION_ORDER_COLUMNS), kind="stable")["sample_id"]
+                .astype(str)
+                .tolist()
+            )
+            if (
+                holdout_contract.get("path") != holdout_relative
+                or holdout_contract.get("row_count") != len(holdout)
+                or holdout_contract.get("schema_sha256") != feature_schema_sha256(config)
+                or holdout_contract.get("splits") != ["test"]
+                or holdout["sample_id"].astype(str).tolist() != ordered_ids
+            ):
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "holdout partition violates its immutable contract"
+                )
+            development_ids = set(development["sample_id"].astype(str))
+            if development_ids & set(holdout["sample_id"].astype(str)):
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "development and holdout sample IDs overlap"
+                )
+
+            circuit_manifest = self._read_object(store.root / circuit_manifest_relative)
+            circuit_records = circuit_manifest.get("circuits")
+            if not isinstance(circuit_records, list):
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "circuit manifest is invalid"
+                )
+            selected_modes = int(selection.selected["modes"])
+            circuits: dict[int, photonic_features.CircuitDefinition] = {}
+            selected_circuit_paths: list[str] = []
+            for seed in config.seeds.circuit_seeds:
+                matches = [
+                    record
+                    for record in circuit_records
+                    if isinstance(record, dict)
+                    and record.get("modes") == selected_modes
+                    and record.get("photons") == 2
+                    and record.get("circuit_seed") == seed
+                ]
+                if len(matches) != 1:
+                    raise photonic_benchmark.PhotonicBenchmarkContractError(
+                        "selected circuit definition is missing or duplicated"
+                    )
+                record = matches[0]
+                relative = str(record.get("path"))
+                payload = (store.root / relative).read_bytes()
+                declared += len(payload)
+                guard.checkpoint(declared)
+                if hashlib.sha256(payload).hexdigest() != record.get("npz_sha256"):
+                    raise photonic_benchmark.PhotonicBenchmarkContractError(
+                        "selected circuit archive checksum mismatch"
+                    )
+                circuit = photonic_features.load_circuit_npz(payload)
+                if photonic_features.circuit_checksum(circuit) != record.get("circuit_sha256"):
+                    raise photonic_benchmark.PhotonicBenchmarkContractError(
+                        "selected circuit checksum mismatch"
+                    )
+                circuits[seed] = circuit
+                selected_circuit_paths.append(relative)
+
+            exact_features = photonic_benchmark.build_holdout_photonic_features(
+                holdout,
+                selected=selection.selected,
+                circuits=circuits,
+                resource_checkpoint=guard.checkpoint,
+            )
+            expected_exact_feature_rows = len(holdout) * len(config.seeds.circuit_seeds) * 2
+            if len(exact_features) != expected_exact_feature_rows:
+                raise RuntimeError("exact holdout photonic matrix is incomplete")
+            exact_predictions, exact_diagnostics = photonic_benchmark.predict_exact(
+                exact_features,
+                selection.selected_models,
+                tuple(config.evaluation.quantiles),
+                fit_executor=fit_executor,
+            )
+            if len(exact_predictions) != expected_exact_feature_rows:
+                raise RuntimeError("exact holdout predictions are incomplete")
+            finite_counts = photonic_benchmark.finite_shot_screen(
+                exact_features,
+                tuple(config.photonics.raw_attempt_budgets),
+                SeedManager(config.seeds.master_seed),
+            )
+            expected_finite_rows = (
+                len(holdout)
+                * len(config.seeds.circuit_seeds)
+                * len(config.photonics.raw_attempt_budgets)
+            )
+            if len(finite_counts) != expected_finite_rows:
+                raise RuntimeError("finite-shot count matrix is incomplete")
+            finite_predictions = photonic_benchmark.predict_finite_shot(
+                finite_counts,
+                selection.selected_models,
+                tuple(config.evaluation.quantiles),
+                fit_executor=fit_executor,
+            )
+            if len(finite_predictions) != expected_finite_rows:
+                raise RuntimeError("finite-shot predictions are incomplete")
+
+            validation_bytes = photonic_benchmark.parquet_bytes(
+                selection.validation_scores,
+                photonic_benchmark.validation_score_arrow_schema(),
+            )
+            feature_bytes = photonic_features.feature_parquet_bytes(exact_features)
+            exact_prediction_bytes = photonic_benchmark.parquet_bytes(
+                exact_predictions, photonic_benchmark.exact_prediction_arrow_schema()
+            )
+            finite_count_bytes = photonic_benchmark.parquet_bytes(
+                finite_counts, photonic_benchmark.finite_shot_count_arrow_schema()
+            )
+            finite_prediction_bytes = photonic_benchmark.parquet_bytes(
+                finite_predictions,
+                photonic_benchmark.finite_shot_prediction_arrow_schema(),
+            )
+            model_bytes = photonic_benchmark.model_pickle_bytes(selection.selected_models)
+            restored = pickle.loads(model_bytes)
+            if not isinstance(restored, dict) or set(restored) != set(selection.selected_models):
+                raise RuntimeError("photonic model serialization round-trip failed")
+            for key, model in restored.items():
+                original = selection.selected_models[key]
+                if (
+                    model.circuit_sha256 != original.circuit_sha256
+                    or model.alpha != original.alpha
+                    or model.modes != original.modes
+                ):
+                    raise RuntimeError("photonic model metadata changed after serialization")
+            output_bytes = sum(
+                map(
+                    len,
+                    (
+                        validation_bytes,
+                        feature_bytes,
+                        exact_prediction_bytes,
+                        finite_count_bytes,
+                        finite_prediction_bytes,
+                        model_bytes,
+                    ),
+                )
+            )
+            guard.checkpoint(declared + output_bytes)
+        except _ResourceLimitExceeded as error:
+            return self._publish_benchmark_invalid(
+                store=store,
+                guard=guard,
+                gate=f"resource_{error.gate}",
+                message="photonic benchmark exceeded a configured resource cap",
+            )
+        except baseline_models.FitDeadlineExceeded:
+            return self._publish_benchmark_invalid(
+                store=store,
+                guard=guard,
+                gate="resource_fit_wall_clock_deadline",
+                message="photonic benchmark fit exceeded its hard deadline",
+            )
+        except baseline_models.FitMemoryExceeded:
+            return self._publish_benchmark_invalid(
+                store=store,
+                guard=guard,
+                gate="resource_fit_memory_rss",
+                message="photonic benchmark fit exceeded aggregate RSS",
+            )
+        except photonic_benchmark.PhotonicBenchmarkContractError as error:
+            return self._publish_benchmark_invalid(
+                store=store,
+                guard=guard,
+                gate="data_or_artifact_contract",
+                message=f"photonic benchmark input is invalid: {error}",
+            )
+
+        selection_manifest = dict(selection.selection_manifest)
+        selection_manifest.update(
+            {
+                "holdout_audit": {
+                    "opened_after_selection_freeze_sha256": freeze_hash,
+                    "materialization_count": 1,
+                    "prediction_passes": 1,
+                    "row_count": len(holdout),
+                    "sample_id_order_sha256": hashlib.sha256(
+                        json.dumps(
+                            holdout["sample_id"].astype(str).tolist(), separators=(",", ":")
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                },
+                "prerequisite_manifest_hashes_after_freeze": {
+                    "build_photonic_features": photonic_marker_hash,
+                    "build_splits": split_marker_hash,
+                    "train_baselines": baseline_marker_hash,
+                },
+                "baseline_predictions": {
+                    "path": baseline_predictions_relative,
+                    "sha256": baseline_predictions_sha256,
+                    "policy": "immutable_reuse_no_retrain_no_repredict",
+                },
+                "scientific_decision": "NOT_EVALUATED",
+            }
+        )
+        model_sha256 = hashlib.sha256(model_bytes).hexdigest()
+        model_manifest = {
+            "schema_version": "1.0",
+            "format": "python_pickle_protocol_5",
+            "warning": "load only artifacts produced by this trusted pilot run",
+            "models_sha256": model_sha256,
+            "model_keys": [
+                f"{control}:seed={seed}" for control, seed in sorted(selection.selected_models)
+            ],
+            "serialization_roundtrip_verified": True,
+            "holdout_reinference_for_serialization": False,
+            "selection_freeze_sha256": freeze_hash,
+        }
+        diagnostics = {
+            **selection.diagnostics,
+            "exact_holdout": exact_diagnostics,
+            "exact_prediction_rows": len(exact_predictions),
+            "finite_shot_rows": len(finite_predictions),
+            "finite_shot": {
+                "budgets": list(config.photonics.raw_attempt_budgets),
+                "ideal_shot_noise_only": True,
+                "loss_modeled": False,
+                "used_for_selection": False,
+                "used_for_go_stop": False,
+            },
+        }
+        guard.sample_without_enforcement()
+        ledger = {
+            "schema_version": "1.0",
+            "stage": "benchmark",
+            "status": "success",
+            "resource_status": "WITHIN_LIMIT",
+            "wall_clock_seconds": time.perf_counter() - started,
+            "peak_rss_bytes": guard.peak_rss_bytes,
+            "peak_parent_rss_bytes": guard.peak_parent_rss_bytes,
+            "peak_child_tree_rss_bytes": guard.peak_child_tree_rss_bytes,
+            "peak_combined_rss_bytes": guard.peak_combined_rss_bytes,
+            "peak_declared_bytes": guard.peak_declared_bytes,
+            "max_wall_clock_seconds": guard.wall_seconds,
+            "max_memory_bytes": guard.memory_bytes,
+            "cpu_only": True,
+        }
+        artifacts = (
+            Path("benchmark/selection_manifest.json"),
+            Path("benchmark/validation_scores.parquet"),
+            Path("benchmark/holdout_photonic_features.parquet"),
+            Path("benchmark/exact_predictions.parquet"),
+            Path("benchmark/finite_shot_counts.parquet"),
+            Path("benchmark/finite_shot_predictions.parquet"),
+            Path("benchmark/models/photonic_models.pkl"),
+            Path("benchmark/models/manifest.json"),
+            Path("benchmark/diagnostics.json"),
+            Path("benchmark/resource_ledger.json"),
+        )
+        result = StageResult(
+            stage="benchmark",
+            status=StageStatus.SUCCESS,
+            message="photonic G3 benchmark completed successfully",
+            artifacts=artifacts,
+            details=(
+                DetailEntry(key="scientific_decision", value="NOT_EVALUATED"),
+                DetailEntry(key="selection_freeze_sha256", value=freeze_hash),
+                DetailEntry(key="test_prediction_passes", value=1),
+            ),
+        )
+        input_paths = (
+            development_relative,
+            circuit_manifest_relative,
+            feature_manifest_relative,
+            *selected_circuit_paths,
+            holdout_relative,
+            "build-splits/feature_manifest.json",
+            baseline_predictions_relative,
+        )
+        try:
+            with store.stage(
+                "benchmark",
+                input_paths=input_paths,
+                details={
+                    "result_status": "success",
+                    "scientific_decision": "NOT_EVALUATED",
+                    "selection_freeze_sha256": freeze_hash,
+                    "holdout_materialization_count": 1,
+                },
+                commit_guard=guard.checkpoint,
+                private_write_guard=guard.checkpoint,
+            ) as transaction:
+                transaction.write_json("selection_manifest.json", selection_manifest)
+                transaction.write_bytes("validation_scores.parquet", validation_bytes)
+                transaction.write_bytes("holdout_photonic_features.parquet", feature_bytes)
+                transaction.write_bytes("exact_predictions.parquet", exact_prediction_bytes)
+                transaction.write_bytes("finite_shot_counts.parquet", finite_count_bytes)
+                transaction.write_bytes("finite_shot_predictions.parquet", finite_prediction_bytes)
+                transaction.write_bytes("models/photonic_models.pkl", model_bytes)
+                transaction.write_json("models/manifest.json", model_manifest)
+                transaction.write_json("diagnostics.json", diagnostics)
+                transaction.write_json("resource_ledger.json", ledger)
+                transaction.write_json("stage_result.json", deterministic_data(result))
+        except _ResourceLimitExceeded as error:
+            return self._publish_benchmark_invalid(
+                store=store,
+                guard=guard,
+                gate=f"resource_{error.gate}",
+                message="photonic benchmark publication exceeded a configured resource cap",
+            )
+        return result
 
     def report(self, run_dir: Path) -> None:
         self._unimplemented("report")
