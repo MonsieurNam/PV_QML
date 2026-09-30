@@ -7,9 +7,10 @@ import io
 import json
 import math
 import pickle
+from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib.metadata import version
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -36,8 +37,9 @@ from .photonics import (
     Control,
     build_circuit,
     circuit_checksum,
+    enumerate_fock_states,
     exact_probabilities,
-    fock_dimension,
+    state_order_checksum,
 )
 from .seeds import SeedComponent, SeedManager
 
@@ -110,7 +112,93 @@ def _candidate_key(modes: int, phase_scale: float, alpha: float) -> str:
     return f"photonic:m={modes}:c={format(phase_scale, '.17g')}:alpha={format(alpha, '.17g')}"
 
 
-def _validate_development(frame: pd.DataFrame, config: PilotConfig) -> pd.DataFrame:
+def _validate_development_reference(reference: pd.DataFrame, config: PilotConfig) -> pd.DataFrame:
+    metadata = (
+        "sample_id",
+        "site_id",
+        "issued_at_utc",
+        "target_at_utc",
+        "split",
+        "target_ac_power_kw",
+        "capacity_kw",
+    )
+    scaled = tuple(
+        f"matched{modes}_scaled_{offset}"
+        for modes in config.photonics.modes
+        for offset in range(modes)
+    )
+    missing = sorted(set((*metadata, *scaled)) - set(reference.columns))
+    if missing:
+        raise PhotonicBenchmarkContractError(f"development reference is missing columns: {missing}")
+    trusted = reference.loc[:, (*metadata, *scaled)].copy(deep=True)
+    if trusted.empty or trusted["sample_id"].astype(str).duplicated().any():
+        raise PhotonicBenchmarkContractError(
+            "development reference sample IDs must be nonempty and unique"
+        )
+    if set(trusted["split"].astype(str)) != {"train", "validation"}:
+        raise PhotonicBenchmarkContractError(
+            "development reference must contain train and validation"
+        )
+    for column in ("issued_at_utc", "target_at_utc"):
+        trusted[column] = pd.to_datetime(trusted[column], utc=True, errors="raise")
+    numeric = trusted.loc[:, ("target_ac_power_kw", "capacity_kw", *scaled)].to_numpy(
+        dtype=np.float64
+    )
+    if (
+        not np.isfinite(numeric).all()
+        or (trusted["capacity_kw"].to_numpy(dtype=np.float64) <= 0).any()
+        or (trusted.loc[:, scaled].to_numpy(dtype=np.float64) < -1e-12).any()
+        or (trusted.loc[:, scaled].to_numpy(dtype=np.float64) > 1 + 1e-12).any()
+    ):
+        raise PhotonicBenchmarkContractError(
+            "development reference contains invalid numeric values"
+        )
+    return trusted.sort_values(
+        ["site_id", "issued_at_utc", "sample_id"], kind="stable"
+    ).reset_index(drop=True)
+
+
+def _validate_trusted_photonic_contracts(
+    config: PilotConfig,
+    trusted_circuits: Mapping[tuple[int, int], CircuitDefinition],
+    trusted_state_spaces: Mapping[tuple[int, int], tuple[int, str]],
+) -> None:
+    expected_circuit_keys = {
+        (modes, seed) for modes in config.photonics.modes for seed in config.seeds.circuit_seeds
+    }
+    if set(trusted_circuits) != expected_circuit_keys:
+        raise PhotonicBenchmarkContractError("trusted circuit map is not exact")
+    expected_space_keys = {(modes, 2) for modes in config.photonics.modes}
+    if set(trusted_state_spaces) != expected_space_keys:
+        raise PhotonicBenchmarkContractError("trusted state-space map is not exact")
+    for modes in config.photonics.modes:
+        canonical_states = enumerate_fock_states(modes, 2)
+        expected_space = (len(canonical_states), state_order_checksum(canonical_states))
+        if trusted_state_spaces[(modes, 2)] != expected_space:
+            raise PhotonicBenchmarkContractError("trusted state-order contract is not canonical")
+        for seed in config.seeds.circuit_seeds:
+            circuit = trusted_circuits[(modes, seed)]
+            if (
+                circuit.modes != modes
+                or circuit.photons != 2
+                or circuit.circuit_seed != seed
+                or circuit.state_order_sha256 != expected_space[1]
+            ):
+                raise PhotonicBenchmarkContractError(
+                    "trusted circuit metadata violates its state-order contract"
+                )
+
+
+def _validate_development(
+    frame: pd.DataFrame,
+    config: PilotConfig,
+    *,
+    development_reference: pd.DataFrame,
+    trusted_circuits: Mapping[tuple[int, int], CircuitDefinition],
+    trusted_state_spaces: Mapping[tuple[int, int], tuple[int, str]],
+) -> pd.DataFrame:
+    _validate_trusted_photonic_contracts(config, trusted_circuits, trusted_state_spaces)
+    reference = _validate_development_reference(development_reference, config)
     required = {
         "sample_id",
         "site_id",
@@ -160,33 +248,80 @@ def _validate_development(frame: pd.DataFrame, config: PilotConfig) -> pd.DataFr
     ]
     if work.duplicated(identity).any():
         raise PhotonicBenchmarkContractError("photonic candidate rows are duplicated")
-    expected_samples = {
-        split: set(work.loc[work["split"] == split, "sample_id"].astype(str))
-        for split in ("train", "validation")
-    }
-    expected_count = sum(len(values) for values in expected_samples.values())
+    expected_samples = set(reference["sample_id"].astype(str))
+    if set(work["sample_id"].astype(str)) != expected_samples:
+        raise PhotonicBenchmarkContractError(
+            "candidate sample membership does not match the development reference"
+        )
+    expected_row_count = (
+        len(reference)
+        * len(config.photonics.modes)
+        * len(config.photonics.phase_scales)
+        * len(config.seeds.circuit_seeds)
+        * len(CONTROLS)
+    )
+    if len(work) != expected_row_count:
+        raise PhotonicBenchmarkContractError("photonic candidate Cartesian grid is not complete")
+    reference_by_id = reference.set_index(reference["sample_id"].astype(str), drop=False)
+    metadata_columns = (
+        "site_id",
+        "issued_at_utc",
+        "target_at_utc",
+        "split",
+        "target_ac_power_kw",
+        "capacity_kw",
+    )
+    for row in work.itertuples(index=False):
+        trusted = reference_by_id.loc[str(row.sample_id)]
+        for column in metadata_columns:
+            actual = getattr(row, column)
+            expected = trusted[column]
+            if actual != expected:
+                raise PhotonicBenchmarkContractError(
+                    f"sample metadata mismatch for {row.sample_id}: {column}"
+                )
     grouped = work.groupby(
         ["modes", "phase_scale", "circuit_seed", "control"], observed=True, sort=False
     )
     for key, group in grouped:
-        if len(group) != expected_count:
+        if len(group) != len(reference):
             raise PhotonicBenchmarkContractError(f"candidate {key!r} is not complete")
-        for split, samples in expected_samples.items():
-            actual = set(group.loc[group["split"] == split, "sample_id"].astype(str))
-            if actual != samples:
-                raise PhotonicBenchmarkContractError(f"candidate {key!r} is not complete")
-        dimensions = set(group["dimension"].astype(int))
-        if dimensions != {fock_dimension(int(key[0]), 2)}:
+        if set(group["sample_id"].astype(str)) != expected_samples:
+            raise PhotonicBenchmarkContractError(f"candidate {key!r} is not complete")
+        modes, phase_scale, circuit_seed, control = key
+        expected_dimension, expected_state_checksum = trusted_state_spaces[(int(modes), 2)]
+        trusted_circuit = trusted_circuits[(int(modes), int(circuit_seed))]
+        expected_circuit_checksum = circuit_checksum(trusted_circuit)
+        if set(group["dimension"].astype(int)) != {expected_dimension}:
             raise PhotonicBenchmarkContractError("probability dimension metadata is invalid")
-        for probabilities in group["probabilities"]:
+        if set(group["state_order_sha256"].astype(str)) != {expected_state_checksum}:
+            raise PhotonicBenchmarkContractError("state-order checksum mismatch")
+        if set(group["circuit_sha256"].astype(str)) != {expected_circuit_checksum}:
+            raise PhotonicBenchmarkContractError("circuit checksum mismatch")
+        feature_columns = tuple(
+            f"matched{int(modes)}_scaled_{offset}" for offset in range(int(modes))
+        )
+        for row in group.itertuples(index=False):
+            probabilities = row.probabilities
             array = np.asarray(probabilities, dtype=np.float64)
             if (
-                array.shape != (next(iter(dimensions)),)
+                array.shape != (expected_dimension,)
                 or not np.isfinite(array).all()
                 or (array < -1e-12).any()
                 or not math.isclose(float(array.sum()), 1.0, abs_tol=1e-12, rel_tol=0.0)
             ):
                 raise PhotonicBenchmarkContractError("probability vector is invalid")
+            trusted_sample = reference_by_id.loc[str(row.sample_id)]
+            scaled = trusted_sample.loc[list(feature_columns)].to_numpy(dtype=np.float64)
+            expected_probabilities = exact_probabilities(
+                build_circuit(trusted_circuit, scaled, float(phase_scale)),
+                photons=2,
+                control=cast(Control, str(control)),
+            )
+            if not np.allclose(array, expected_probabilities, atol=1e-12, rtol=0.0):
+                raise PhotonicBenchmarkContractError(
+                    "probability semantics do not match the trusted circuit and state order"
+                )
     return work.sort_values(
         [
             "modes",
@@ -325,11 +460,20 @@ def select_photonic_models(
     development_features: pd.DataFrame,
     config: PilotConfig,
     *,
+    development_reference: pd.DataFrame,
+    trusted_circuits: Mapping[tuple[int, int], CircuitDefinition],
+    trusted_state_spaces: Mapping[tuple[int, int], tuple[int, str]],
     fit_executor: FitExecutor | None = None,
 ) -> PhotonicSelectionResult:
     """Select primary m/c/alpha across every seed and UTC-day validation origin."""
 
-    work = _validate_development(development_features, config)
+    work = _validate_development(
+        development_features,
+        config,
+        development_reference=development_reference,
+        trusted_circuits=trusted_circuits,
+        trusted_state_spaces=trusted_state_spaces,
+    )
     executor = fit_executor or DirectFitExecutor(lambda _declared: None)
     quantiles = tuple(config.evaluation.quantiles)
     seeds = tuple(config.seeds.circuit_seeds)
@@ -536,6 +680,7 @@ def build_holdout_photonic_features(
     *,
     selected: dict[str, Any],
     circuits: dict[int, CircuitDefinition],
+    trusted_state_space: tuple[int, str],
     resource_checkpoint: Any | None = None,
 ) -> pd.DataFrame:
     """Generate selected exact probabilities using only persisted circuit definitions."""
@@ -543,6 +688,12 @@ def build_holdout_photonic_features(
     modes = int(selected["modes"])
     photons = int(selected["photons"])
     phase_scale = float(selected["phase_scale"])
+    canonical_states = enumerate_fock_states(modes, photons)
+    canonical_space = (len(canonical_states), state_order_checksum(canonical_states))
+    if trusted_state_space != canonical_space:
+        raise PhotonicBenchmarkContractError(
+            "selected trusted state-order contract is not canonical"
+        )
     columns = tuple(f"matched{modes}_scaled_{index}" for index in range(modes))
     required = {
         "sample_id",
@@ -570,7 +721,12 @@ def build_holdout_photonic_features(
     records: list[dict[str, Any]] = []
     declared = int(work.memory_usage(index=True, deep=True).sum())
     for seed, circuit in sorted(circuits.items()):
-        if circuit.circuit_seed != seed or circuit.modes != modes or circuit.photons != photons:
+        if (
+            circuit.circuit_seed != seed
+            or circuit.modes != modes
+            or circuit.photons != photons
+            or circuit.state_order_sha256 != canonical_space[1]
+        ):
             raise PhotonicBenchmarkContractError("persisted circuit does not match selection")
         checksum = circuit_checksum(circuit)
         for index, row in enumerate(work.itertuples(index=False)):
@@ -600,7 +756,136 @@ def build_holdout_photonic_features(
                 declared += probabilities.nbytes + 768
                 if resource_checkpoint is not None:
                     resource_checkpoint(declared)
-    return pd.DataFrame.from_records(records)
+    result = pd.DataFrame.from_records(records)
+    _validate_holdout_exact_features(
+        result,
+        holdout_reference=work,
+        selected=selected,
+        trusted_circuits=circuits,
+        trusted_state_space=trusted_state_space,
+    )
+    return result
+
+
+def _validate_holdout_exact_features(
+    exact_features: pd.DataFrame,
+    *,
+    holdout_reference: pd.DataFrame,
+    selected: Mapping[str, Any],
+    trusted_circuits: Mapping[int, CircuitDefinition],
+    trusted_state_space: tuple[int, str],
+) -> pd.DataFrame:
+    modes = int(selected["modes"])
+    photons = int(selected["photons"])
+    phase_scale = float(selected["phase_scale"])
+    states = enumerate_fock_states(modes, photons)
+    canonical_space = (len(states), state_order_checksum(states))
+    if trusted_state_space != canonical_space:
+        raise PhotonicBenchmarkContractError("holdout state-order contract is not canonical")
+    metadata = (
+        "sample_id",
+        "site_id",
+        "issued_at_utc",
+        "target_at_utc",
+        "split",
+        "target_ac_power_kw",
+        "capacity_kw",
+    )
+    feature_columns = tuple(f"matched{modes}_scaled_{offset}" for offset in range(modes))
+    missing_reference = sorted(set((*metadata, *feature_columns)) - set(holdout_reference.columns))
+    if missing_reference:
+        raise PhotonicBenchmarkContractError(
+            f"holdout reference is missing columns: {missing_reference}"
+        )
+    reference = holdout_reference.loc[:, (*metadata, *feature_columns)].copy()
+    if (
+        reference.empty
+        or reference["sample_id"].astype(str).duplicated().any()
+        or set(reference["split"].astype(str)) != {"test"}
+    ):
+        raise PhotonicBenchmarkContractError("holdout reference membership is invalid")
+    for column in ("issued_at_utc", "target_at_utc"):
+        reference[column] = pd.to_datetime(reference[column], utc=True, errors="raise")
+    expected_seeds = set(trusted_circuits)
+    for seed, circuit in trusted_circuits.items():
+        if (
+            circuit.circuit_seed != seed
+            or circuit.modes != modes
+            or circuit.photons != photons
+            or circuit.state_order_sha256 != canonical_space[1]
+        ):
+            raise PhotonicBenchmarkContractError("holdout trusted circuit is invalid")
+    required = {
+        *metadata,
+        "modes",
+        "photons",
+        "phase_scale",
+        "circuit_seed",
+        "control",
+        "probabilities",
+        "dimension",
+        "state_order_sha256",
+        "circuit_sha256",
+    }
+    missing = sorted(required - set(exact_features.columns))
+    if missing:
+        raise PhotonicBenchmarkContractError(f"exact holdout features are missing {missing}")
+    work = exact_features.copy(deep=True)
+    for column in ("issued_at_utc", "target_at_utc"):
+        work[column] = pd.to_datetime(work[column], utc=True, errors="raise")
+    identity = ["sample_id", "circuit_seed", "control"]
+    if (
+        not expected_seeds
+        or len(work) != len(reference) * len(expected_seeds) * len(CONTROLS)
+        or work.duplicated(identity).any()
+        or set(work["sample_id"].astype(str)) != set(reference["sample_id"].astype(str))
+        or set(work["circuit_seed"].astype(int)) != expected_seeds
+        or set(work["control"].astype(str)) != set(CONTROLS)
+    ):
+        raise PhotonicBenchmarkContractError(
+            "exact holdout selected-row Cartesian grid is incomplete"
+        )
+    reference_by_id = reference.set_index(reference["sample_id"].astype(str), drop=False)
+    for row in work.itertuples(index=False):
+        trusted_sample = reference_by_id.loc[str(row.sample_id)]
+        for column in metadata[1:]:
+            if getattr(row, column) != trusted_sample[column]:
+                raise PhotonicBenchmarkContractError(f"holdout sample metadata mismatch: {column}")
+        seed = int(row.circuit_seed)
+        circuit = trusted_circuits[seed]
+        if (
+            int(row.modes) != modes
+            or int(row.photons) != photons
+            or float(row.phase_scale) != phase_scale
+            or int(row.dimension) != canonical_space[0]
+            or str(row.state_order_sha256) != canonical_space[1]
+            or str(row.circuit_sha256) != circuit_checksum(circuit)
+        ):
+            raise PhotonicBenchmarkContractError(
+                "holdout state-order/dimension/circuit checksum mismatch"
+            )
+        actual = np.asarray(row.probabilities, dtype=np.float64)
+        if (
+            actual.shape != (canonical_space[0],)
+            or not np.isfinite(actual).all()
+            or (actual < -1e-12).any()
+            or not math.isclose(float(actual.sum()), 1.0, abs_tol=1e-12, rel_tol=0.0)
+        ):
+            raise PhotonicBenchmarkContractError("holdout probability vector is invalid")
+        scaled = trusted_sample.loc[list(feature_columns)].to_numpy(dtype=np.float64)
+        expected = exact_probabilities(
+            build_circuit(circuit, scaled, phase_scale),
+            photons=photons,
+            control=cast(Control, str(row.control)),
+        )
+        if not np.allclose(actual, expected, atol=1e-12, rtol=0.0):
+            raise PhotonicBenchmarkContractError(
+                "holdout probability semantics do not match the trusted circuit"
+            )
+    return work.sort_values(
+        ["circuit_seed", "control", "site_id", "issued_at_utc", "sample_id"],
+        kind="stable",
+    ).reset_index(drop=True)
 
 
 def predict_exact(
@@ -608,8 +893,25 @@ def predict_exact(
     models: dict[tuple[str, int], PhotonicSeedModel],
     quantiles: tuple[float, ...],
     *,
+    holdout_reference: pd.DataFrame,
+    trusted_circuits: Mapping[int, CircuitDefinition],
+    trusted_state_space: tuple[int, str],
     fit_executor: FitExecutor | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if not models:
+        raise PhotonicBenchmarkContractError("photonic model map is empty")
+    exemplar = next(iter(models.values()))
+    exact_features = _validate_holdout_exact_features(
+        exact_features,
+        holdout_reference=holdout_reference,
+        selected={
+            "modes": exemplar.modes,
+            "photons": exemplar.photons,
+            "phase_scale": exemplar.phase_scale,
+        },
+        trusted_circuits=trusted_circuits,
+        trusted_state_space=trusted_state_space,
+    )
     executor = fit_executor or DirectFitExecutor(lambda _declared: None)
     records: list[dict[str, Any]] = []
     diagnostics: dict[str, Any] = {}

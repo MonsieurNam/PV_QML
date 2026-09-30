@@ -1844,6 +1844,8 @@ class DefaultPilotServices:
         development_relative = "build-photonic-features/development_photonic_features.parquet"
         circuit_manifest_relative = "build-photonic-features/circuit_manifest.json"
         feature_manifest_relative = "build-photonic-features/feature_manifest.json"
+        state_spaces_relative = "build-photonic-features/state_spaces.json"
+        development_reference_relative = "build-splits/development_features.parquet"
         try:
             # Holdout-safe boundary: this verifies Task 7 and only its fixed development
             # prerequisites. It cannot hash/materialize the Task 5 holdout partition.
@@ -1869,6 +1871,7 @@ class DefaultPilotServices:
                 development_relative,
                 circuit_manifest_relative,
                 feature_manifest_relative,
+                state_spaces_relative,
             ):
                 if relative not in task7_hashes:
                     raise photonic_benchmark.PhotonicBenchmarkContractError(
@@ -1879,6 +1882,20 @@ class DefaultPilotServices:
             development = pds.dataset(development_path, format="parquet").to_table().to_pandas()
             declared = int(development.memory_usage(index=True, deep=True).sum())
             guard.checkpoint(declared)
+            task7_inputs = task7_manifest.get("input_hashes")
+            if not isinstance(task7_inputs, dict) or task7_inputs.get(
+                development_reference_relative
+            ) != sha256_file(store.root / development_reference_relative):
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "Task 5 development reference is not bound to Task 7"
+                )
+            development_reference = (
+                pds.dataset(store.root / development_reference_relative, format="parquet")
+                .to_table()
+                .to_pandas()
+            )
+            declared += int(development_reference.memory_usage(index=True, deep=True).sum())
+            guard.checkpoint(declared)
             task7_feature_manifest = self._read_object(store.root / feature_manifest_relative)
             if (
                 task7_feature_manifest.get("holdout_opened") is not False
@@ -1888,6 +1905,64 @@ class DefaultPilotServices:
                 raise photonic_benchmark.PhotonicBenchmarkContractError(
                     "development photonic manifest violates the G3 firewall"
                 )
+            raw_state_spaces = self._read_object(store.root / state_spaces_relative).get("spaces")
+            if not isinstance(raw_state_spaces, list):
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "trusted state-space manifest is invalid"
+                )
+            trusted_state_spaces: dict[tuple[int, int], tuple[int, str]] = {}
+            for record in raw_state_spaces:
+                if not isinstance(record, dict):
+                    raise photonic_benchmark.PhotonicBenchmarkContractError(
+                        "trusted state-space record is invalid"
+                    )
+                key = (int(record.get("modes", -1)), int(record.get("photons", -1)))
+                value = (
+                    int(record.get("dimension", -1)),
+                    str(record.get("state_order_sha256", "")),
+                )
+                if key in trusted_state_spaces:
+                    raise photonic_benchmark.PhotonicBenchmarkContractError(
+                        "trusted state-space record is duplicated"
+                    )
+                trusted_state_spaces[key] = value
+            circuit_manifest = self._read_object(store.root / circuit_manifest_relative)
+            circuit_records = circuit_manifest.get("circuits")
+            if not isinstance(circuit_records, list):
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "circuit manifest is invalid"
+                )
+            trusted_circuits: dict[tuple[int, int], photonic_features.CircuitDefinition] = {}
+            trusted_circuit_paths: list[str] = []
+            for record in circuit_records:
+                if not isinstance(record, dict):
+                    raise photonic_benchmark.PhotonicBenchmarkContractError(
+                        "circuit manifest record is invalid"
+                    )
+                relative = str(record.get("path"))
+                if relative not in task7_hashes:
+                    raise photonic_benchmark.PhotonicBenchmarkContractError(
+                        "circuit archive is not a verified Task 7 output"
+                    )
+                payload = (store.root / relative).read_bytes()
+                declared += len(payload)
+                guard.checkpoint(declared)
+                if hashlib.sha256(payload).hexdigest() != record.get("npz_sha256"):
+                    raise photonic_benchmark.PhotonicBenchmarkContractError(
+                        "trusted circuit archive checksum mismatch"
+                    )
+                circuit = photonic_features.load_circuit_npz(payload)
+                key = (circuit.modes, circuit.circuit_seed)
+                if (
+                    key in trusted_circuits
+                    or circuit.photons != 2
+                    or photonic_features.circuit_checksum(circuit) != record.get("circuit_sha256")
+                ):
+                    raise photonic_benchmark.PhotonicBenchmarkContractError(
+                        "trusted circuit definition is invalid or duplicated"
+                    )
+                trusted_circuits[key] = circuit
+                trusted_circuit_paths.append(relative)
             fit_executor = baseline_models.DeadlineProcessFitExecutor(
                 deadline_monotonic=(
                     time.monotonic()
@@ -1904,6 +1979,9 @@ class DefaultPilotServices:
             selection = photonic_benchmark.select_photonic_models(
                 development,
                 config,
+                development_reference=development_reference,
+                trusted_circuits=trusted_circuits,
+                trusted_state_spaces=trusted_state_spaces,
                 fit_executor=fit_executor,
             )
             freeze_hash = selection.selection_manifest["selection_freeze_sha256"]
@@ -1973,49 +2051,17 @@ class DefaultPilotServices:
                     "development and holdout sample IDs overlap"
                 )
 
-            circuit_manifest = self._read_object(store.root / circuit_manifest_relative)
-            circuit_records = circuit_manifest.get("circuits")
-            if not isinstance(circuit_records, list):
-                raise photonic_benchmark.PhotonicBenchmarkContractError(
-                    "circuit manifest is invalid"
-                )
             selected_modes = int(selection.selected["modes"])
-            circuits: dict[int, photonic_features.CircuitDefinition] = {}
-            selected_circuit_paths: list[str] = []
-            for seed in config.seeds.circuit_seeds:
-                matches = [
-                    record
-                    for record in circuit_records
-                    if isinstance(record, dict)
-                    and record.get("modes") == selected_modes
-                    and record.get("photons") == 2
-                    and record.get("circuit_seed") == seed
-                ]
-                if len(matches) != 1:
-                    raise photonic_benchmark.PhotonicBenchmarkContractError(
-                        "selected circuit definition is missing or duplicated"
-                    )
-                record = matches[0]
-                relative = str(record.get("path"))
-                payload = (store.root / relative).read_bytes()
-                declared += len(payload)
-                guard.checkpoint(declared)
-                if hashlib.sha256(payload).hexdigest() != record.get("npz_sha256"):
-                    raise photonic_benchmark.PhotonicBenchmarkContractError(
-                        "selected circuit archive checksum mismatch"
-                    )
-                circuit = photonic_features.load_circuit_npz(payload)
-                if photonic_features.circuit_checksum(circuit) != record.get("circuit_sha256"):
-                    raise photonic_benchmark.PhotonicBenchmarkContractError(
-                        "selected circuit checksum mismatch"
-                    )
-                circuits[seed] = circuit
-                selected_circuit_paths.append(relative)
+            circuits = {
+                seed: trusted_circuits[(selected_modes, seed)]
+                for seed in config.seeds.circuit_seeds
+            }
 
             exact_features = photonic_benchmark.build_holdout_photonic_features(
                 holdout,
                 selected=selection.selected,
                 circuits=circuits,
+                trusted_state_space=trusted_state_spaces[(selected_modes, 2)],
                 resource_checkpoint=guard.checkpoint,
             )
             expected_exact_feature_rows = len(holdout) * len(config.seeds.circuit_seeds) * 2
@@ -2025,6 +2071,9 @@ class DefaultPilotServices:
                 exact_features,
                 selection.selected_models,
                 tuple(config.evaluation.quantiles),
+                holdout_reference=holdout,
+                trusted_circuits=circuits,
+                trusted_state_space=trusted_state_spaces[(selected_modes, 2)],
                 fit_executor=fit_executor,
             )
             if len(exact_predictions) != expected_exact_feature_rows:
@@ -2216,7 +2265,9 @@ class DefaultPilotServices:
             development_relative,
             circuit_manifest_relative,
             feature_manifest_relative,
-            *selected_circuit_paths,
+            state_spaces_relative,
+            development_reference_relative,
+            *trusted_circuit_paths,
             holdout_relative,
             "build-splits/feature_manifest.json",
             baseline_predictions_relative,

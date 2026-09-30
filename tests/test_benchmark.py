@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import json
 import math
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, cast
 
@@ -16,6 +17,7 @@ from pv_pilot.artifacts import RunStore
 from pv_pilot.baselines import DirectFitExecutor, QuantileHeads
 from pv_pilot.benchmark import (
     PhotonicBenchmarkContractError,
+    PhotonicSelectionResult,
     build_holdout_photonic_features,
     candidate_sort_key,
     finite_shot_screen,
@@ -26,35 +28,57 @@ from pv_pilot.benchmark import (
 )
 from pv_pilot.config import PilotConfig, load_config
 from pv_pilot.domain import StageResult, StageStatus, deterministic_data
-from pv_pilot.photonics import circuit_checksum, generate_circuit
+from pv_pilot.photonics import (
+    CircuitDefinition,
+    build_circuit,
+    circuit_checksum,
+    enumerate_fock_states,
+    exact_probabilities,
+    generate_circuit,
+    state_order_checksum,
+)
 from pv_pilot.seeds import SeedManager
 from pv_pilot.services import DefaultPilotServices
 from pv_pilot.splits import feature_dataframe_parquet_bytes, feature_schema_sha256
 
 
+@lru_cache(maxsize=1)
 def _config() -> PilotConfig:
     return load_config(Path("configs/pilot.synthetic.yaml")).config
 
 
 def _development_frame() -> pd.DataFrame:
+    return _cached_development_frame().copy(deep=True)
+
+
+@lru_cache(maxsize=1)
+def _cached_development_frame() -> pd.DataFrame:
     config = _config()
     rows: list[dict[str, object]] = []
-    timestamps = pd.date_range("2025-01-01", periods=16, freq="12h", tz="UTC")
+    timestamps = pd.to_datetime(
+        [
+            "2025-01-01T00:00:00Z",
+            "2025-01-01T12:00:00Z",
+            "2025-01-16T00:00:00Z",
+            "2025-01-17T00:00:00Z",
+        ],
+        utc=True,
+    )
     for index, timestamp in enumerate(timestamps):
-        split = "train" if index < 8 else "validation"
+        split = "train" if index < 2 else "validation"
         target = float((index % 5) + 1)
         for modes in (4, 6):
             dimension = math.comb(modes + 1, 2)
+            scaled = np.asarray([0.05 + 0.1 * index + 0.03 * offset for offset in range(modes)])
             for scale in (math.pi / 2, math.pi):
-                for seed_index, seed in enumerate(config.seeds.circuit_seeds):
-                    base = np.arange(1, dimension + 1, dtype=np.float64)
-                    base[(index + seed_index) % dimension] += target * (1 + modes / 10)
-                    probabilities = base / base.sum()
+                for seed in config.seeds.circuit_seeds:
                     circuit = generate_circuit(circuit_seed=seed, modes=modes, photons=2)
                     for control in ("indistinguishable", "distinguishable"):
-                        values = probabilities.copy()
-                        if control == "distinguishable":
-                            values = np.roll(values, 1)
+                        values = exact_probabilities(
+                            build_circuit(circuit, scaled, scale),
+                            photons=2,
+                            control=control,
+                        )
                         rows.append(
                             {
                                 "sample_id": f"sample-{index}",
@@ -76,6 +100,109 @@ def _development_frame() -> pd.DataFrame:
                             }
                         )
     return pd.DataFrame(rows)
+
+
+def _development_reference(frame: pd.DataFrame) -> pd.DataFrame:
+    metadata = [
+        "sample_id",
+        "site_id",
+        "issued_at_utc",
+        "target_at_utc",
+        "split",
+        "target_ac_power_kw",
+        "capacity_kw",
+    ]
+    reference = frame.loc[:, metadata].drop_duplicates("sample_id").copy()
+    for modes in (4, 6):
+        for offset in range(modes):
+            reference[f"matched{modes}_scaled_{offset}"] = [
+                0.05 + 0.1 * int(sample_id.split("-")[-1]) + 0.03 * offset
+                for sample_id in reference["sample_id"].astype(str)
+            ]
+    return reference
+
+
+def _trusted_contracts(
+    config: PilotConfig,
+) -> tuple[
+    dict[tuple[int, int], CircuitDefinition],
+    dict[tuple[int, int], tuple[int, str]],
+]:
+    circuits = {
+        (modes, seed): generate_circuit(circuit_seed=seed, modes=modes, photons=2)
+        for modes in config.photonics.modes
+        for seed in config.seeds.circuit_seeds
+    }
+    states = {
+        (modes, 2): (
+            math.comb(modes + 1, 2),
+            state_order_checksum(enumerate_fock_states(modes, 2)),
+        )
+        for modes in config.photonics.modes
+    }
+    return circuits, states
+
+
+def _select(frame: pd.DataFrame, config: PilotConfig) -> PhotonicSelectionResult:
+    circuits, states = _trusted_contracts(config)
+    return select_photonic_models(
+        frame,
+        config,
+        development_reference=_development_reference(frame),
+        trusted_circuits=circuits,
+        trusted_state_spaces=states,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation,match",
+    [
+        ("state_order", "state-order"),
+        ("distinguishable_circuit", "circuit checksum"),
+        ("candidate_target", "sample metadata"),
+        ("probability_length", "probability"),
+        ("probability_sum", "probability"),
+        ("probability_reorder", "probability semantics"),
+    ],
+)
+def test_semantic_contract_rejects_before_any_fit(
+    mutation: str, match: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pv_pilot.benchmark as benchmark_module
+
+    config = _config()
+    frame = _development_frame()
+    row = frame.index[0]
+    if mutation == "state_order":
+        frame.at[row, "state_order_sha256"] = "f" * 64
+    elif mutation == "distinguishable_circuit":
+        target = frame.index[frame["control"] == "distinguishable"][0]
+        frame.at[target, "circuit_sha256"] = "e" * 64
+    elif mutation == "candidate_target":
+        frame.at[row, "target_ac_power_kw"] = float(frame.at[row, "target_ac_power_kw"]) + 1
+    elif mutation == "probability_length":
+        frame.at[row, "probabilities"] = list(frame.at[row, "probabilities"])[:-1]
+    elif mutation == "probability_sum":
+        changed = list(frame.at[row, "probabilities"])
+        changed[0] += 0.1
+        frame.at[row, "probabilities"] = changed
+    else:
+        frame.at[row, "probabilities"] = list(reversed(frame.at[row, "probabilities"]))
+
+    def unexpected_fit(*args: Any, **kwargs: Any) -> object:
+        del args, kwargs
+        raise AssertionError("semantic validation must finish before model fit")
+
+    monkeypatch.setattr(benchmark_module, "_fit_linear_heads", unexpected_fit)
+    circuits, states = _trusted_contracts(config)
+    with pytest.raises(PhotonicBenchmarkContractError, match=match):
+        select_photonic_models(
+            frame,
+            config,
+            development_reference=_development_reference(_development_frame()),
+            trusted_circuits=circuits,
+            trusted_state_spaces=states,
+        )
 
 
 class _ConstantEstimator:
@@ -285,7 +412,7 @@ def test_candidate_tie_break_order_is_locked() -> None:
 def test_selection_scores_all_five_seeds_and_blocked_day_origins() -> None:
     config = _config()
     development = _development_frame()
-    result = select_photonic_models(development, config)
+    result = _select(development, config)
     assert result.selected["control"] == "indistinguishable"
     assert result.selected["photons"] == 2
     assert len(result.selected_models) == 10
@@ -323,7 +450,7 @@ def test_selection_rejects_missing_seed_origin() -> None:
         & (frame["control"] == "indistinguishable")
     )
     with pytest.raises(PhotonicBenchmarkContractError, match="complete"):
-        select_photonic_models(frame.loc[mask].copy(), config)
+        _select(frame.loc[mask].copy(), config)
 
 
 def test_finite_shot_is_deterministic_and_isolated_by_sampling_seed() -> None:
@@ -374,7 +501,7 @@ def test_real_slos_holdout_both_controls_predictions_and_serialization() -> None
     import pickle
 
     config = _config()
-    selection = select_photonic_models(_development_frame(), config)
+    selection = _select(_development_frame(), config)
     modes = int(selection.selected["modes"])
     holdout = pd.DataFrame(
         [
@@ -394,13 +521,27 @@ def test_real_slos_holdout_both_controls_predictions_and_serialization() -> None
         seed: generate_circuit(circuit_seed=seed, modes=modes, photons=2)
         for seed in config.seeds.circuit_seeds
     }
-    exact = build_holdout_photonic_features(holdout, selected=selection.selected, circuits=circuits)
+    trusted_state_space = (
+        math.comb(modes + 1, 2),
+        state_order_checksum(enumerate_fock_states(modes, 2)),
+    )
+    exact = build_holdout_photonic_features(
+        holdout,
+        selected=selection.selected,
+        circuits=circuits,
+        trusted_state_space=trusted_state_space,
+    )
     assert len(exact) == 10
     assert set(exact["control"]) == {"indistinguishable", "distinguishable"}
     assert exact.groupby("control")["circuit_seed"].nunique().eq(5).all()
     assert exact["probabilities"].map(sum).to_numpy() == pytest.approx(np.ones(10))
     predictions, diagnostics = predict_exact(
-        exact, selection.selected_models, tuple(config.evaluation.quantiles)
+        exact,
+        selection.selected_models,
+        tuple(config.evaluation.quantiles),
+        holdout_reference=holdout,
+        trusted_circuits=circuits,
+        trusted_state_space=trusted_state_space,
     )
     assert len(predictions) == 10
     assert predictions.groupby("control")["circuit_seed"].nunique().eq(5).all()
@@ -412,8 +553,32 @@ def test_real_slos_holdout_both_controls_predictions_and_serialization() -> None
 
     restored = pickle.loads(model_pickle_bytes(selection.selected_models))
     assert set(restored) == set(selection.selected_models)
-    repeated, _ = predict_exact(exact, restored, tuple(config.evaluation.quantiles))
+    repeated, _ = predict_exact(
+        exact,
+        restored,
+        tuple(config.evaluation.quantiles),
+        holdout_reference=holdout,
+        trusted_circuits=circuits,
+        trusted_state_space=trusted_state_space,
+    )
     assert repeated[quantile_columns].to_numpy() == pytest.approx(values)
+
+    for column, bad_value, match in (
+        ("state_order_sha256", "f" * 64, "state-order"),
+        ("circuit_sha256", "e" * 64, "circuit checksum"),
+        ("target_ac_power_kw", 9.0, "sample metadata"),
+    ):
+        tampered = exact.copy(deep=True)
+        tampered.at[tampered.index[0], column] = bad_value
+        with pytest.raises(PhotonicBenchmarkContractError, match=match):
+            predict_exact(
+                tampered,
+                selection.selected_models,
+                tuple(config.evaluation.quantiles),
+                holdout_reference=holdout,
+                trusted_circuits=circuits,
+                trusted_state_space=trusted_state_space,
+            )
 
     counts = finite_shot_screen(
         exact, tuple(config.photonics.raw_attempt_budgets), SeedManager(config.seeds.master_seed)
