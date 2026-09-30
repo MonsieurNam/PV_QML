@@ -237,6 +237,120 @@ def test_marker_only_prerequisite_check_is_limited_to_diagnostic_invalid(
     assert manifest["details"]["prerequisite_verification"] == "marker_only"
 
 
+def test_selective_prerequisite_verification_hashes_only_allowlisted_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pv_pilot.artifacts as artifacts_module
+
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    with store.stage("validate-data", now=FIXED_NOW) as transaction:
+        transaction.write_text("validated.csv", "ok")
+    with store.stage("build-splits", now=FIXED_NOW) as transaction:
+        transaction.write_bytes("development.bin", b"development")
+        transaction.write_bytes("metadata.json", b"{}")
+        transaction.write_bytes("holdout.bin", b"opaque holdout")
+
+    original_sha256 = artifacts_module.sha256_file
+
+    def reject_holdout_read(path: Path) -> str:
+        if path.name == "holdout.bin":
+            raise AssertionError("selective verification read the holdout")
+        return original_sha256(path)
+
+    monkeypatch.setattr(artifacts_module, "sha256_file", reject_holdout_read)
+    with store.stage(
+        "build-photonic-features",
+        input_paths=("build-splits/development.bin", "build-splits/metadata.json"),
+        prerequisite_verification="selected_outputs",
+        prerequisite_output_allowlist={
+            "build-splits": (
+                "build-splits/development.bin",
+                "build-splits/metadata.json",
+            )
+        },
+        now=FIXED_NOW,
+    ) as transaction:
+        transaction.write_json(
+            "stage_result.json",
+            {"stage": "build-photonic-features", "status": "SUCCESS"},
+        )
+
+    manifest = read_json(store.root / "build-photonic-features/stage_manifest.json")
+    assert manifest["status"] == "SUCCESS"
+    assert manifest["details"]["prerequisite_verification"] == "selected_outputs"
+    assert manifest["details"]["prerequisite_output_allowlist"] == {
+        "build-splits": [
+            "build-splits/development.bin",
+            "build-splits/metadata.json",
+        ]
+    }
+
+
+def test_selective_prerequisite_verification_rejects_undeclared_output(tmp_path: Path) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    with store.stage("validate-data", now=FIXED_NOW) as transaction:
+        transaction.write_text("validated.csv", "ok")
+    with store.stage("build-splits", now=FIXED_NOW) as transaction:
+        transaction.write_bytes("development.bin", b"development")
+
+    with pytest.raises(ValueError, match="allowlist"):
+        store.stage(
+            "build-photonic-features",
+            prerequisite_verification="selected_outputs",
+            prerequisite_output_allowlist={
+                "build-splits": ("build-splits/not-declared.bin",)
+            },
+            now=FIXED_NOW,
+        )
+
+
+def test_selective_verification_requires_inputs_to_be_allowlisted_and_audited(
+    tmp_path: Path,
+) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    with store.stage("validate-data", now=FIXED_NOW) as transaction:
+        transaction.write_text("validated.csv", "ok")
+    with store.stage("build-splits", now=FIXED_NOW) as transaction:
+        transaction.write_bytes("development.bin", b"development")
+        transaction.write_bytes("holdout.bin", b"holdout")
+
+    with pytest.raises(ValueError, match="allowlisted"):
+        store.stage(
+            "build-photonic-features",
+            input_paths=("build-splits/holdout.bin",),
+            prerequisite_verification="selected_outputs",
+            prerequisite_output_allowlist={
+                "build-splits": ("build-splits/development.bin",)
+            },
+            now=FIXED_NOW,
+        )
+
+    with store.stage(
+        "build-photonic-features",
+        input_paths=("build-splits/development.bin",),
+        prerequisite_verification="selected_outputs",
+        prerequisite_output_allowlist={
+            "build-splits": ("build-splits/development.bin",)
+        },
+        now=FIXED_NOW,
+    ) as transaction:
+        transaction.write_json(
+            "stage_result.json",
+            {"stage": "build-photonic-features", "status": "SUCCESS"},
+        )
+    marker_path = store.root / "build-photonic-features/stage_manifest.json"
+    marker = read_json(marker_path)
+    marker["details"]["prerequisite_verification"] = "full"
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    with pytest.raises(ValueError, match="verification policy"):
+        store.verify_terminal_stage(
+            "build-photonic-features",
+            prerequisite_output_allowlist={
+                "build-splits": ("build-splits/development.bin",)
+            },
+        )
+
+
 def test_stage_exception_leaves_no_outputs_or_success_marker(tmp_path: Path) -> None:
     store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
 

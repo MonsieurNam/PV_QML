@@ -64,10 +64,10 @@ def test_run_pilot_requires_exactly_one_config_source() -> None:
     assert "exactly one" in both.output.lower()
 
 
-def test_unimplemented_service_has_clear_error() -> None:
+def test_photonic_service_reports_missing_run_without_traceback() -> None:
     result = runner.invoke(app, ["build-photonic-features", "--run-dir", "artifacts/run"])
     assert result.exit_code == 1
-    assert "pipeline stages are not implemented" in result.output.lower()
+    assert "run directory does not exist" in result.output.lower()
     assert "traceback" not in result.output.lower()
 
 

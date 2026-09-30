@@ -25,7 +25,7 @@ class PilotServices(Protocol):
 
     def train_baselines(self, run_dir: Path) -> StageResult | None: ...
 
-    def build_photonic_features(self, run_dir: Path) -> None: ...
+    def build_photonic_features(self, run_dir: Path) -> StageResult | None: ...
 
     def benchmark(self, run_dir: Path) -> None: ...
 
@@ -40,7 +40,7 @@ services: PilotServices = DefaultPilotServices()
 def _run_service(action: Callable[[], StageResult | None]) -> None:
     try:
         result = action()
-    except NotImplementedError as error:
+    except (FileNotFoundError, NotImplementedError) as error:
         typer.echo(f"Error: {error}", err=True)
         raise typer.Exit(code=1) from None
     if result is None:

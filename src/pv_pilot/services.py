@@ -8,6 +8,7 @@ import pickle
 import time
 from collections import Counter
 from dataclasses import dataclass
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -16,6 +17,7 @@ import psutil
 import pyarrow.dataset as pds
 
 from . import baselines as baseline_models
+from . import photonics as photonic_features
 from .artifacts import RunStore, sha256_file
 from .config import PilotConfig, load_config
 from .data import (
@@ -86,15 +88,9 @@ class _ResourceGuard:
         self, parent_rss_bytes: int, child_tree_rss_bytes: int, combined_rss_bytes: int
     ) -> None:
         self.peak_rss_bytes = max(self.peak_rss_bytes, parent_rss_bytes)
-        self.peak_parent_rss_bytes = max(
-            self.peak_parent_rss_bytes, parent_rss_bytes
-        )
-        self.peak_child_tree_rss_bytes = max(
-            self.peak_child_tree_rss_bytes, child_tree_rss_bytes
-        )
-        self.peak_combined_rss_bytes = max(
-            self.peak_combined_rss_bytes, combined_rss_bytes
-        )
+        self.peak_parent_rss_bytes = max(self.peak_parent_rss_bytes, parent_rss_bytes)
+        self.peak_child_tree_rss_bytes = max(self.peak_child_tree_rss_bytes, child_tree_rss_bytes)
+        self.peak_combined_rss_bytes = max(self.peak_combined_rss_bytes, combined_rss_bytes)
 
 
 class DefaultPilotServices:
@@ -145,9 +141,7 @@ class DefaultPilotServices:
         status = manifest.get("status")
         if status not in {"SUCCESS", "BLOCKED", "INVALID"}:
             raise ValueError("validate-data has an invalid terminal marker")
-        store.verify_terminal_stage(
-            "validate-data", accepted_statuses=frozenset({str(status)})
-        )
+        store.verify_terminal_stage("validate-data", accepted_statuses=frozenset({str(status)}))
         result_path = store.root / "validate-data/stage_result.json"
         result = StageResult.model_validate_json(result_path.read_text(encoding="utf-8"))
         if status == "SUCCESS":
@@ -163,9 +157,7 @@ class DefaultPilotServices:
         status = manifest.get("status")
         if status not in {"SUCCESS", "INVALID"}:
             raise ValueError("build-splits has an invalid terminal marker")
-        store.verify_terminal_stage(
-            "build-splits", accepted_statuses=frozenset({str(status)})
-        )
+        store.verify_terminal_stage("build-splits", accepted_statuses=frozenset({str(status)}))
         result_path = store.root / "build-splits/stage_result.json"
         result = StageResult.model_validate_json(result_path.read_text(encoding="utf-8"))
         message = (
@@ -184,9 +176,7 @@ class DefaultPilotServices:
         status = manifest.get("status")
         if status not in {"SUCCESS", "INVALID"}:
             raise ValueError("train-baselines has an invalid terminal marker")
-        store.verify_terminal_stage(
-            "train-baselines", accepted_statuses=frozenset({str(status)})
-        )
+        store.verify_terminal_stage("train-baselines", accepted_statuses=frozenset({str(status)}))
         result_path = store.root / "train-baselines/stage_result.json"
         result = StageResult.model_validate_json(result_path.read_text(encoding="utf-8"))
         message = (
@@ -195,6 +185,39 @@ class DefaultPilotServices:
             else "train-baselines already invalid"
         )
         return result.model_copy(update={"message": message})
+
+    @classmethod
+    def _existing_photonic_result(cls, store: RunStore) -> StageResult | None:
+        marker = store.root / "build-photonic-features/stage_manifest.json"
+        if not marker.is_file():
+            return None
+        manifest = cls._read_object(marker)
+        status = manifest.get("status")
+        if status not in {"SUCCESS", "INVALID"}:
+            raise ValueError("build-photonic-features has an invalid terminal marker")
+        allowlist = {
+            "build-splits": (
+                "build-splits/development_features.parquet",
+                "build-splits/feature_manifest.json",
+                "build-splits/minmax_scalers.json",
+            )
+        }
+        store.verify_terminal_stage(
+            "build-photonic-features",
+            accepted_statuses=frozenset({str(status)}),
+            prerequisite_output_allowlist=allowlist,
+        )
+        result_path = store.root / "build-photonic-features/stage_result.json"
+        result = StageResult.model_validate_json(result_path.read_text(encoding="utf-8"))
+        return result.model_copy(
+            update={
+                "message": (
+                    "build-photonic-features already successful"
+                    if status == "SUCCESS"
+                    else "build-photonic-features already invalid"
+                )
+            }
+        )
 
     @staticmethod
     def _publish_baseline_resource_invalid(
@@ -208,9 +231,7 @@ class DefaultPilotServices:
     ) -> StageResult:
         del config
         empty_predictions = pd.DataFrame(columns=baseline_models.prediction_arrow_schema().names)
-        empty_scores = pd.DataFrame(
-            columns=baseline_models.validation_score_arrow_schema().names
-        )
+        empty_scores = pd.DataFrame(columns=baseline_models.validation_score_arrow_schema().names)
         prediction_bytes = baseline_models.prediction_parquet_bytes(empty_predictions)
         validation_bytes = baseline_models.validation_scores_parquet_bytes(empty_scores)
         model_bytes = pickle.dumps({}, protocol=5)
@@ -513,8 +534,7 @@ class DefaultPilotServices:
         canonical = result.canonical
         exclusions = result.exclusions
         site_counts = {
-            str(key): int(value)
-            for key, value in sorted(Counter(canonical["site_id"]).items())
+            str(key): int(value) for key, value in sorted(Counter(canonical["site_id"]).items())
         }
         start_utc = None
         end_utc = None
@@ -699,9 +719,7 @@ class DefaultPilotServices:
             status=StageStatus.INVALID,
             message=message,
             artifacts=self._split_artifacts(),
-            details=tuple(
-                DetailEntry(key=key, value=value) for key, value in details.items()
-            ),
+            details=tuple(DetailEntry(key=key, value=value) for key, value in details.items()),
         )
         ledger = self._split_ledger(
             guard=guard,
@@ -777,9 +795,7 @@ class DefaultPilotServices:
             feature_bytes = feature_dataframe_parquet_bytes(build.features, config)
             guard.checkpoint(declared + len(feature_bytes))
             development_bytes = feature_dataframe_parquet_bytes(
-                build.features.loc[
-                    build.features["split"].isin(("train", "validation"))
-                ],
+                build.features.loc[build.features["split"].isin(("train", "validation"))],
                 config,
             )
             holdout_bytes = feature_dataframe_parquet_bytes(
@@ -830,9 +846,7 @@ class DefaultPilotServices:
             artifacts=self._split_artifacts(),
             details=(
                 DetailEntry(key="scientific_decision", value="NOT_EVALUATED"),
-                DetailEntry(
-                    key="split_counts", value=build.feature_manifest["split_counts"]
-                ),
+                DetailEntry(key="split_counts", value=build.feature_manifest["split_counts"]),
             ),
         )
         ledger = self._split_ledger(
@@ -897,19 +911,12 @@ class DefaultPilotServices:
         development_path = store.root / "build-splits/development_features.parquet"
         holdout_path = store.root / "build-splits/holdout_features.parquet"
         manifest_path = store.root / "build-splits/feature_manifest.json"
-        split_stage_manifest = self._read_object(
-            store.root / "build-splits/stage_manifest.json"
-        )
+        split_stage_manifest = self._read_object(store.root / "build-splits/stage_manifest.json")
         if (
             split_stage_manifest.get("schema_version") != "1.0"
             or split_stage_manifest.get("prerequisite_manifest_hashes")
-            != {
-                "validate-data": sha256_file(
-                    store.root / "validate-data/stage_manifest.json"
-                )
-            }
-            or
-            split_stage_manifest.get("stage") != "build-splits"
+            != {"validate-data": sha256_file(store.root / "validate-data/stage_manifest.json")}
+            or split_stage_manifest.get("stage") != "build-splits"
             or split_stage_manifest.get("status") != "SUCCESS"
             or split_stage_manifest.get("config_hash") != store.config_hash
         ):
@@ -934,8 +941,7 @@ class DefaultPilotServices:
                 raise ValueError(f"build-splits marker is missing partition output: {required}")
         if (
             not development_path.is_file()
-            or sha256_file(development_path)
-            != expected_output_hashes[development_relative]
+            or sha256_file(development_path) != expected_output_hashes[development_relative]
         ):
             raise ValueError("development partition checksum mismatch")
         for relative_path in (
@@ -943,10 +949,7 @@ class DefaultPilotServices:
             "build-splits/minmax_scalers.json",
         ):
             path = store.root / relative_path
-            if (
-                not path.is_file()
-                or sha256_file(path) != expected_output_hashes[relative_path]
-            ):
+            if not path.is_file() or sha256_file(path) != expected_output_hashes[relative_path]:
                 raise ValueError(f"split metadata checksum mismatch: {relative_path}")
         if not holdout_path.is_file():
             raise ValueError("holdout partition is missing")
@@ -957,9 +960,7 @@ class DefaultPilotServices:
         )
         try:
             guard.checkpoint(development_path.stat().st_size)
-            development = pds.dataset(
-                development_path, format="parquet"
-            ).to_table().to_pandas()
+            development = pds.dataset(development_path, format="parquet").to_table().to_pandas()
             declared = int(development.memory_usage(index=True, deep=True).sum())
             guard.checkpoint(declared)
         except _ResourceLimitExceeded as error:
@@ -978,9 +979,7 @@ class DefaultPilotServices:
                     config=config,
                     guard=guard,
                     gate="data_or_split_contract",
-                    message=(
-                        f"feature manifest {key} does not match the frozen baseline contract"
-                    ),
+                    message=(f"feature manifest {key} does not match the frozen baseline contract"),
                     resource_status="WITHIN_LIMIT",
                 )
         expected_xgb = [
@@ -1026,17 +1025,17 @@ class DefaultPilotServices:
             raise baseline_models.BaselineContractError(
                 "feature manifest combined partition record is invalid"
             )
-        development_order = development.sort_values(
-            list(PARTITION_ORDER_COLUMNS), kind="stable"
-        )["sample_id"].astype(str).tolist()
+        development_order = (
+            development.sort_values(list(PARTITION_ORDER_COLUMNS), kind="stable")["sample_id"]
+            .astype(str)
+            .tolist()
+        )
         if (
             development_contract.get("row_count") != len(development)
-            or development_contract.get("schema_sha256")
-            != feature_schema_sha256(config)
+            or development_contract.get("schema_sha256") != feature_schema_sha256(config)
             or development_contract.get("path") != development_relative
             or development_contract.get("splits") != ["train", "validation"]
-            or development_contract.get("order_policy")
-            != list(PARTITION_ORDER_COLUMNS)
+            or development_contract.get("order_policy") != list(PARTITION_ORDER_COLUMNS)
             or set(development["split"].astype(str)) != {"train", "validation"}
             or development["sample_id"].duplicated().any()
             or development["sample_id"].astype(str).tolist() != development_order
@@ -1050,9 +1049,7 @@ class DefaultPilotServices:
         development_sample_hash = hashlib.sha256(
             development_sample_payload.encode("utf-8")
         ).hexdigest()
-        declared_development_hash = development_contract.get(
-            "sample_id_order_sha256"
-        )
+        declared_development_hash = development_contract.get("sample_id_order_sha256")
         if declared_development_hash != development_sample_hash:
             raise baseline_models.BaselineContractError(
                 "development partition sample order hash mismatch"
@@ -1077,16 +1074,12 @@ class DefaultPilotServices:
                     "holdout partition violates its manifest row count"
                 )
             if (
-                holdout_contract.get("schema_sha256")
-                != feature_schema_sha256(config)
+                holdout_contract.get("schema_sha256") != feature_schema_sha256(config)
                 or holdout_contract.get("path") != holdout_relative
                 or holdout_contract.get("splits") != ["test"]
-                or holdout_contract.get("order_policy")
-                != list(PARTITION_ORDER_COLUMNS)
-                or combined_contract.get("schema_sha256")
-                != feature_schema_sha256(config)
-                or combined_contract.get("membership_policy")
-                != COMBINED_MEMBERSHIP_POLICY
+                or holdout_contract.get("order_policy") != list(PARTITION_ORDER_COLUMNS)
+                or combined_contract.get("schema_sha256") != feature_schema_sha256(config)
+                or combined_contract.get("membership_policy") != COMBINED_MEMBERSHIP_POLICY
             ):
                 raise baseline_models.BaselineContractError(
                     "feature partition schema hash mismatch"
@@ -1095,9 +1088,9 @@ class DefaultPilotServices:
                 set(holdout["split"].astype(str)) != {"test"}
                 or holdout["sample_id"].duplicated().any()
                 or holdout["sample_id"].astype(str).tolist()
-                != holdout.sort_values(
-                    list(PARTITION_ORDER_COLUMNS), kind="stable"
-                )["sample_id"].astype(str).tolist()
+                != holdout.sort_values(list(PARTITION_ORDER_COLUMNS), kind="stable")["sample_id"]
+                .astype(str)
+                .tolist()
             ):
                 raise baseline_models.BaselineContractError(
                     "holdout partition violates its split or uniqueness contract"
@@ -1109,9 +1102,7 @@ class DefaultPilotServices:
             holdout_sample_payload = json.dumps(
                 holdout["sample_id"].astype(str).tolist(), separators=(",", ":")
             )
-            holdout_sample_hash = hashlib.sha256(
-                holdout_sample_payload.encode("utf-8")
-            ).hexdigest()
+            holdout_sample_hash = hashlib.sha256(holdout_sample_payload.encode("utf-8")).hexdigest()
             declared_holdout_hash = holdout_contract.get("sample_id_order_sha256")
             if declared_holdout_hash != holdout_sample_hash:
                 raise baseline_models.BaselineContractError(
@@ -1126,9 +1117,7 @@ class DefaultPilotServices:
             combined_sample_payload = json.dumps(
                 sorted([*development_ids, *holdout_ids]), separators=(",", ":")
             )
-            declared_combined_hash = combined_contract.get(
-                "sample_id_membership_sha256"
-            )
+            declared_combined_hash = combined_contract.get("sample_id_membership_sha256")
             if (
                 hashlib.sha256(combined_sample_payload.encode("utf-8")).hexdigest()
                 != declared_combined_hash
@@ -1145,8 +1134,7 @@ class DefaultPilotServices:
                     time.monotonic()
                     + max(
                         0.0,
-                        config.resources.max_wall_clock_seconds
-                        - (time.perf_counter() - started),
+                        config.resources.max_wall_clock_seconds - (time.perf_counter() - started),
                     )
                 ),
                 resource_checkpoint=guard.checkpoint,
@@ -1201,9 +1189,7 @@ class DefaultPilotServices:
         selected_object = training.selection_manifest.get("selected")
         if not isinstance(selected_object, dict):
             raise RuntimeError("baseline selection manifest lost selected configurations")
-        serialization_probe = development.loc[
-            development["split"] == "train"
-        ].iloc[:3].copy()
+        serialization_probe = development.loc[development["split"] == "train"].iloc[:3].copy()
         try:
             original_probe_predictions = baseline_models.predict_test_models(
                 serialization_probe,
@@ -1237,9 +1223,7 @@ class DefaultPilotServices:
                 guard=guard,
                 gate="fit_memory_rss",
             )
-        prediction_columns = baseline_models.quantile_columns(
-            tuple(config.evaluation.quantiles)
-        )
+        prediction_columns = baseline_models.quantile_columns(tuple(config.evaluation.quantiles))
         if not (
             original_probe_predictions.loc[:, prediction_columns].to_numpy(dtype=float)
             == restored_predictions.loc[:, prediction_columns].to_numpy(dtype=float)
@@ -1333,8 +1317,351 @@ class DefaultPilotServices:
             )
         return result
 
-    def build_photonic_features(self, run_dir: Path) -> None:
-        self._unimplemented("build-photonic-features")
+    @staticmethod
+    def _photonic_allowlist() -> dict[str, tuple[str, ...]]:
+        return {
+            "build-splits": (
+                "build-splits/development_features.parquet",
+                "build-splits/feature_manifest.json",
+                "build-splits/minmax_scalers.json",
+            )
+        }
+
+    @staticmethod
+    def _publish_photonic_invalid(
+        *,
+        store: RunStore,
+        guard: _ResourceGuard,
+        gate: str,
+        message: str,
+    ) -> StageResult:
+        empty_bytes = photonic_features.feature_parquet_bytes(
+            pd.DataFrame(columns=photonic_features.feature_arrow_schema().names)
+        )
+        result = StageResult(
+            stage="build-photonic-features",
+            status=StageStatus.INVALID,
+            message=message,
+            artifacts=(
+                Path("build-photonic-features/development_photonic_features.parquet"),
+                Path("build-photonic-features/state_spaces.json"),
+                Path("build-photonic-features/circuit_manifest.json"),
+                Path("build-photonic-features/feature_manifest.json"),
+                Path("build-photonic-features/resource_ledger.json"),
+            ),
+            details=(
+                DetailEntry(key="resource_gate", value=gate),
+                DetailEntry(key="scientific_decision", value="NOT_EVALUATED"),
+            ),
+        )
+        ledger = {
+            "schema_version": "1.0",
+            "stage": "build-photonic-features",
+            "status": "invalid",
+            "resource_status": "EXCEEDED" if gate != "data_or_split_contract" else "WITHIN_LIMIT",
+            "resource_gate": gate,
+            "wall_clock_seconds": time.perf_counter() - guard.started,
+            "peak_rss_bytes": guard.peak_rss_bytes,
+            "peak_declared_bytes": guard.peak_declared_bytes,
+            "max_wall_clock_seconds": guard.wall_seconds,
+            "max_memory_bytes": guard.memory_bytes,
+            "cpu_only": True,
+            "scientific_decision": "NOT_EVALUATED",
+        }
+        with store.stage(
+            "build-photonic-features",
+            input_paths=(
+                "build-splits/development_features.parquet",
+                "build-splits/feature_manifest.json",
+                "build-splits/minmax_scalers.json",
+            ),
+            prerequisite_verification="selected_outputs",
+            prerequisite_output_allowlist=DefaultPilotServices._photonic_allowlist(),
+            terminal_status="INVALID",
+            details={
+                "result_status": "invalid",
+                "scientific_decision": "NOT_EVALUATED",
+                "resource_gate": gate,
+            },
+        ) as transaction:
+            transaction.write_bytes("development_photonic_features.parquet", empty_bytes)
+            transaction.write_json("state_spaces.json", {"schema_version": "1.0", "spaces": []})
+            transaction.write_json(
+                "circuit_manifest.json",
+                {"schema_version": "1.0", "status": "invalid", "circuits": []},
+            )
+            transaction.write_json(
+                "feature_manifest.json",
+                {
+                    "schema_version": "1.0",
+                    "status": "invalid",
+                    "scientific_decision": "NOT_EVALUATED",
+                    "row_count": 0,
+                },
+            )
+            transaction.write_json("resource_ledger.json", ledger)
+            transaction.write_json("stage_result.json", deterministic_data(result))
+        return result
+
+    def build_photonic_features(self, run_dir: Path) -> StageResult:
+        started = time.perf_counter()
+        store = RunStore.open(run_dir)
+        existing = self._existing_photonic_result(store)
+        if existing is not None:
+            return existing
+        config = self._run_config(store)
+        guard = _ResourceGuard(
+            started=started,
+            wall_seconds=config.resources.max_wall_clock_seconds,
+            memory_bytes=int(config.resources.max_memory_gb * 1024**3),
+        )
+        required_inputs = (
+            "build-splits/development_features.parquet",
+            "build-splits/feature_manifest.json",
+            "build-splits/minmax_scalers.json",
+        )
+        try:
+            store.verify_selected_stage_outputs("build-splits", required_inputs)
+            development_path = store.root / required_inputs[0]
+            guard.checkpoint(development_path.stat().st_size)
+            development = pds.dataset(development_path, format="parquet").to_table().to_pandas()
+            declared = int(development.memory_usage(index=True, deep=True).sum())
+            guard.checkpoint(declared)
+            split_manifest = self._read_object(store.root / required_inputs[1])
+            scalers = self._read_object(store.root / required_inputs[2])
+            expected_profiles = {
+                "matched4_columns": list(MATCHED4_COLUMNS),
+                "matched6_columns": list(MATCHED6_COLUMNS),
+            }
+            for key, expected in expected_profiles.items():
+                if split_manifest.get(key) != expected:
+                    raise photonic_features.PhotonicContractError(
+                        f"feature manifest {key} violates the photonic contract"
+                    )
+            partitions = split_manifest.get("partitions")
+            partition = partitions.get("development") if isinstance(partitions, dict) else None
+            if not isinstance(partition, dict):
+                raise photonic_features.PhotonicContractError(
+                    "feature manifest has no development partition contract"
+                )
+            ordered_ids = (
+                development.sort_values(list(PARTITION_ORDER_COLUMNS), kind="stable")["sample_id"]
+                .astype(str)
+                .tolist()
+            )
+            sample_hash = hashlib.sha256(
+                json.dumps(
+                    development["sample_id"].astype(str).tolist(), separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            if (
+                partition.get("path") != required_inputs[0]
+                or partition.get("splits") != ["train", "validation"]
+                or partition.get("row_count") != len(development)
+                or partition.get("schema_sha256") != feature_schema_sha256(config)
+                or partition.get("order_policy") != list(PARTITION_ORDER_COLUMNS)
+                or partition.get("sample_id_order_sha256") != sample_hash
+                or development["sample_id"].astype(str).tolist() != ordered_ids
+            ):
+                raise photonic_features.PhotonicContractError(
+                    "development partition violates its immutable manifest"
+                )
+            for profile, columns in (
+                ("matched4", MATCHED4_COLUMNS),
+                ("matched6", MATCHED6_COLUMNS),
+            ):
+                record = scalers.get(profile)
+                if (
+                    not isinstance(record, dict)
+                    or record.get("schema_version") != FEATURE_SCHEMA_VERSION
+                    or record.get("feature_order") != list(columns)
+                    or record.get("fitted_split") != "train"
+                ):
+                    raise photonic_features.PhotonicContractError(
+                        f"{profile} train-fitted scaler order is invalid"
+                    )
+            extraction = photonic_features.build_development_photonic_features(
+                development,
+                modes=tuple(config.photonics.modes),
+                photons=config.photonics.primary_photons,
+                phase_scales=tuple(config.photonics.phase_scales),
+                circuit_seeds=tuple(config.seeds.circuit_seeds),
+                resource_checkpoint=guard.checkpoint,
+            )
+            feature_bytes = photonic_features.feature_parquet_bytes(extraction.features)
+            circuit_payloads: dict[str, bytes] = {}
+            circuit_records: list[dict[str, object]] = []
+            for key, circuit in sorted(extraction.circuits.items()):
+                payload = photonic_features.circuit_npz_bytes(circuit)
+                restored = photonic_features.load_circuit_npz(payload)
+                if photonic_features.circuit_checksum(
+                    restored
+                ) != photonic_features.circuit_checksum(circuit):
+                    raise RuntimeError("circuit NPZ checksum round-trip failed")
+                circuit_payloads[f"circuits/{key}.npz"] = payload
+                circuit_records.append(
+                    {
+                        "key": key,
+                        "path": f"build-photonic-features/circuits/{key}.npz",
+                        "circuit_seed": circuit.circuit_seed,
+                        "modes": circuit.modes,
+                        "photons": circuit.photons,
+                        "circuit_sha256": photonic_features.circuit_checksum(circuit),
+                        "npz_sha256": hashlib.sha256(payload).hexdigest(),
+                        "state_order_sha256": circuit.state_order_sha256,
+                    }
+                )
+            declared += len(feature_bytes) + sum(map(len, circuit_payloads.values()))
+            guard.checkpoint(declared)
+        except _ResourceLimitExceeded as error:
+            return self._publish_photonic_invalid(
+                store=store,
+                guard=guard,
+                gate=error.gate,
+                message="photonic feature extraction exceeded a configured resource cap",
+            )
+        except photonic_features.PhotonicContractError as error:
+            return self._publish_photonic_invalid(
+                store=store,
+                guard=guard,
+                gate="data_or_split_contract",
+                message=f"photonic input violates the data contract: {error}",
+            )
+
+        state_spaces = {
+            "schema_version": "1.0",
+            "ordering": "ascending_lexicographic_occupation_tuple",
+            "spaces": [
+                {
+                    "modes": modes,
+                    "photons": config.photonics.primary_photons,
+                    "dimension": photonic_features.fock_dimension(
+                        modes, config.photonics.primary_photons
+                    ),
+                    "states": [
+                        list(state)
+                        for state in photonic_features.enumerate_fock_states(
+                            modes, config.photonics.primary_photons
+                        )
+                    ],
+                    "state_order_sha256": photonic_features.state_order_checksum(
+                        photonic_features.enumerate_fock_states(
+                            modes, config.photonics.primary_photons
+                        )
+                    ),
+                }
+                for modes in config.photonics.modes
+            ],
+        }
+        split_marker_hash = sha256_file(store.root / "build-splits/stage_manifest.json")
+        input_hashes = {path: sha256_file(store.root / path) for path in required_inputs}
+        circuit_manifest = {
+            "schema_version": "1.0",
+            "status": "success",
+            "backend": {"name": "SLOS", "class": "SLOSExqaliburBackend"},
+            "versions": {
+                "perceval-quandela": version("perceval-quandela"),
+                "exqalibur": version("exqalibur"),
+            },
+            "construction": "V1 -> diag(exp(i*c*x)) -> V2",
+            "matrix_convention": "V2 @ phase @ V1",
+            "haar_generator": "numpy.Generator.normal+QR-phase-normalization",
+            "circuits": circuit_records,
+        }
+        feature_manifest = {
+            "schema_version": photonic_features.PHOTONIC_FEATURE_SCHEMA_VERSION,
+            "status": "success",
+            "partition": "development_only",
+            "holdout_opened": False,
+            "exact": True,
+            "ideal": True,
+            "sampling": False,
+            "loss_model": False,
+            "qpu": False,
+            "controls": ["indistinguishable", "distinguishable"],
+            "modes": list(config.photonics.modes),
+            "photons": config.photonics.primary_photons,
+            "phase_scales": list(config.photonics.phase_scales),
+            "circuit_seeds": list(config.seeds.circuit_seeds),
+            "development_sample_count": len(development),
+            "row_count": len(extraction.features),
+            "expected_row_count": len(development)
+            * len(config.photonics.modes)
+            * len(config.photonics.phase_scales)
+            * len(config.seeds.circuit_seeds)
+            * 2,
+            "feature_sha256": hashlib.sha256(feature_bytes).hexdigest(),
+            "split_marker_sha256": split_marker_hash,
+            "input_hashes": input_hashes,
+            "scaler_sha256": input_hashes["build-splits/minmax_scalers.json"],
+            "scaled_feature_order": {
+                "4": [f"matched4_scaled_{index}" for index in range(4)],
+                "6": [f"matched6_scaled_{index}" for index in range(6)],
+            },
+            "probability_tolerance": photonic_features.PROBABILITY_TOLERANCE,
+            "scientific_decision": "NOT_EVALUATED",
+        }
+        if feature_manifest["row_count"] != feature_manifest["expected_row_count"]:
+            raise RuntimeError("photonic feature candidate matrix is incomplete")
+        guard.sample_without_enforcement()
+        ledger = {
+            "schema_version": "1.0",
+            "stage": "build-photonic-features",
+            "status": "success",
+            "resource_status": "WITHIN_LIMIT",
+            "wall_clock_seconds": time.perf_counter() - started,
+            "peak_rss_bytes": guard.peak_rss_bytes,
+            "peak_declared_bytes": guard.peak_declared_bytes,
+            "max_wall_clock_seconds": guard.wall_seconds,
+            "max_memory_bytes": guard.memory_bytes,
+            "cpu_only": True,
+            "configurations": list(extraction.configuration_ledger),
+        }
+        result = StageResult(
+            stage="build-photonic-features",
+            status=StageStatus.SUCCESS,
+            message="exact development photonic features built successfully",
+            artifacts=(
+                Path("build-photonic-features/development_photonic_features.parquet"),
+                Path("build-photonic-features/state_spaces.json"),
+                Path("build-photonic-features/circuit_manifest.json"),
+                Path("build-photonic-features/feature_manifest.json"),
+                Path("build-photonic-features/resource_ledger.json"),
+            ),
+            details=(
+                DetailEntry(key="scientific_decision", value="NOT_EVALUATED"),
+                DetailEntry(key="holdout_opened", value=False),
+            ),
+        )
+        try:
+            with store.stage(
+                "build-photonic-features",
+                input_paths=required_inputs,
+                prerequisite_verification="selected_outputs",
+                prerequisite_output_allowlist=self._photonic_allowlist(),
+                details={
+                    "result_status": "success",
+                    "scientific_decision": "NOT_EVALUATED",
+                    "holdout_opened": False,
+                },
+                commit_guard=guard.checkpoint,
+            ) as transaction:
+                transaction.write_bytes("development_photonic_features.parquet", feature_bytes)
+                transaction.write_json("state_spaces.json", state_spaces)
+                transaction.write_json("circuit_manifest.json", circuit_manifest)
+                for path, payload in sorted(circuit_payloads.items()):
+                    transaction.write_bytes(path, payload)
+                transaction.write_json("feature_manifest.json", feature_manifest)
+                transaction.write_json("resource_ledger.json", ledger)
+                transaction.write_json("stage_result.json", deterministic_data(result))
+        except _ResourceLimitExceeded as error:
+            return self._publish_photonic_invalid(
+                store=store,
+                guard=guard,
+                gate=error.gate,
+                message="photonic feature publication exceeded a configured resource cap",
+            )
+        return result
 
     def benchmark(self, run_dir: Path) -> None:
         self._unimplemented("benchmark")

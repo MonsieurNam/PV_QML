@@ -992,6 +992,50 @@ class RunStore:
         verified.add(stage)
         return sha256_file(path)
 
+    def _verify_stage_selected_outputs(
+        self,
+        stage: str,
+        allowlist: tuple[str, ...],
+    ) -> str:
+        """Verify a SUCCESS marker and only explicitly selected committed outputs.
+
+        This mode protects unopened partitions (notably scientific holdout data) while
+        still binding a downstream SUCCESS stage to immutable, declared inputs.  The
+        complete prerequisite marker remains structurally checked, but output bytes
+        outside ``allowlist`` are never opened or hashed.
+        """
+
+        marker_hash = self._verify_stage_marker_only(stage)
+        marker_path = self.root / stage / "stage_manifest.json"
+        manifest = self._read_json_file(marker_path)
+        raw_outputs = manifest.get("outputs")
+        if not isinstance(raw_outputs, list):
+            raise ValueError(f"stage {stage!r} marker has invalid outputs")
+        output_hashes = {
+            record.get("path"): record.get("sha256")
+            for record in raw_outputs
+            if isinstance(record, dict)
+        }
+        normalized: list[str] = []
+        for raw_path in allowlist:
+            target = self._validated_target(raw_path)
+            relative = target.relative_to(self.root).as_posix()
+            if not relative.startswith(f"{stage}/"):
+                raise ValueError("prerequisite output allowlist crosses a stage boundary")
+            if relative in normalized:
+                raise ValueError("prerequisite output allowlist contains duplicates")
+            expected = output_hashes.get(relative)
+            if not isinstance(expected, str):
+                raise ValueError(
+                    f"prerequisite output allowlist path is not declared: {relative}"
+                )
+            if not target.is_file() or target.is_symlink() or sha256_file(target) != expected:
+                raise ValueError(f"prerequisite output checksum mismatch: {relative}")
+            normalized.append(relative)
+        if not normalized:
+            raise ValueError("prerequisite output allowlist cannot be empty")
+        return marker_hash
+
     def _verify_terminal_result_contract(self, manifest: Mapping[str, object]) -> None:
         """Bind the conventional JSON result to its marker even if declaration is removed."""
 
@@ -1036,6 +1080,7 @@ class RunStore:
         stage: str,
         *,
         accepted_statuses: frozenset[str] = frozenset({"SUCCESS"}),
+        prerequisite_output_allowlist: Mapping[str, Iterable[str | Path]] | None = None,
     ) -> str:
         """Verify a terminal stage and all outputs without relaxing prerequisites."""
 
@@ -1043,7 +1088,79 @@ class RunStore:
             raise ValueError(f"unknown pipeline stage: {stage!r}")
         if not accepted_statuses or not accepted_statuses <= {"SUCCESS", "BLOCKED", "INVALID"}:
             raise ValueError("accepted terminal statuses are invalid")
+        if prerequisite_output_allowlist is not None:
+            if set(prerequisite_output_allowlist) != set(STAGE_PREREQUISITES[stage]):
+                raise ValueError("prerequisite output allowlist must cover exact prerequisites")
+            prerequisite_hashes = {
+                prerequisite: self._verify_stage_selected_outputs(
+                    prerequisite,
+                    tuple(str(path) for path in prerequisite_output_allowlist[prerequisite]),
+                )
+                for prerequisite in STAGE_PREREQUISITES[stage]
+            }
+            marker_path = self.root / stage / "stage_manifest.json"
+            if not marker_path.is_file() or marker_path.is_symlink():
+                raise ValueError(f"stage {stage!r} has no terminal marker")
+            manifest = self._read_json_file(marker_path)
+            normalized_allowlist = {
+                prerequisite: sorted(
+                    self._validated_target(path).relative_to(self.root).as_posix()
+                    for path in prerequisite_output_allowlist[prerequisite]
+                )
+                for prerequisite in STAGE_PREREQUISITES[stage]
+            }
+            details = manifest.get("details")
+            if (
+                manifest.get("schema_version") != SCHEMA_VERSION
+                or manifest.get("stage") != stage
+                or manifest.get("status") not in accepted_statuses
+                or manifest.get("config_hash") != self.config_hash
+                or manifest.get("prerequisite_manifest_hashes") != prerequisite_hashes
+                or not isinstance(details, dict)
+                or details.get("prerequisite_verification") != "selected_outputs"
+                or details.get("prerequisite_output_allowlist") != normalized_allowlist
+            ):
+                raise ValueError(
+                    f"stage {stage!r} has an invalid selective verification policy"
+                )
+            inputs = manifest.get("input_hashes")
+            if not isinstance(inputs, dict):
+                raise ValueError(f"stage {stage!r} has invalid input hashes")
+            for relative, expected in inputs.items():
+                if not isinstance(relative, str) or not isinstance(expected, str):
+                    raise ValueError(f"stage {stage!r} has invalid input hashes")
+                target = self._validated_target(relative)
+                if not target.is_file() or target.is_symlink() or sha256_file(target) != expected:
+                    raise ValueError(f"stage input checksum mismatch: {relative}")
+            outputs = manifest.get("outputs")
+            if not isinstance(outputs, list):
+                raise ValueError(f"stage {stage!r} has invalid outputs")
+            for record in outputs:
+                if not isinstance(record, dict):
+                    raise ValueError(f"stage {stage!r} has invalid outputs")
+                relative = record.get("path")
+                expected = record.get("sha256")
+                if not isinstance(relative, str) or not isinstance(expected, str):
+                    raise ValueError(f"stage {stage!r} has invalid outputs")
+                target = self._validated_target(relative)
+                if not target.is_file() or target.is_symlink() or sha256_file(target) != expected:
+                    raise ValueError(f"stage output checksum mismatch: {relative}")
+            self._verify_terminal_result_contract(manifest)
+            return sha256_file(marker_path)
         return self._verify_stage(stage, accepted_statuses=accepted_statuses)
+
+    def verify_selected_stage_outputs(
+        self, stage: str, output_paths: Iterable[str | Path]
+    ) -> str:
+        """Public audited boundary for holdout-safe prerequisite verification."""
+
+        if stage not in STAGE_PREREQUISITES:
+            raise ValueError(f"unknown pipeline stage: {stage!r}")
+        paths = tuple(
+            self._validated_target(path).relative_to(self.root).as_posix()
+            for path in output_paths
+        )
+        return self._verify_stage_selected_outputs(stage, paths)
 
     def stage(
         self,
@@ -1053,7 +1170,10 @@ class RunStore:
         external_input_hashes: Mapping[str | Path, str] | None = None,
         details: Mapping[str, object] | None = None,
         terminal_status: Literal["SUCCESS", "BLOCKED", "INVALID"] = "SUCCESS",
-        prerequisite_verification: Literal["full", "marker_only"] = "full",
+        prerequisite_verification: Literal[
+            "full", "marker_only", "selected_outputs"
+        ] = "full",
+        prerequisite_output_allowlist: Mapping[str, Iterable[str | Path]] | None = None,
         commit_guard: CommitGuard | None = None,
         config_hash: str | None = None,
         now: Now = None,
@@ -1064,10 +1184,19 @@ class RunStore:
             raise ValueError(f"unknown pipeline stage: {stage!r}")
         if terminal_status not in _TERMINAL_STATUSES:
             raise ValueError("terminal status must be SUCCESS, BLOCKED, or INVALID")
-        if prerequisite_verification not in {"full", "marker_only"}:
+        if prerequisite_verification not in {"full", "marker_only", "selected_outputs"}:
             raise ValueError("prerequisite verification mode is invalid")
         if prerequisite_verification == "marker_only" and terminal_status != "INVALID":
             raise ValueError("marker_only prerequisite verification is limited to INVALID stages")
+        if prerequisite_verification == "selected_outputs":
+            if prerequisite_output_allowlist is None:
+                raise ValueError("selected_outputs requires a prerequisite output allowlist")
+            if set(prerequisite_output_allowlist) != set(STAGE_PREREQUISITES[stage]):
+                raise ValueError("prerequisite output allowlist must cover exact prerequisites")
+        elif prerequisite_output_allowlist is not None:
+            raise ValueError(
+                "prerequisite output allowlist requires selected_outputs verification"
+            )
         with self._publication_lock():
             self._recover_publication_journals()
             self._cleanup_stale_stage_directories()
@@ -1076,17 +1205,40 @@ class RunStore:
         if marker.exists() or marker.is_symlink():
             raise FileExistsError(f"stage {stage!r} is already completed")
         prerequisite_hashes: dict[str, str] = {}
+        normalized_allowlist: dict[str, list[str]] = {}
         for prerequisite in STAGE_PREREQUISITES[stage]:
             if prerequisite_verification == "marker_only":
                 prerequisite_hashes[prerequisite] = self._verify_stage_marker_only(
                     prerequisite
                 )
+            elif prerequisite_verification == "selected_outputs":
+                assert prerequisite_output_allowlist is not None
+                paths = tuple(
+                    self._validated_target(path).relative_to(self.root).as_posix()
+                    for path in prerequisite_output_allowlist[prerequisite]
+                )
+                prerequisite_hashes[prerequisite] = self._verify_stage_selected_outputs(
+                    prerequisite, paths
+                )
+                normalized_allowlist[prerequisite] = sorted(paths)
             else:
                 prerequisite_hashes[prerequisite] = self._verify_stage(prerequisite)
         inputs: dict[str, str] = {}
+        selected_paths = {
+            path
+            for paths in normalized_allowlist.values()
+            for path in paths
+        }
         for input_path in input_paths:
             target = self._validated_target(input_path)
             relative = target.relative_to(self.root).as_posix()
+            if (
+                prerequisite_verification == "selected_outputs"
+                and relative not in selected_paths
+            ):
+                raise ValueError(
+                    "selected-output stage inputs must be explicitly allowlisted"
+                )
             if not target.is_file():
                 raise FileNotFoundError(f"stage input is not a file: {relative}")
             inputs[relative] = sha256_file(target)
@@ -1112,6 +1264,14 @@ class RunStore:
                 **(
                     {"prerequisite_verification": "marker_only"}
                     if prerequisite_verification == "marker_only"
+                    else {}
+                ),
+                **(
+                    {
+                        "prerequisite_verification": "selected_outputs",
+                        "prerequisite_output_allowlist": normalized_allowlist,
+                    }
+                    if prerequisite_verification == "selected_outputs"
                     else {}
                 ),
             },
