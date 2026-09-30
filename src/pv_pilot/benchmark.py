@@ -7,7 +7,7 @@ import io
 import json
 import math
 import pickle
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from importlib.metadata import version
 from typing import Any, cast
@@ -44,6 +44,7 @@ from .photonics import (
 from .seeds import SeedComponent, SeedManager
 
 FloatArray = NDArray[np.float64]
+ResourceCheckpoint = Callable[[int], None]
 TIE_TOLERANCE = 1e-12
 CONTROLS: tuple[Control, ...] = ("indistinguishable", "distinguishable")
 
@@ -88,6 +89,62 @@ class PhotonicSelectionResult:
     validation_scores: pd.DataFrame
     selected_models: dict[tuple[str, int], PhotonicSeedModel]
     diagnostics: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class _ValidatedHoldoutFeatures:
+    """Opaque proof that selected holdout features passed trusted validation once."""
+
+    _frame: pd.DataFrame
+    _integrity_sha256: str
+
+    @property
+    def frame(self) -> pd.DataFrame:
+        return self._frame.copy(deep=True)
+
+
+def _holdout_integrity_sha256(
+    frame: pd.DataFrame, resource_checkpoint: ResourceCheckpoint
+) -> str:
+    declared = int(frame.memory_usage(index=True, deep=True).sum())
+    resource_checkpoint(declared)
+    payload = pickle.dumps(frame, protocol=5)
+    resource_checkpoint(declared + len(payload))
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _make_validated_holdout_features(
+    frame: pd.DataFrame, resource_checkpoint: ResourceCheckpoint
+) -> _ValidatedHoldoutFeatures:
+    declared = int(frame.memory_usage(index=True, deep=True).sum())
+    resource_checkpoint(declared)
+    trusted = frame.copy(deep=True)
+    resource_checkpoint(declared * 2)
+    token = object.__new__(_ValidatedHoldoutFeatures)
+    object.__setattr__(token, "_frame", trusted)
+    object.__setattr__(
+        token,
+        "_integrity_sha256",
+        _holdout_integrity_sha256(trusted, resource_checkpoint),
+    )
+    return token
+
+
+def _consume_validated_holdout_features(
+    token: _ValidatedHoldoutFeatures,
+    resource_checkpoint: ResourceCheckpoint,
+) -> pd.DataFrame:
+    if not isinstance(token, _ValidatedHoldoutFeatures):
+        raise PhotonicBenchmarkContractError("validated holdout token is required")
+    if (
+        _holdout_integrity_sha256(token._frame, resource_checkpoint)
+        != token._integrity_sha256
+    ):
+        raise PhotonicBenchmarkContractError("validated holdout token integrity check failed")
+    declared = int(token._frame.memory_usage(index=True, deep=True).sum())
+    result = token._frame.copy(deep=True)
+    resource_checkpoint(declared * 2)
+    return result
 
 
 def _finite_matrix(values: NDArray[Any], label: str) -> FloatArray:
@@ -196,6 +253,7 @@ def _validate_development(
     development_reference: pd.DataFrame,
     trusted_circuits: Mapping[tuple[int, int], CircuitDefinition],
     trusted_state_spaces: Mapping[tuple[int, int], tuple[int, str]],
+    resource_checkpoint: ResourceCheckpoint,
 ) -> pd.DataFrame:
     _validate_trusted_photonic_contracts(config, trusted_circuits, trusted_state_spaces)
     reference = _validate_development_reference(development_reference, config)
@@ -263,6 +321,10 @@ def _validate_development(
     if len(work) != expected_row_count:
         raise PhotonicBenchmarkContractError("photonic candidate Cartesian grid is not complete")
     reference_by_id = reference.set_index(reference["sample_id"].astype(str), drop=False)
+    declared = int(work.memory_usage(index=True, deep=True).sum()) + int(
+        reference.memory_usage(index=True, deep=True).sum()
+    )
+    resource_checkpoint(declared)
     metadata_columns = (
         "site_id",
         "issued_at_utc",
@@ -284,6 +346,7 @@ def _validate_development(
         ["modes", "phase_scale", "circuit_seed", "control"], observed=True, sort=False
     )
     for key, group in grouped:
+        resource_checkpoint(declared)
         if len(group) != len(reference):
             raise PhotonicBenchmarkContractError(f"candidate {key!r} is not complete")
         if set(group["sample_id"].astype(str)) != expected_samples:
@@ -302,6 +365,7 @@ def _validate_development(
             f"matched{int(modes)}_scaled_{offset}" for offset in range(int(modes))
         )
         for row in group.itertuples(index=False):
+            resource_checkpoint(declared)
             probabilities = row.probabilities
             array = np.asarray(probabilities, dtype=np.float64)
             if (
@@ -318,6 +382,8 @@ def _validate_development(
                 photons=2,
                 control=cast(Control, str(control)),
             )
+            declared += int(expected_probabilities.nbytes)
+            resource_checkpoint(declared)
             if not np.allclose(array, expected_probabilities, atol=1e-12, rtol=0.0):
                 raise PhotonicBenchmarkContractError(
                     "probability semantics do not match the trusted circuit and state order"
@@ -464,15 +530,18 @@ def select_photonic_models(
     trusted_circuits: Mapping[tuple[int, int], CircuitDefinition],
     trusted_state_spaces: Mapping[tuple[int, int], tuple[int, str]],
     fit_executor: FitExecutor | None = None,
+    resource_checkpoint: ResourceCheckpoint | None = None,
 ) -> PhotonicSelectionResult:
     """Select primary m/c/alpha across every seed and UTC-day validation origin."""
 
+    checkpoint = resource_checkpoint or (lambda _declared: None)
     work = _validate_development(
         development_features,
         config,
         development_reference=development_reference,
         trusted_circuits=trusted_circuits,
         trusted_state_spaces=trusted_state_spaces,
+        resource_checkpoint=checkpoint,
     )
     executor = fit_executor or DirectFitExecutor(lambda _declared: None)
     quantiles = tuple(config.evaluation.quantiles)
@@ -681,8 +750,8 @@ def build_holdout_photonic_features(
     selected: dict[str, Any],
     circuits: dict[int, CircuitDefinition],
     trusted_state_space: tuple[int, str],
-    resource_checkpoint: Any | None = None,
-) -> pd.DataFrame:
+    resource_checkpoint: ResourceCheckpoint | None = None,
+) -> _ValidatedHoldoutFeatures:
     """Generate selected exact probabilities using only persisted circuit definitions."""
 
     modes = int(selected["modes"])
@@ -720,7 +789,10 @@ def build_holdout_photonic_features(
         raise PhotonicBenchmarkContractError("holdout scaled inputs must be finite in [0,1]")
     records: list[dict[str, Any]] = []
     declared = int(work.memory_usage(index=True, deep=True).sum())
+    checkpoint = resource_checkpoint or (lambda _declared: None)
+    checkpoint(declared)
     for seed, circuit in sorted(circuits.items()):
+        checkpoint(declared)
         if (
             circuit.circuit_seed != seed
             or circuit.modes != modes
@@ -730,8 +802,10 @@ def build_holdout_photonic_features(
             raise PhotonicBenchmarkContractError("persisted circuit does not match selection")
         checksum = circuit_checksum(circuit)
         for index, row in enumerate(work.itertuples(index=False)):
+            checkpoint(declared)
             unitary = build_circuit(circuit, values[index], phase_scale)
             for control in CONTROLS:
+                checkpoint(declared)
                 probabilities = exact_probabilities(unitary, photons=photons, control=control)
                 records.append(
                     {
@@ -754,17 +828,17 @@ def build_holdout_photonic_features(
                     }
                 )
                 declared += probabilities.nbytes + 768
-                if resource_checkpoint is not None:
-                    resource_checkpoint(declared)
+                checkpoint(declared)
     result = pd.DataFrame.from_records(records)
-    _validate_holdout_exact_features(
+    validated = _validate_holdout_exact_features(
         result,
         holdout_reference=work,
         selected=selected,
         trusted_circuits=circuits,
         trusted_state_space=trusted_state_space,
+        resource_checkpoint=checkpoint,
     )
-    return result
+    return _make_validated_holdout_features(validated, checkpoint)
 
 
 def _validate_holdout_exact_features(
@@ -774,7 +848,9 @@ def _validate_holdout_exact_features(
     selected: Mapping[str, Any],
     trusted_circuits: Mapping[int, CircuitDefinition],
     trusted_state_space: tuple[int, str],
+    resource_checkpoint: ResourceCheckpoint | None = None,
 ) -> pd.DataFrame:
+    checkpoint = resource_checkpoint or (lambda _declared: None)
     modes = int(selected["modes"])
     photons = int(selected["photons"])
     phase_scale = float(selected["phase_scale"])
@@ -831,6 +907,10 @@ def _validate_holdout_exact_features(
     if missing:
         raise PhotonicBenchmarkContractError(f"exact holdout features are missing {missing}")
     work = exact_features.copy(deep=True)
+    declared = int(work.memory_usage(index=True, deep=True).sum()) + int(
+        reference.memory_usage(index=True, deep=True).sum()
+    )
+    checkpoint(declared)
     for column in ("issued_at_utc", "target_at_utc"):
         work[column] = pd.to_datetime(work[column], utc=True, errors="raise")
     identity = ["sample_id", "circuit_seed", "control"]
@@ -847,6 +927,7 @@ def _validate_holdout_exact_features(
         )
     reference_by_id = reference.set_index(reference["sample_id"].astype(str), drop=False)
     for row in work.itertuples(index=False):
+        checkpoint(declared)
         trusted_sample = reference_by_id.loc[str(row.sample_id)]
         for column in metadata[1:]:
             if getattr(row, column) != trusted_sample[column]:
@@ -872,16 +953,8 @@ def _validate_holdout_exact_features(
             or not math.isclose(float(actual.sum()), 1.0, abs_tol=1e-12, rel_tol=0.0)
         ):
             raise PhotonicBenchmarkContractError("holdout probability vector is invalid")
-        scaled = trusted_sample.loc[list(feature_columns)].to_numpy(dtype=np.float64)
-        expected = exact_probabilities(
-            build_circuit(circuit, scaled, phase_scale),
-            photons=photons,
-            control=cast(Control, str(row.control)),
-        )
-        if not np.allclose(actual, expected, atol=1e-12, rtol=0.0):
-            raise PhotonicBenchmarkContractError(
-                "holdout probability semantics do not match the trusted circuit"
-            )
+        declared += int(actual.nbytes)
+        checkpoint(declared)
     return work.sort_values(
         ["circuit_seed", "control", "site_id", "issued_at_utc", "sample_id"],
         kind="stable",
@@ -889,29 +962,17 @@ def _validate_holdout_exact_features(
 
 
 def predict_exact(
-    exact_features: pd.DataFrame,
+    validated_features: _ValidatedHoldoutFeatures,
     models: dict[tuple[str, int], PhotonicSeedModel],
     quantiles: tuple[float, ...],
     *,
-    holdout_reference: pd.DataFrame,
-    trusted_circuits: Mapping[int, CircuitDefinition],
-    trusted_state_space: tuple[int, str],
     fit_executor: FitExecutor | None = None,
+    resource_checkpoint: ResourceCheckpoint | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     if not models:
         raise PhotonicBenchmarkContractError("photonic model map is empty")
-    exemplar = next(iter(models.values()))
-    exact_features = _validate_holdout_exact_features(
-        exact_features,
-        holdout_reference=holdout_reference,
-        selected={
-            "modes": exemplar.modes,
-            "photons": exemplar.photons,
-            "phase_scale": exemplar.phase_scale,
-        },
-        trusted_circuits=trusted_circuits,
-        trusted_state_space=trusted_state_space,
-    )
+    checkpoint = resource_checkpoint or (lambda _declared: None)
+    exact_features = _consume_validated_holdout_features(validated_features, checkpoint)
     executor = fit_executor or DirectFitExecutor(lambda _declared: None)
     records: list[dict[str, Any]] = []
     diagnostics: dict[str, Any] = {}

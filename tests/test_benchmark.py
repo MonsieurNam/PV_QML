@@ -154,6 +154,73 @@ def _select(frame: pd.DataFrame, config: PilotConfig) -> PhotonicSelectionResult
     )
 
 
+def test_development_semantic_validation_honors_resource_checkpoint_before_slos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pv_pilot.benchmark as benchmark_module
+
+    config = _config()
+    frame = _development_frame()
+    circuits, states = _trusted_contracts(config)
+    slos_calls = 0
+
+    def counted_exact(*args: Any, **kwargs: Any) -> np.ndarray[Any, Any]:
+        nonlocal slos_calls
+        slos_calls += 1
+        return exact_probabilities(*args, **kwargs)
+
+    def expired(_declared: int) -> None:
+        raise TimeoutError("expired before semantic validation")
+
+    monkeypatch.setattr(benchmark_module, "exact_probabilities", counted_exact)
+    with pytest.raises(TimeoutError, match="expired"):
+        select_photonic_models(
+            frame,
+            config,
+            development_reference=_development_reference(frame),
+            trusted_circuits=circuits,
+            trusted_state_spaces=states,
+            resource_checkpoint=expired,
+        )
+    assert slos_calls == 0
+
+
+def test_development_semantic_validation_stops_promptly_mid_grid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pv_pilot.benchmark as benchmark_module
+
+    config = _config()
+    frame = _development_frame()
+    circuits, states = _trusted_contracts(config)
+    slos_calls = 0
+    checkpoints = 0
+
+    def counted_exact(*args: Any, **kwargs: Any) -> np.ndarray[Any, Any]:
+        nonlocal slos_calls
+        slos_calls += 1
+        return exact_probabilities(*args, **kwargs)
+
+    def expire_mid_grid(_declared: int) -> None:
+        nonlocal checkpoints
+        checkpoints += 1
+        if checkpoints == 7:
+            raise TimeoutError("expired mid-grid")
+
+    monkeypatch.setattr(benchmark_module, "exact_probabilities", counted_exact)
+    with pytest.raises(TimeoutError, match="mid-grid"):
+        select_photonic_models(
+            frame,
+            config,
+            development_reference=_development_reference(frame),
+            trusted_circuits=circuits,
+            trusted_state_spaces=states,
+            resource_checkpoint=expire_mid_grid,
+        )
+    assert 0 < slos_calls < len(frame)
+    assert checkpoints == 7
+
+
 @pytest.mark.parametrize(
     "mutation,match",
     [
@@ -497,8 +564,12 @@ def test_finite_shot_is_deterministic_and_isolated_by_sampling_seed() -> None:
         assert first[column].equals(changed[column])
 
 
-def test_real_slos_holdout_both_controls_predictions_and_serialization() -> None:
+def test_real_slos_holdout_both_controls_predictions_and_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import pickle
+
+    import pv_pilot.benchmark as benchmark_module
 
     config = _config()
     selection = _select(_development_frame(), config)
@@ -525,24 +596,35 @@ def test_real_slos_holdout_both_controls_predictions_and_serialization() -> None
         math.comb(modes + 1, 2),
         state_order_checksum(enumerate_fock_states(modes, 2)),
     )
-    exact = build_holdout_photonic_features(
+    slos_calls = 0
+    checkpoints: list[int] = []
+
+    def counted_exact(*args: Any, **kwargs: Any) -> np.ndarray[Any, Any]:
+        nonlocal slos_calls
+        slos_calls += 1
+        return exact_probabilities(*args, **kwargs)
+
+    monkeypatch.setattr(benchmark_module, "exact_probabilities", counted_exact)
+    validated = build_holdout_photonic_features(
         holdout,
         selected=selection.selected,
         circuits=circuits,
         trusted_state_space=trusted_state_space,
+        resource_checkpoint=checkpoints.append,
     )
+    exact = validated.frame
     assert len(exact) == 10
+    assert slos_calls == len(exact)
+    assert checkpoints
     assert set(exact["control"]) == {"indistinguishable", "distinguishable"}
     assert exact.groupby("control")["circuit_seed"].nunique().eq(5).all()
     assert exact["probabilities"].map(sum).to_numpy() == pytest.approx(np.ones(10))
     predictions, diagnostics = predict_exact(
-        exact,
+        validated,
         selection.selected_models,
         tuple(config.evaluation.quantiles),
-        holdout_reference=holdout,
-        trusted_circuits=circuits,
-        trusted_state_space=trusted_state_space,
     )
+    assert slos_calls == len(exact)
     assert len(predictions) == 10
     assert predictions.groupby("control")["circuit_seed"].nunique().eq(5).all()
     quantile_columns = ["q05", "q10", "q25", "q50", "q75", "q90", "q95"]
@@ -554,31 +636,25 @@ def test_real_slos_holdout_both_controls_predictions_and_serialization() -> None
     restored = pickle.loads(model_pickle_bytes(selection.selected_models))
     assert set(restored) == set(selection.selected_models)
     repeated, _ = predict_exact(
-        exact,
+        validated,
         restored,
         tuple(config.evaluation.quantiles),
-        holdout_reference=holdout,
-        trusted_circuits=circuits,
-        trusted_state_space=trusted_state_space,
     )
+    assert slos_calls == len(exact)
     assert repeated[quantile_columns].to_numpy() == pytest.approx(values)
 
-    for column, bad_value, match in (
-        ("state_order_sha256", "f" * 64, "state-order"),
-        ("circuit_sha256", "e" * 64, "circuit checksum"),
-        ("target_ac_power_kw", 9.0, "sample metadata"),
+    for column, bad_value in (
+        ("state_order_sha256", "f" * 64),
+        ("circuit_sha256", "e" * 64),
+        ("target_ac_power_kw", 9.0),
+        ("probabilities", list(reversed(exact.iloc[0]["probabilities"]))),
     ):
-        tampered = exact.copy(deep=True)
-        tampered.at[tampered.index[0], column] = bad_value
-        with pytest.raises(PhotonicBenchmarkContractError, match=match):
-            predict_exact(
-                tampered,
-                selection.selected_models,
-                tuple(config.evaluation.quantiles),
-                holdout_reference=holdout,
-                trusted_circuits=circuits,
-                trusted_state_space=trusted_state_space,
-            )
+        original = validated._frame.at[validated._frame.index[0], column]
+        validated._frame.at[validated._frame.index[0], column] = bad_value
+        with pytest.raises(PhotonicBenchmarkContractError, match="token integrity"):
+            predict_exact(validated, selection.selected_models, tuple(config.evaluation.quantiles))
+        validated._frame.at[validated._frame.index[0], column] = original
+    assert slos_calls == len(exact)
 
     counts = finite_shot_screen(
         exact, tuple(config.photonics.raw_attempt_budgets), SeedManager(config.seeds.master_seed)
@@ -692,3 +768,60 @@ def test_benchmark_contract_failure_is_durable_invalid_without_holdout(
     assert marker["status"] == "INVALID"
     assert marker["details"]["prerequisite_verification"] == "marker_only"
     assert pd.read_parquet(store.root / "benchmark/exact_predictions.parquet").empty
+
+
+def test_benchmark_expired_resource_is_durable_invalid_before_slos_or_holdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pv_pilot.benchmark as benchmark_module
+
+    artifacts_module: Any = importlib.import_module("pv_pilot.artifacts")
+    services_module: Any = importlib.import_module("pv_pilot.services")
+    store = _make_service_run(tmp_path)
+    original_artifact_hash = artifacts_module.sha256_file
+    original_service_hash = services_module.sha256_file
+    slos_calls = 0
+    fit_calls = 0
+
+    def reject_holdout_artifact(path: Path) -> str:
+        if path.name == "holdout_features.parquet":
+            raise AssertionError("expired benchmark touched holdout")
+        return cast(str, original_artifact_hash(path))
+
+    def reject_holdout_service(path: Path) -> str:
+        if path.name == "holdout_features.parquet":
+            raise AssertionError("expired benchmark touched holdout")
+        return cast(str, original_service_hash(path))
+
+    def unexpected_slos(*args: Any, **kwargs: Any) -> np.ndarray[Any, Any]:
+        nonlocal slos_calls
+        slos_calls += 1
+        return exact_probabilities(*args, **kwargs)
+
+    def unexpected_fit(*args: Any, **kwargs: Any) -> object:
+        nonlocal fit_calls
+        del args, kwargs
+        fit_calls += 1
+        raise AssertionError("expired benchmark started a fit")
+
+    def expired_checkpoint(self: Any, declared_bytes: int = 0) -> None:
+        del self, declared_bytes
+        raise services_module._ResourceLimitExceeded("wall_clock")
+
+    monkeypatch.setattr(artifacts_module, "sha256_file", reject_holdout_artifact)
+    monkeypatch.setattr(services_module, "sha256_file", reject_holdout_service)
+    monkeypatch.setattr(benchmark_module, "exact_probabilities", unexpected_slos)
+    monkeypatch.setattr(benchmark_module, "_fit_linear_heads", unexpected_fit)
+    monkeypatch.setattr(services_module._ResourceGuard, "checkpoint", expired_checkpoint)
+
+    result = DefaultPilotServices().benchmark(store.root)
+    assert result.status is StageStatus.INVALID
+    assert slos_calls == 0
+    assert fit_calls == 0
+    resumed = DefaultPilotServices().benchmark(store.root)
+    assert resumed.status is StageStatus.INVALID
+    marker = json.loads((store.root / "benchmark/stage_manifest.json").read_text(encoding="utf-8"))
+    assert marker["status"] == "INVALID"
+    assert marker["details"]["gate"] == "resource_wall_clock"
+    assert pd.read_parquet(store.root / "benchmark/exact_predictions.parquet").empty
+    assert not [path for path in store.root.rglob("*") if ".tmp" in path.name]

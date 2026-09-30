@@ -1983,12 +1983,14 @@ class DefaultPilotServices:
                 trusted_circuits=trusted_circuits,
                 trusted_state_spaces=trusted_state_spaces,
                 fit_executor=fit_executor,
+                resource_checkpoint=guard.checkpoint,
             )
             freeze_hash = selection.selection_manifest["selection_freeze_sha256"]
             if not isinstance(freeze_hash, str) or len(freeze_hash) != 64:
                 raise RuntimeError("photonic selection did not produce a freeze hash")
 
             # All holdout-bound verification is deliberately below the immutable freeze.
+            guard.checkpoint(declared)
             baseline_marker_hash = store.verify_terminal_stage(
                 "train-baselines", accepted_statuses=frozenset({"SUCCESS"})
             )
@@ -2015,6 +2017,7 @@ class DefaultPilotServices:
             }
             holdout_relative = "build-splits/holdout_features.parquet"
             holdout_path = store.root / holdout_relative
+            guard.checkpoint(declared)
             if split_hashes.get(holdout_relative) != sha256_file(holdout_path):
                 raise photonic_benchmark.PhotonicBenchmarkContractError(
                     "holdout checksum changed after selection freeze"
@@ -2026,6 +2029,7 @@ class DefaultPilotServices:
                     "holdout partition contract is missing"
                 )
             # Exactly one dataframe materialization of the test partition.
+            guard.checkpoint(declared)
             holdout = pds.dataset(holdout_path, format="parquet").to_table().to_pandas()
             holdout_declared = int(holdout.memory_usage(index=True, deep=True).sum())
             declared += holdout_declared
@@ -2057,24 +2061,25 @@ class DefaultPilotServices:
                 for seed in config.seeds.circuit_seeds
             }
 
-            exact_features = photonic_benchmark.build_holdout_photonic_features(
+            validated_exact_features = photonic_benchmark.build_holdout_photonic_features(
                 holdout,
                 selected=selection.selected,
                 circuits=circuits,
                 trusted_state_space=trusted_state_spaces[(selected_modes, 2)],
                 resource_checkpoint=guard.checkpoint,
             )
+            exact_features = validated_exact_features.frame
+            declared += int(exact_features.memory_usage(index=True, deep=True).sum())
+            guard.checkpoint(declared)
             expected_exact_feature_rows = len(holdout) * len(config.seeds.circuit_seeds) * 2
             if len(exact_features) != expected_exact_feature_rows:
                 raise RuntimeError("exact holdout photonic matrix is incomplete")
             exact_predictions, exact_diagnostics = photonic_benchmark.predict_exact(
-                exact_features,
+                validated_exact_features,
                 selection.selected_models,
                 tuple(config.evaluation.quantiles),
-                holdout_reference=holdout,
-                trusted_circuits=circuits,
-                trusted_state_space=trusted_state_spaces[(selected_modes, 2)],
                 fit_executor=fit_executor,
+                resource_checkpoint=guard.checkpoint,
             )
             if len(exact_predictions) != expected_exact_feature_rows:
                 raise RuntimeError("exact holdout predictions are incomplete")
