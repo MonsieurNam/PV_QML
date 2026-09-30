@@ -202,11 +202,14 @@ class DefaultPilotServices:
                 "build-splits/minmax_scalers.json",
             )
         }
-        store.verify_terminal_stage(
-            "build-photonic-features",
-            accepted_statuses=frozenset({str(status)}),
-            prerequisite_output_allowlist=allowlist,
-        )
+        if status == "SUCCESS":
+            store.verify_terminal_stage(
+                "build-photonic-features",
+                accepted_statuses=frozenset({"SUCCESS"}),
+                prerequisite_output_allowlist=allowlist,
+            )
+        else:
+            store.verify_terminal_diagnostic_stage("build-photonic-features")
         result_path = store.root / "build-photonic-features/stage_result.json"
         result = StageResult.model_validate_json(result_path.read_text(encoding="utf-8"))
         return result.model_copy(
@@ -1375,8 +1378,7 @@ class DefaultPilotServices:
                 "build-splits/feature_manifest.json",
                 "build-splits/minmax_scalers.json",
             ),
-            prerequisite_verification="selected_outputs",
-            prerequisite_output_allowlist=DefaultPilotServices._photonic_allowlist(),
+            prerequisite_verification="marker_only",
             terminal_status="INVALID",
             details={
                 "result_status": "invalid",
@@ -1506,6 +1508,8 @@ class DefaultPilotServices:
                         "circuit_seed": circuit.circuit_seed,
                         "modes": circuit.modes,
                         "photons": circuit.photons,
+                        "v1_sha256": photonic_features.matrix_checksum(circuit.v1),
+                        "v2_sha256": photonic_features.matrix_checksum(circuit.v2),
                         "circuit_sha256": photonic_features.circuit_checksum(circuit),
                         "npz_sha256": hashlib.sha256(payload).hexdigest(),
                         "state_order_sha256": circuit.state_order_sha256,
@@ -1566,6 +1570,13 @@ class DefaultPilotServices:
             "construction": "V1 -> diag(exp(i*c*x)) -> V2",
             "matrix_convention": "V2 @ phase @ V1",
             "haar_generator": "numpy.Generator.normal+QR-phase-normalization",
+            "matrix_checksum_contract": {
+                "schema_version": "1.0",
+                "dtype": "<c16",
+                "shape": "uint64 dimensions",
+                "order": "C",
+                "aggregate": "ordered V1 and V2 matrix checksums",
+            },
             "circuits": circuit_records,
         }
         feature_manifest = {

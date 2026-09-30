@@ -246,26 +246,32 @@ def test_selective_prerequisite_verification_hashes_only_allowlisted_outputs(
     with store.stage("validate-data", now=FIXED_NOW) as transaction:
         transaction.write_text("validated.csv", "ok")
     with store.stage("build-splits", now=FIXED_NOW) as transaction:
-        transaction.write_bytes("development.bin", b"development")
-        transaction.write_bytes("metadata.json", b"{}")
-        transaction.write_bytes("holdout.bin", b"opaque holdout")
+        transaction.write_bytes("development_features.parquet", b"development")
+        transaction.write_bytes("feature_manifest.json", b"{}")
+        transaction.write_bytes("minmax_scalers.json", b"{}")
+        transaction.write_bytes("holdout_features.parquet", b"opaque holdout")
 
     original_sha256 = artifacts_module.sha256_file
 
     def reject_holdout_read(path: Path) -> str:
-        if path.name == "holdout.bin":
+        if path.name == "holdout_features.parquet":
             raise AssertionError("selective verification read the holdout")
         return original_sha256(path)
 
     monkeypatch.setattr(artifacts_module, "sha256_file", reject_holdout_read)
     with store.stage(
         "build-photonic-features",
-        input_paths=("build-splits/development.bin", "build-splits/metadata.json"),
+        input_paths=(
+            "build-splits/development_features.parquet",
+            "build-splits/feature_manifest.json",
+            "build-splits/minmax_scalers.json",
+        ),
         prerequisite_verification="selected_outputs",
         prerequisite_output_allowlist={
             "build-splits": (
-                "build-splits/development.bin",
-                "build-splits/metadata.json",
+                "build-splits/development_features.parquet",
+                "build-splits/feature_manifest.json",
+                "build-splits/minmax_scalers.json",
             )
         },
         now=FIXED_NOW,
@@ -280,8 +286,9 @@ def test_selective_prerequisite_verification_hashes_only_allowlisted_outputs(
     assert manifest["details"]["prerequisite_verification"] == "selected_outputs"
     assert manifest["details"]["prerequisite_output_allowlist"] == {
         "build-splits": [
-            "build-splits/development.bin",
-            "build-splits/metadata.json",
+            "build-splits/development_features.parquet",
+            "build-splits/feature_manifest.json",
+            "build-splits/minmax_scalers.json",
         ]
     }
 
@@ -291,14 +298,21 @@ def test_selective_prerequisite_verification_rejects_undeclared_output(tmp_path:
     with store.stage("validate-data", now=FIXED_NOW) as transaction:
         transaction.write_text("validated.csv", "ok")
     with store.stage("build-splits", now=FIXED_NOW) as transaction:
-        transaction.write_bytes("development.bin", b"development")
+        transaction.write_bytes("development_features.parquet", b"development")
+        transaction.write_bytes("feature_manifest.json", b"{}")
+        transaction.write_bytes("minmax_scalers.json", b"{}")
 
     with pytest.raises(ValueError, match="allowlist"):
         store.stage(
             "build-photonic-features",
             prerequisite_verification="selected_outputs",
             prerequisite_output_allowlist={
-                "build-splits": ("build-splits/not-declared.bin",)
+                "build-splits": (
+                    "build-splits/development_features.parquet",
+                    "build-splits/feature_manifest.json",
+                    "build-splits/minmax_scalers.json",
+                    "build-splits/not-declared.bin",
+                )
             },
             now=FIXED_NOW,
         )
@@ -311,26 +325,40 @@ def test_selective_verification_requires_inputs_to_be_allowlisted_and_audited(
     with store.stage("validate-data", now=FIXED_NOW) as transaction:
         transaction.write_text("validated.csv", "ok")
     with store.stage("build-splits", now=FIXED_NOW) as transaction:
-        transaction.write_bytes("development.bin", b"development")
-        transaction.write_bytes("holdout.bin", b"holdout")
+        transaction.write_bytes("development_features.parquet", b"development")
+        transaction.write_bytes("feature_manifest.json", b"{}")
+        transaction.write_bytes("minmax_scalers.json", b"{}")
+        transaction.write_bytes("holdout_features.parquet", b"holdout")
 
     with pytest.raises(ValueError, match="allowlisted"):
         store.stage(
             "build-photonic-features",
-            input_paths=("build-splits/holdout.bin",),
+            input_paths=("build-splits/holdout_features.parquet",),
             prerequisite_verification="selected_outputs",
             prerequisite_output_allowlist={
-                "build-splits": ("build-splits/development.bin",)
+                "build-splits": (
+                    "build-splits/development_features.parquet",
+                    "build-splits/feature_manifest.json",
+                    "build-splits/minmax_scalers.json",
+                )
             },
             now=FIXED_NOW,
         )
 
     with store.stage(
         "build-photonic-features",
-        input_paths=("build-splits/development.bin",),
+        input_paths=(
+            "build-splits/development_features.parquet",
+            "build-splits/feature_manifest.json",
+            "build-splits/minmax_scalers.json",
+        ),
         prerequisite_verification="selected_outputs",
         prerequisite_output_allowlist={
-            "build-splits": ("build-splits/development.bin",)
+            "build-splits": (
+                "build-splits/development_features.parquet",
+                "build-splits/feature_manifest.json",
+                "build-splits/minmax_scalers.json",
+            )
         },
         now=FIXED_NOW,
     ) as transaction:
@@ -346,8 +374,153 @@ def test_selective_verification_requires_inputs_to_be_allowlisted_and_audited(
         store.verify_terminal_stage(
             "build-photonic-features",
             prerequisite_output_allowlist={
-                "build-splits": ("build-splits/development.bin",)
+                "build-splits": (
+                    "build-splits/development_features.parquet",
+                    "build-splits/feature_manifest.json",
+                    "build-splits/minmax_scalers.json",
+                )
             },
+        )
+
+
+def test_selected_outputs_is_task7_only_and_cannot_hide_benchmark_tamper(
+    tmp_path: Path,
+) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    with store.stage("validate-data", now=FIXED_NOW) as transaction:
+        transaction.write_text("validated.csv", "ok")
+    with store.stage("build-splits", now=FIXED_NOW) as transaction:
+        transaction.write_bytes("development_features.parquet", b"development")
+        transaction.write_bytes("feature_manifest.json", b"{}")
+        transaction.write_bytes("minmax_scalers.json", b"{}")
+        transaction.write_bytes("holdout_features.parquet", b"holdout")
+    with store.stage("train-baselines", now=FIXED_NOW) as transaction:
+        transaction.write_bytes("keep.bin", b"baseline keep")
+        transaction.write_bytes("ignored.bin", b"baseline ignored")
+    with store.stage(
+        "build-photonic-features",
+        input_paths=(
+            "build-splits/development_features.parquet",
+            "build-splits/feature_manifest.json",
+            "build-splits/minmax_scalers.json",
+        ),
+        prerequisite_verification="selected_outputs",
+        prerequisite_output_allowlist={
+            "build-splits": (
+                "build-splits/development_features.parquet",
+                "build-splits/feature_manifest.json",
+                "build-splits/minmax_scalers.json",
+            )
+        },
+        now=FIXED_NOW,
+    ) as transaction:
+        transaction.write_bytes("keep.bin", b"photonic keep")
+        transaction.write_bytes("ignored.bin", b"photonic ignored")
+    (store.root / "train-baselines/ignored.bin").write_bytes(b"tampered baseline")
+    (store.root / "build-photonic-features/ignored.bin").write_bytes(b"tampered photonic")
+
+    with pytest.raises(ValueError, match="checksum"):
+        store.stage("benchmark", now=FIXED_NOW)
+
+    with pytest.raises(ValueError, match="build-photonic-features"):
+        store.stage(
+            "benchmark",
+            prerequisite_verification="selected_outputs",
+            prerequisite_output_allowlist={
+                "train-baselines": ("train-baselines/keep.bin",),
+                "build-photonic-features": (
+                    "build-photonic-features/keep.bin",
+                ),
+            },
+            now=FIXED_NOW,
+        )
+    assert not (store.root / "benchmark/stage_manifest.json").exists()
+
+
+@pytest.mark.parametrize(
+    "selected_paths",
+    [
+        (
+            "build-splits/development_features.parquet",
+            "build-splits/feature_manifest.json",
+        ),
+        (
+            "build-splits/development_features.parquet",
+            "build-splits/feature_manifest.json",
+            "build-splits/minmax_scalers.json",
+            "build-splits/extra.json",
+        ),
+    ],
+    ids=("missing", "extra"),
+)
+def test_task7_selected_outputs_rejects_non_exact_fixed_allowlist(
+    tmp_path: Path, selected_paths: tuple[str, ...]
+) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    with store.stage("validate-data", now=FIXED_NOW) as transaction:
+        transaction.write_text("validated.csv", "ok")
+    with store.stage("build-splits", now=FIXED_NOW) as transaction:
+        transaction.write_bytes("development_features.parquet", b"development")
+        transaction.write_bytes("feature_manifest.json", b"{}")
+        transaction.write_bytes("minmax_scalers.json", b"{}")
+        transaction.write_bytes("extra.json", b"{}")
+
+    with pytest.raises(ValueError, match="fixed contract"):
+        store.stage(
+            "build-photonic-features",
+            prerequisite_verification="selected_outputs",
+            prerequisite_output_allowlist={"build-splits": selected_paths},
+            now=FIXED_NOW,
+        )
+    assert not (store.root / "build-photonic-features/stage_manifest.json").exists()
+
+
+def test_task7_selected_outputs_detects_selected_tamper_but_ignores_holdout_tamper(
+    tmp_path: Path,
+) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    with store.stage("validate-data", now=FIXED_NOW) as transaction:
+        transaction.write_text("validated.csv", "ok")
+    with store.stage("build-splits", now=FIXED_NOW) as transaction:
+        transaction.write_bytes("development_features.parquet", b"development")
+        transaction.write_bytes("feature_manifest.json", b"{}")
+        transaction.write_bytes("minmax_scalers.json", b"{}")
+        transaction.write_bytes("holdout_features.parquet", b"holdout")
+    allowlist = {
+        "build-splits": (
+            "build-splits/development_features.parquet",
+            "build-splits/feature_manifest.json",
+            "build-splits/minmax_scalers.json",
+        )
+    }
+    (store.root / "build-splits/holdout_features.parquet").write_bytes(b"tampered holdout")
+    with store.stage(
+        "build-photonic-features",
+        input_paths=allowlist["build-splits"],
+        prerequisite_verification="selected_outputs",
+        prerequisite_output_allowlist=allowlist,
+        now=FIXED_NOW,
+    ) as transaction:
+        transaction.write_json(
+            "stage_result.json",
+            {"stage": "build-photonic-features", "status": "SUCCESS"},
+        )
+
+    second = RunStore.create(make_loaded_config(tmp_path / "second"), now=FIXED_NOW)
+    with second.stage("validate-data", now=FIXED_NOW) as transaction:
+        transaction.write_text("validated.csv", "ok")
+    with second.stage("build-splits", now=FIXED_NOW) as transaction:
+        transaction.write_bytes("development_features.parquet", b"development")
+        transaction.write_bytes("feature_manifest.json", b"{}")
+        transaction.write_bytes("minmax_scalers.json", b"{}")
+        transaction.write_bytes("holdout_features.parquet", b"holdout")
+    (second.root / "build-splits/development_features.parquet").write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="checksum"):
+        second.stage(
+            "build-photonic-features",
+            prerequisite_verification="selected_outputs",
+            prerequisite_output_allowlist=allowlist,
+            now=FIXED_NOW,
         )
 
 

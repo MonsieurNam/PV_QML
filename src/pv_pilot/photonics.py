@@ -317,41 +317,73 @@ def build_development_photonic_features(
 
 def circuit_checksum(circuit: CircuitDefinition) -> str:
     digest = hashlib.sha256()
-    digest.update(b"pv-pilot-circuit-v1\0")
+    digest.update(b"pv-pilot-circuit-v2\0")
     digest.update(
         np.asarray([circuit.circuit_seed, circuit.modes, circuit.photons], dtype="<u8").tobytes()
     )
     digest.update(circuit.state_order_sha256.encode("ascii"))
-    for matrix in (circuit.v1, circuit.v2):
-        canonical = np.asarray(matrix, dtype="<c16", order="C")
-        digest.update(canonical.tobytes(order="C"))
+    digest.update(b"V1\0")
+    digest.update(bytes.fromhex(matrix_checksum(circuit.v1)))
+    digest.update(b"V2\0")
+    digest.update(bytes.fromhex(matrix_checksum(circuit.v2)))
+    return digest.hexdigest()
+
+
+def matrix_checksum(matrix: np.ndarray) -> str:
+    """Hash canonical complex matrix metadata and row-major bytes."""
+
+    canonical = np.ascontiguousarray(np.asarray(matrix, dtype="<c16"))
+    digest = hashlib.sha256()
+    digest.update(b"pv-pilot-circuit-matrix-v1\0")
+    digest.update(canonical.dtype.str.encode("ascii"))
+    digest.update(b"\0C\0")
+    digest.update(np.asarray(canonical.ndim, dtype="<u8").tobytes())
+    digest.update(np.asarray(canonical.shape, dtype="<u8").tobytes())
+    digest.update(canonical.tobytes(order="C"))
     return digest.hexdigest()
 
 
 def circuit_npz_bytes(circuit: CircuitDefinition) -> bytes:
     buffer = io.BytesIO()
+    v1_sha256 = matrix_checksum(circuit.v1)
+    v2_sha256 = matrix_checksum(circuit.v2)
     np.savez(
         buffer,
         circuit_seed=np.asarray(circuit.circuit_seed, dtype=np.uint64),
         modes=np.asarray(circuit.modes, dtype=np.uint64),
         photons=np.asarray(circuit.photons, dtype=np.uint64),
         state_order_sha256=np.asarray(circuit.state_order_sha256),
-        v1=np.asarray(circuit.v1, dtype=np.complex128),
-        v2=np.asarray(circuit.v2, dtype=np.complex128),
+        v1=np.asarray(circuit.v1, dtype="<c16", order="C"),
+        v2=np.asarray(circuit.v2, dtype="<c16", order="C"),
+        v1_sha256=np.asarray(v1_sha256),
+        v2_sha256=np.asarray(v2_sha256),
+        circuit_sha256=np.asarray(circuit_checksum(circuit)),
     )
     return buffer.getvalue()
 
 
 def load_circuit_npz(payload: bytes) -> CircuitDefinition:
-    with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
-        circuit = CircuitDefinition(
-            circuit_seed=int(archive["circuit_seed"]),
-            modes=int(archive["modes"]),
-            photons=int(archive["photons"]),
-            state_order_sha256=str(archive["state_order_sha256"]),
-            v1=np.asarray(archive["v1"], dtype=np.complex128),
-            v2=np.asarray(archive["v2"], dtype=np.complex128),
-        )
+    try:
+        with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
+            circuit = CircuitDefinition(
+                circuit_seed=int(archive["circuit_seed"]),
+                modes=int(archive["modes"]),
+                photons=int(archive["photons"]),
+                state_order_sha256=str(archive["state_order_sha256"]),
+                v1=np.asarray(archive["v1"], dtype="<c16", order="C"),
+                v2=np.asarray(archive["v2"], dtype="<c16", order="C"),
+            )
+            declared_v1_sha256 = str(archive["v1_sha256"])
+            declared_v2_sha256 = str(archive["v2_sha256"])
+            declared_circuit_sha256 = str(archive["circuit_sha256"])
+    except (KeyError, OSError, ValueError) as error:
+        raise PhotonicContractError("circuit NPZ is invalid") from error
+    if matrix_checksum(circuit.v1) != declared_v1_sha256:
+        raise PhotonicContractError("circuit NPZ V1 checksum mismatch")
+    if matrix_checksum(circuit.v2) != declared_v2_sha256:
+        raise PhotonicContractError("circuit NPZ V2 checksum mismatch")
+    if circuit_checksum(circuit) != declared_circuit_sha256:
+        raise PhotonicContractError("circuit NPZ aggregate checksum mismatch")
     expected = generate_circuit(
         circuit_seed=circuit.circuit_seed, modes=circuit.modes, photons=circuit.photons
     )
@@ -451,6 +483,7 @@ __all__ = [
     "fock_dimension",
     "generate_circuit",
     "load_circuit_npz",
+    "matrix_checksum",
     "state_order_checksum",
     "validate_development_features",
 ]

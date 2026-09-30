@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import math
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +15,7 @@ import perceval as pcvl
 import pytest
 import yaml
 
-from pv_pilot.artifacts import RunStore
+from pv_pilot.artifacts import RunStore, sha256_file
 from pv_pilot.config import load_config
 from pv_pilot.domain import StageResult, StageStatus, deterministic_data
 from pv_pilot.photonics import (
@@ -30,6 +32,7 @@ from pv_pilot.photonics import (
     fock_dimension,
     generate_circuit,
     load_circuit_npz,
+    matrix_checksum,
     state_order_checksum,
     validate_development_features,
 )
@@ -140,14 +143,70 @@ def test_circuit_is_deterministic_round_trips_and_checksum_binds_state_order() -
     assert np.array_equal(restored.v1, first.v1)
     assert np.array_equal(restored.v2, first.v2)
     assert circuit_checksum(restored) == circuit_checksum(first)
+    assert matrix_checksum(restored.v1) == matrix_checksum(first.v1)
+    assert matrix_checksum(restored.v2) == matrix_checksum(first.v2)
     assert state_order_checksum(enumerate_fock_states(6, 2)) == first.state_order_sha256
     assert hashlib.sha256(payload).hexdigest()
 
 
+def test_matrix_checksums_bind_canonical_dtype_shape_order_and_bytes() -> None:
+    circuit = generate_circuit(circuit_seed=1234, modes=6, photons=2)
+    v1_fortran = np.asarray(circuit.v1, dtype=">c16", order="F")
+    assert matrix_checksum(v1_fortran) == matrix_checksum(circuit.v1)
+    changed = circuit.v1.copy()
+    changed[0, 0] += 1e-12
+    assert matrix_checksum(changed) != matrix_checksum(circuit.v1)
+    assert matrix_checksum(circuit.v1.reshape(3, 12)) != matrix_checksum(circuit.v1)
+
+
+def _rewrite_circuit_npz(payload: bytes, **replacements: np.ndarray) -> bytes:
+    with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
+        values = {name: archive[name] for name in archive.files}
+    values.update(replacements)
+    buffer = io.BytesIO()
+    np.savez(buffer, **values)
+    return buffer.getvalue()
+
+
+def test_circuit_npz_verifies_individual_matrix_checksums_and_swap() -> None:
+    circuit = generate_circuit(circuit_seed=1234, modes=6, photons=2)
+    payload = circuit_npz_bytes(circuit)
+    with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
+        assert str(archive["v1_sha256"]) == matrix_checksum(circuit.v1)
+        assert str(archive["v2_sha256"]) == matrix_checksum(circuit.v2)
+
+    tampered_v1 = circuit.v1.copy()
+    tampered_v1[0, 0] += 1e-12
+    with pytest.raises(PhotonicContractError, match="V1 checksum"):
+        load_circuit_npz(_rewrite_circuit_npz(payload, v1=tampered_v1))
+
+    swapped = _rewrite_circuit_npz(
+        payload,
+        v1=circuit.v2,
+        v2=circuit.v1,
+        v1_sha256=np.asarray(matrix_checksum(circuit.v2)),
+        v2_sha256=np.asarray(matrix_checksum(circuit.v1)),
+        circuit_sha256=np.asarray(
+            circuit_checksum(replace(circuit, v1=circuit.v2, v2=circuit.v1))
+        ),
+    )
+    with pytest.raises(PhotonicContractError, match="deterministic definition"):
+        load_circuit_npz(swapped)
+
+
+def test_circuit_checksum_aggregates_ordered_individual_matrix_checksums() -> None:
+    circuit = generate_circuit(circuit_seed=1234, modes=6, photons=2)
+    swapped = replace(circuit, v1=circuit.v2, v2=circuit.v1)
+    assert matrix_checksum(circuit.v1) == matrix_checksum(swapped.v2)
+    assert matrix_checksum(circuit.v2) == matrix_checksum(swapped.v1)
+    assert circuit_checksum(circuit) != circuit_checksum(swapped)
+
+
 def test_fresh_processes_reproduce_circuit_checksum() -> None:
     script = (
-        "from pv_pilot.photonics import generate_circuit,circuit_checksum;"
-        "print(circuit_checksum(generate_circuit(circuit_seed=77,modes=4,photons=2)))"
+        "from pv_pilot.photonics import generate_circuit,circuit_checksum,matrix_checksum;"
+        "c=generate_circuit(circuit_seed=77,modes=4,photons=2);"
+        "print(matrix_checksum(c.v1),matrix_checksum(c.v2),circuit_checksum(c))"
     )
     outputs = [
         subprocess.check_output([sys.executable, "-c", script], text=True).strip() for _ in range(2)
@@ -248,7 +307,10 @@ def test_development_builder_generates_every_candidate_and_reuses_circuit() -> N
     assert set(result.features.loc[result.features["modes"] == 6, "dimension"]) == {21}
     assert len(result.circuits) == 10
     assert len(result.configuration_ledger) == 20
-    assert all(int(record["rss_bytes"]) > 0 for record in result.configuration_ledger)
+    assert all(
+        isinstance(record["rss_bytes"], int) and record["rss_bytes"] > 0
+        for record in result.configuration_ledger
+    )
     grouped = result.features.groupby(["modes", "circuit_seed"])
     assert grouped["circuit_sha256"].nunique().eq(1).all()
     assert result.features["probabilities"].map(sum).to_numpy() == pytest.approx(
@@ -391,7 +453,7 @@ def test_service_publishes_development_only_without_opening_holdout(
 
     store = _make_photonic_run(tmp_path)
     original_artifact_hash = artifacts_module.sha256_file
-    original_service_hash = services_module.sha256_file
+    original_service_hash = sha256_file
 
     def reject_artifact_holdout(path: Path) -> str:
         if path.name == "holdout_features.parquet":
@@ -432,6 +494,17 @@ def test_service_publishes_development_only_without_opening_holdout(
     )
     assert manifest["details"]["prerequisite_verification"] == "selected_outputs"
     assert "holdout_features.parquet" not in json.dumps(manifest["input_hashes"])
+    circuit_manifest = json.loads(
+        (store.root / "build-photonic-features/circuit_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    for record in circuit_manifest["circuits"]:
+        circuit_path = store.root / record["path"]
+        restored = load_circuit_npz(circuit_path.read_bytes())
+        assert record["v1_sha256"] == matrix_checksum(restored.v1)
+        assert record["v2_sha256"] == matrix_checksum(restored.v2)
+        assert record["circuit_sha256"] == circuit_checksum(restored)
 
 
 def test_service_rejects_tampered_development_input_without_stage_marker(tmp_path: Path) -> None:
@@ -441,6 +514,21 @@ def test_service_rejects_tampered_development_input_without_stage_marker(tmp_pat
     with pytest.raises(ValueError, match="checksum"):
         DefaultPilotServices().build_photonic_features(store.root)
     assert not (store.root / "build-photonic-features/stage_manifest.json").exists()
+
+
+def test_success_resume_rejects_marker_downgrade_to_invalid(tmp_path: Path) -> None:
+    store = _make_photonic_run(tmp_path)
+    result = DefaultPilotServices().build_photonic_features(store.root)
+    assert result.status is StageStatus.SUCCESS
+    marker_path = store.root / "build-photonic-features/stage_manifest.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["status"] = "INVALID"
+    marker_path.write_text(
+        json.dumps(marker, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="invalid diagnostic policy"):
+        DefaultPilotServices().build_photonic_features(store.root)
 
 
 def test_resource_exhaustion_publishes_bounded_invalid_without_holdout(
@@ -468,6 +556,8 @@ def test_resource_exhaustion_publishes_bounded_invalid_without_holdout(
     monkeypatch.setattr(photonics_module, "build_development_photonic_features", exceed_resource)
     result = DefaultPilotServices().build_photonic_features(store.root)
     assert result.status is StageStatus.INVALID
+    resumed = DefaultPilotServices().build_photonic_features(store.root)
+    assert resumed.status is StageStatus.INVALID
     marker = json.loads(
         (store.root / "build-photonic-features/stage_manifest.json").read_text(encoding="utf-8")
     )
