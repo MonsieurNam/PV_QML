@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -320,6 +321,81 @@ class CircuitSeedScore(VersionedRecord):
     success_rate: float = Field(ge=0, le=1)
 
 
+ResourceGateStage = Literal[
+    "validate-data",
+    "build-splits",
+    "train-baselines",
+    "build-photonic-features",
+    "benchmark",
+]
+
+RESOURCE_GATE_STAGES: tuple[ResourceGateStage, ...] = (
+    "validate-data",
+    "build-splits",
+    "train-baselines",
+    "build-photonic-features",
+    "benchmark",
+)
+
+
+class ResourceGateResult(VersionedRecord):
+    """One named G1/G2/G3 resource-ledger gate."""
+
+    stage: ResourceGateStage
+    passed: bool
+
+
+class ResourceGateEvidence(VersionedRecord):
+    """Complete, ordered resource evidence required for a scientific decision."""
+
+    gates: tuple[ResourceGateResult, ...]
+
+    @field_validator("gates")
+    @classmethod
+    def gates_are_complete_and_ordered(
+        cls, value: tuple[ResourceGateResult, ...]
+    ) -> tuple[ResourceGateResult, ...]:
+        by_stage = {item.stage: item for item in value}
+        if len(by_stage) != len(value):
+            raise ValueError("resource gate stages must be unique")
+        configured = set(by_stage)
+        required = set(RESOURCE_GATE_STAGES)
+        missing = sorted(required - configured)
+        unknown = sorted(configured - required)
+        if missing:
+            raise ValueError(f"resource gate evidence is missing stages: {missing}")
+        if unknown:
+            raise ValueError(f"resource gate evidence has unknown stages: {unknown}")
+        return tuple(by_stage[stage] for stage in RESOURCE_GATE_STAGES)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, bool]) -> ResourceGateEvidence:
+        configured = set(value)
+        required = set(RESOURCE_GATE_STAGES)
+        missing = sorted(required - configured)
+        unknown = sorted(configured - required)
+        if missing:
+            raise ValueError(f"resource gate evidence is missing stages: {missing}")
+        if unknown:
+            raise ValueError(f"resource gate evidence has unknown stages: {unknown}")
+        if any(not isinstance(item, bool) for item in value.values()):
+            raise ValueError("resource gate values must be booleans")
+        return cls(
+            gates=tuple(
+                ResourceGateResult(stage=stage, passed=value[stage])
+                for stage in RESOURCE_GATE_STAGES
+            )
+        )
+
+    @property
+    def passed(self) -> bool:
+        return all(item.passed for item in self.gates)
+
+    @property
+    def failed_stages(self) -> tuple[str, ...]:
+        return tuple(item.stage for item in self.gates if not item.passed)
+
+
 class ScoreBundle(VersionedRecord):
     """Matched quantum-only and full-system evaluation metadata."""
 
@@ -358,6 +434,7 @@ class ScoreBundle(VersionedRecord):
     circuit_seed_scores: tuple[CircuitSeedScore, ...] = ()
     resource_gates_passed: bool = False
     failed_resource_gates: tuple[str, ...] = ()
+    resource_gates: ResourceGateEvidence | None = None
     science_eligible: bool = False
     stage_status: StageStatus = StageStatus.BLOCKED
     decision: ScientificDecision = ScientificDecision.NOT_EVALUATED
@@ -411,6 +488,7 @@ def deterministic_json(record: VersionedRecord) -> str:
 
 
 __all__ = [
+    "RESOURCE_GATE_STAGES",
     "BootstrapInterval",
     "CanonicalRow",
     "CircuitSeedScore",
@@ -423,6 +501,9 @@ __all__ = [
     "PortablePath",
     "PredictionRecord",
     "QuantileValue",
+    "ResourceGateEvidence",
+    "ResourceGateResult",
+    "ResourceGateStage",
     "ScientificDecision",
     "ScoreBundle",
     "StageResult",

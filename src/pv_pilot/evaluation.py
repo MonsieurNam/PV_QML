@@ -8,7 +8,8 @@ and the frozen resource/protocol gates.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Mapping
+import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Literal
@@ -19,10 +20,12 @@ from numpy.typing import NDArray
 
 from .baselines import LOCKED_QUANTILES, normalized_wis, quantile_columns
 from .domain import (
+    RESOURCE_GATE_STAGES,
     BootstrapInterval,
     CircuitSeedScore,
     DataProvenance,
     IntervalCalibration,
+    ResourceGateEvidence,
     ScientificDecision,
     ScoreBundle,
     StageStatus,
@@ -39,10 +42,45 @@ type FloatArray = NDArray[np.float64]
 _KEY_COLUMNS = ("sample_id", "site_id", "issued_at_utc", "target_at_utc")
 _INTERVALS = ((0.5, 2, 4), (0.8, 1, 5), (0.9, 0, 6))
 _SUCCESS = "success"
+REQUIRED_RESOURCE_GATES = RESOURCE_GATE_STAGES
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class EvaluationContractError(ValueError):
     """Raised when evaluation inputs violate the frozen pairing protocol."""
+
+
+@dataclass(frozen=True, slots=True)
+class ExpectedPrimaryConfiguration:
+    """Task 8 frozen exact-primary selection and per-seed circuit identity."""
+
+    modes: int
+    photons: int
+    phase_scale: float
+    alpha: float
+    circuit_sha256_by_seed: tuple[tuple[int, str], ...]
+
+    def __post_init__(self) -> None:
+        if self.modes not in {4, 6}:
+            raise EvaluationContractError("expected primary modes must be 4 or 6")
+        if self.photons != 2:
+            raise EvaluationContractError("G3 exact primary must use two photons")
+        if not math.isfinite(self.phase_scale) or self.phase_scale <= 0:
+            raise EvaluationContractError("expected phase scale must be finite and positive")
+        if not math.isfinite(self.alpha) or self.alpha <= 0:
+            raise EvaluationContractError("expected alpha must be finite and positive")
+        seeds = tuple(seed for seed, _digest in self.circuit_sha256_by_seed)
+        if len(seeds) != 5 or len(set(seeds)) != 5:
+            raise EvaluationContractError("expected primary requires five unique circuit seeds")
+        if any(
+            not _SHA256_PATTERN.fullmatch(digest)
+            for _seed, digest in self.circuit_sha256_by_seed
+        ):
+            raise EvaluationContractError("expected circuit checksums must be lowercase SHA-256")
+
+    @property
+    def circuit_checksums(self) -> dict[int, str]:
+        return dict(self.circuit_sha256_by_seed)
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,7 +200,11 @@ def _validate_quantiles(values: NDArray[Any], capacity: float, label: str) -> Fl
     return array
 
 
-def _prepare_quantum(frame: pd.DataFrame, policy: EvaluationPolicy) -> pd.DataFrame:
+def _prepare_quantum(
+    frame: pd.DataFrame,
+    policy: EvaluationPolicy,
+    expected: ExpectedPrimaryConfiguration,
+) -> pd.DataFrame:
     q_columns = quantile_columns(policy.quantiles)
     required = {
         *_KEY_COLUMNS,
@@ -175,6 +217,8 @@ def _prepare_quantum(frame: pd.DataFrame, policy: EvaluationPolicy) -> pd.DataFr
         "phase_scale",
         "alpha",
         "status",
+        "fit_phase",
+        "circuit_sha256",
         *q_columns,
     }
     _required_columns(frame, required, "exact quantum predictions")
@@ -184,6 +228,10 @@ def _prepare_quantum(frame: pd.DataFrame, policy: EvaluationPolicy) -> pd.DataFr
         raise EvaluationContractError("indistinguishable exact predictions are empty")
     work["circuit_seed"] = work["circuit_seed"].astype(np.int64)
     expected_seeds = set(policy.circuit_seeds)
+    if set(expected.circuit_checksums) != expected_seeds:
+        raise EvaluationContractError(
+            "expected circuit checksums do not match configured circuit seeds"
+        )
     actual_seeds = set(work["circuit_seed"].astype(int))
     if actual_seeds != expected_seeds:
         raise EvaluationContractError("primary exact predictions have missing or extra seeds")
@@ -192,13 +240,37 @@ def _prepare_quantum(frame: pd.DataFrame, policy: EvaluationPolicy) -> pd.DataFr
     if work.groupby("sample_id", sort=False)[list(_KEY_COLUMNS[1:])].nunique().gt(1).any().any():
         raise EvaluationContractError("sample_id maps to inconsistent timestamp/site semantics")
 
+    global_expected: dict[str, int | float] = {
+        "modes": expected.modes,
+        "photons": expected.photons,
+        "phase_scale": expected.phase_scale,
+        "alpha": expected.alpha,
+    }
+    for column, expected_value in global_expected.items():
+        numeric = pd.to_numeric(work[column], errors="coerce").to_numpy(dtype=np.float64)
+        if not np.isfinite(numeric).all() or not np.allclose(
+            numeric, float(expected_value), atol=0.0, rtol=0.0
+        ):
+            raise EvaluationContractError(
+                f"exact primary {column} does not match the frozen selection"
+            )
+    if set(work["fit_phase"].astype(str)) != {"train_plus_validation_refit"}:
+        raise EvaluationContractError("exact primary fit_phase is not the frozen refit phase")
+    for seed, group in work.groupby("circuit_seed", sort=False):
+        checksums = set(group["circuit_sha256"].astype(str))
+        expected_checksum = expected.circuit_checksums[int(seed)]
+        if (
+            len(checksums) != 1
+            or next(iter(checksums)) != expected_checksum
+            or not _SHA256_PATTERN.fullmatch(expected_checksum)
+        ):
+            raise EvaluationContractError(
+                f"circuit checksum drift for configured seed {int(seed)}"
+            )
+
     semantic = (
         "target_ac_power_kw",
         "capacity_kw",
-        "modes",
-        "photons",
-        "phase_scale",
-        "alpha",
     )
     groups = work.groupby(list(_KEY_COLUMNS), sort=False, dropna=False)
     for _key, group in groups:
@@ -330,26 +402,54 @@ def _build_timestamp_scores(
     records: list[dict[str, Any]] = []
     seed_losses: dict[int, list[float]] = {seed: [] for seed in policy.circuit_seeds}
     seed_baseline_losses: dict[int, list[float]] = {seed: [] for seed in policy.circuit_seeds}
-    groups = quantum.groupby(list(_KEY_COLUMNS), sort=False, dropna=False)
-    for key, group in groups:
-        sample_id, site_id, issued_at, target_at = key
-        target = float(group["target_ac_power_kw"].iloc[0])
-        capacity = float(group["capacity_kw"].iloc[0])
-        base_key = (
-            str(sample_id),
-            str(site_id),
-            pd.Timestamp(issued_at),
-            pd.Timestamp(target_at),
+    quantum_groups = {
+        tuple(key): group
+        for key, group in quantum.groupby(list(_KEY_COLUMNS), sort=False, dropna=False)
+    }
+    comparator = baselines.loc[
+        baselines["model"].astype(str) == policy.comparison_model
+    ].sort_values(["site_id", "issued_at_utc", "sample_id"], kind="stable")
+    if comparator.empty:
+        raise EvaluationContractError("primary comparator baseline holdout is empty")
+    comparator_keys = {
+        tuple(row)
+        for row in comparator.loc[:, list(_KEY_COLUMNS)].itertuples(index=False, name=None)
+    }
+    extra_quantum = set(quantum_groups).difference(comparator_keys)
+    if extra_quantum:
+        raise EvaluationContractError(
+            "exact quantum predictions contain timestamps outside comparator T"
         )
-        comparison = lookup.get((*base_key, policy.comparison_model))
-        if comparison is None or str(comparison.status).lower() != _SUCCESS:
+
+    for comparison in comparator.itertuples(index=False):
+        sample_id = str(comparison.sample_id)
+        site_id = str(comparison.site_id)
+        issued_at = pd.Timestamp(comparison.issued_at_utc)
+        target_at = pd.Timestamp(comparison.target_at_utc)
+        group = quantum_groups.get((sample_id, site_id, issued_at, target_at))
+        target = float(comparison.target_ac_power_kw)
+        capacity = float(comparison.capacity_kw)
+        base_key = (
+            sample_id,
+            site_id,
+            issued_at,
+            target_at,
+        )
+        if str(comparison.status).lower() != _SUCCESS:
             raise EvaluationContractError("matched comparison baseline is missing or failed")
-        if not math.isclose(float(comparison.target_ac_power_kw), target, rel_tol=0, abs_tol=0):
-            raise EvaluationContractError("matched baseline target does not match quantum target")
-        if not math.isclose(float(comparison.capacity_kw), capacity, rel_tol=0, abs_tol=0):
-            raise EvaluationContractError(
-                "matched baseline capacity does not match quantum capacity"
-            )
+        if group is not None:
+            if not math.isclose(
+                float(group["target_ac_power_kw"].iloc[0]), target, rel_tol=0, abs_tol=0
+            ):
+                raise EvaluationContractError(
+                    "matched baseline target does not match quantum target"
+                )
+            if not math.isclose(
+                float(group["capacity_kw"].iloc[0]), capacity, rel_tol=0, abs_tol=0
+            ):
+                raise EvaluationContractError(
+                    "matched baseline capacity does not match quantum capacity"
+                )
         comparison_prediction = _validate_quantiles(
             np.asarray([getattr(comparison, column) for column in q_columns]),
             capacity,
@@ -357,11 +457,16 @@ def _build_timestamp_scores(
         )
         baseline_loss, _, _ = _one_prediction_metrics(target, capacity, comparison_prediction)
 
-        quantum_success = bool((group["status"].astype(str).str.lower() == _SUCCESS).all())
+        quantum_success = bool(
+            group is not None
+            and (group["status"].astype(str).str.lower() == _SUCCESS).all()
+        )
         quantum_loss: float | None = None
         q_coverage = {nominal: 0.0 for nominal, _, _ in _INTERVALS}
         q_width = {nominal: 0.0 for nominal, _, _ in _INTERVALS}
         if quantum_success:
+            if group is None:
+                raise AssertionError("successful quantum timestamp must have seed rows")
             per_seed_loss: list[float] = []
             for row in group.sort_values("circuit_seed", kind="stable").itertuples(index=False):
                 seed = int(row.circuit_seed)
@@ -653,8 +758,9 @@ def evaluate_predictions(
     baseline_predictions: pd.DataFrame,
     *,
     policy: EvaluationPolicy,
+    expected_primary: ExpectedPrimaryConfiguration,
     seed_manager: SeedManager,
-    resource_gates: Mapping[str, bool],
+    resource_gates: ResourceGateEvidence,
     finite_shot_predictions: pd.DataFrame | None = None,
     resource_checkpoint: ResourceCheckpoint | None = None,
 ) -> EvaluationResult:
@@ -662,12 +768,10 @@ def evaluate_predictions(
 
     # Deliberately accepted only to make the decision firewall explicit to callers.
     del finite_shot_predictions
-    if not resource_gates:
-        raise EvaluationContractError("resource gate evidence is required")
-    if any(not isinstance(value, bool) for value in resource_gates.values()):
-        raise EvaluationContractError("resource gate values must be booleans")
+    if not isinstance(resource_gates, ResourceGateEvidence):
+        raise EvaluationContractError("typed resource gate evidence is required")
     checkpoint = resource_checkpoint or (lambda _declared: None)
-    quantum = _prepare_quantum(exact_predictions, policy)
+    quantum = _prepare_quantum(exact_predictions, policy, expected_primary)
     baselines = _prepare_baselines(baseline_predictions, policy)
     checkpoint(
         int(quantum.memory_usage(index=True, deep=True).sum())
@@ -742,7 +846,7 @@ def evaluate_predictions(
         sensitivity_cis.append(interval)
         bootstrap_rows.extend(rows)
 
-    resources_passed = all(resource_gates.values())
+    resources_passed = resource_gates.passed
     stage_status, decision, conclusion = decide_evaluation(
         science_eligible=policy.science_eligible,
         system_complete=system_complete,
@@ -778,9 +882,8 @@ def evaluate_predictions(
         sensitivity_system_cis=tuple(sensitivity_cis),
         circuit_seed_scores=seed_scores,
         resource_gates_passed=resources_passed,
-        failed_resource_gates=tuple(
-            sorted(name for name, passed in resource_gates.items() if not passed)
-        ),
+        failed_resource_gates=resource_gates.failed_stages,
+        resource_gates=resource_gates,
         science_eligible=policy.science_eligible,
         stage_status=stage_status,
         decision=decision,
@@ -807,7 +910,7 @@ def evaluate_predictions(
 def score_bundle_csv_row(bundle: ScoreBundle) -> dict[str, str | int | float | bool | None]:
     """Flatten the primary summary into one stable CSV-ready record."""
 
-    return {
+    row: dict[str, str | int | float | bool | None] = {
         "metric": bundle.metric,
         "quantum_only_score": bundle.quantum_only_score,
         "quantum_only_baseline_score": bundle.quantum_only_baseline_score,
@@ -827,17 +930,29 @@ def score_bundle_csv_row(bundle: ScoreBundle) -> dict[str, str | int | float | b
         "primary_ci_status": bundle.primary_system_ci.status,
         "calibration_passed": bundle.calibration_passed,
         "resource_gates_passed": bundle.resource_gates_passed,
+        "failed_resource_gates": ";".join(bundle.failed_resource_gates),
         "science_eligible": bundle.science_eligible,
         "stage_status": bundle.stage_status.value,
         "decision": bundle.decision.value,
         "conclusion": bundle.conclusion,
     }
+    gate_values = (
+        {item.stage: item.passed for item in bundle.resource_gates.gates}
+        if bundle.resource_gates is not None
+        else {}
+    )
+    for stage in REQUIRED_RESOURCE_GATES:
+        row[f"resource_gate_{stage}"] = gate_values.get(stage)
+    return row
 
 
 __all__ = [
+    "REQUIRED_RESOURCE_GATES",
     "EvaluationContractError",
     "EvaluationPolicy",
     "EvaluationResult",
+    "ExpectedPrimaryConfiguration",
+    "ResourceGateEvidence",
     "decide_evaluation",
     "evaluate_predictions",
     "score_bundle_csv_row",

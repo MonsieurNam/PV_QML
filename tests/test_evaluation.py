@@ -13,8 +13,11 @@ from pv_pilot.baselines import LOCKED_QUANTILES
 from pv_pilot.config import load_config
 from pv_pilot.domain import DataProvenance, ScientificDecision, StageStatus
 from pv_pilot.evaluation import (
+    REQUIRED_RESOURCE_GATES,
     EvaluationContractError,
     EvaluationPolicy,
+    ExpectedPrimaryConfiguration,
+    ResourceGateEvidence,
     decide_evaluation,
     evaluate_predictions,
     score_bundle_csv_row,
@@ -42,6 +45,22 @@ def _policy(**overrides: Any) -> EvaluationPolicy:
         fallback_model="persistence",
     )
     return replace(policy, **overrides)
+
+
+def _expected() -> ExpectedPrimaryConfiguration:
+    return ExpectedPrimaryConfiguration(
+        modes=4,
+        photons=2,
+        phase_scale=np.pi / 2,
+        alpha=0.01,
+        circuit_sha256_by_seed=tuple((seed, f"{seed:064x}") for seed in SEEDS),
+    )
+
+
+def _gates(**overrides: bool) -> ResourceGateEvidence:
+    values: dict[str, bool] = {name: True for name in REQUIRED_RESOURCE_GATES}
+    values.update(overrides)
+    return ResourceGateEvidence.from_mapping(values)
 
 
 def _rows(
@@ -118,8 +137,9 @@ def test_quantum_is_scored_per_seed_before_mean_not_as_prediction_ensemble() -> 
         exact,
         baseline,
         policy=_policy(min_valid_blocks=20),
+        expected_primary=_expected(),
         seed_manager=SeedManager(20260928),
-        resource_gates={"benchmark": True},
+        resource_gates=_gates(),
     )
 
     per_seed = timestamp_normalized_wis(
@@ -158,8 +178,96 @@ def test_primary_seed_matrix_rejects_missing_duplicate_extra_or_semantic_mismatc
             exact,
             baseline,
             policy=_policy(),
+            expected_primary=_expected(),
             seed_manager=SeedManager(1),
-            resource_gates={"benchmark": True},
+            resource_gates=_gates(),
+        )
+
+
+def test_missing_whole_quantum_timestamp_remains_in_t_and_uses_fallback() -> None:
+    exact, baseline = _rows(days=6)
+    exact = exact.loc[exact["sample_id"] != "sample-003"].reset_index(drop=True)
+
+    result = evaluate_predictions(
+        exact,
+        baseline,
+        policy=_policy(min_valid_blocks=20),
+        expected_primary=_expected(),
+        seed_manager=SeedManager(11),
+        resource_gates=_gates(),
+    )
+
+    assert len(result.per_timestamp) == 6
+    missing = result.per_timestamp.set_index("sample_id").loc["sample-003"]
+    assert missing["quantum_success"] == np.False_
+    assert missing["fallback_used"] == np.True_
+    assert missing["fallback_success"] == np.True_
+    assert result.score_bundle.success_count == 5
+    assert result.score_bundle.fallback_count == 1
+    assert result.score_bundle.success_rate == pytest.approx(5 / 6)
+    matched = result.per_timestamp.loc[
+        result.per_timestamp["quantum_success"], "baseline_loss"
+    ].mean()
+    assert result.score_bundle.quantum_only_baseline_score == pytest.approx(matched)
+
+
+def test_quantum_timestamp_outside_primary_comparator_t_is_rejected() -> None:
+    exact, baseline = _rows(days=4)
+    extra = exact.loc[exact["sample_id"] == "sample-003"].copy()
+    extra["sample_id"] = "quantum-extra"
+    extra["issued_at_utc"] += pd.Timedelta(days=1)
+    extra["target_at_utc"] += pd.Timedelta(days=1)
+    exact = pd.concat([exact, extra], ignore_index=True)
+
+    with pytest.raises(EvaluationContractError, match="outside"):
+        evaluate_predictions(
+            exact,
+            baseline,
+            policy=_policy(),
+            expected_primary=_expected(),
+            seed_manager=SeedManager(12),
+            resource_gates=_gates(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("modes", 6),
+        ("photons", 3),
+        ("phase_scale", np.pi),
+        ("alpha", 0.1),
+        ("fit_phase", "validation_fit"),
+        ("circuit_sha256", "f" * 64),
+    ],
+)
+def test_exact_primary_provenance_rejects_drift(column: str, value: Any) -> None:
+    exact, baseline = _rows(days=4)
+    exact.loc[exact.index[0], column] = value
+
+    with pytest.raises(EvaluationContractError):
+        evaluate_predictions(
+            exact,
+            baseline,
+            policy=_policy(),
+            expected_primary=_expected(),
+            seed_manager=SeedManager(13),
+            resource_gates=_gates(),
+        )
+
+
+@pytest.mark.parametrize("column", ["fit_phase", "circuit_sha256"])
+def test_exact_primary_requires_full_provenance_schema(column: str) -> None:
+    exact, baseline = _rows(days=4)
+
+    with pytest.raises(EvaluationContractError, match="missing required columns"):
+        evaluate_predictions(
+            exact.drop(columns=column),
+            baseline,
+            policy=_policy(),
+            expected_primary=_expected(),
+            seed_manager=SeedManager(14),
+            resource_gates=_gates(),
         )
 
 
@@ -169,8 +277,9 @@ def test_empty_success_set_is_na_and_system_uses_fallback() -> None:
         exact,
         baseline,
         policy=_policy(min_valid_blocks=20),
+        expected_primary=_expected(),
         seed_manager=SeedManager(1),
-        resource_gates={"benchmark": True},
+        resource_gates=_gates(),
     )
 
     bundle = result.score_bundle
@@ -191,8 +300,9 @@ def test_partial_failure_separates_quantum_system_and_matched_baseline() -> None
         exact,
         baseline,
         policy=_policy(min_valid_blocks=20),
+        expected_primary=_expected(),
         seed_manager=SeedManager(2),
-        resource_gates={"benchmark": True},
+        resource_gates=_gates(),
     )
     bundle = result.score_bundle
 
@@ -228,8 +338,9 @@ def test_missing_or_failed_fallback_keeps_unresolved_timestamp_and_blocks_system
         exact,
         baseline,
         policy=_policy(min_valid_blocks=20),
+        expected_primary=_expected(),
         seed_manager=SeedManager(3),
-        resource_gates={"benchmark": True},
+        resource_gates=_gates(),
     )
 
     assert len(result.per_timestamp) == 5
@@ -260,8 +371,9 @@ def test_calibration_reports_three_intervals_and_uses_seed_mean_without_ensemble
         exact,
         baseline,
         policy=_policy(min_valid_blocks=20),
+        expected_primary=_expected(),
         seed_manager=SeedManager(4),
-        resource_gates={"benchmark": True},
+        resource_gates=_gates(),
     )
 
     system = {item.nominal_coverage: item for item in result.score_bundle.system_calibration}
@@ -275,11 +387,12 @@ def test_bootstrap_is_row_order_invariant_and_preserves_original_success_mask() 
     exact, baseline = _rows(days=24, failed_samples={2, 7, 18})
     policy = _policy(replicates=96)
     seed_manager = SeedManager(20260928)
-    resource_gates = {"benchmark": True, "features": True}
+    resource_gates = _gates()
     first = evaluate_predictions(
         exact,
         baseline,
         policy=policy,
+        expected_primary=_expected(),
         seed_manager=seed_manager,
         resource_gates=resource_gates,
     )
@@ -287,6 +400,7 @@ def test_bootstrap_is_row_order_invariant_and_preserves_original_success_mask() 
         exact.sample(frac=1, random_state=9).reset_index(drop=True),
         baseline.sample(frac=1, random_state=10).reset_index(drop=True),
         policy=policy,
+        expected_primary=_expected(),
         seed_manager=seed_manager,
         resource_gates=resource_gates,
     )
@@ -305,8 +419,9 @@ def test_insufficient_calendar_blocks_returns_null_ci_and_inconclusive() -> None
         exact,
         baseline,
         policy=_policy(min_valid_blocks=20),
+        expected_primary=_expected(),
         seed_manager=SeedManager(5),
-        resource_gates={"benchmark": True},
+        resource_gates=_gates(),
     )
 
     assert result.score_bundle.primary_system_ci.lower is None
@@ -327,8 +442,9 @@ def test_synthetic_or_unapproved_protocol_is_blocked_not_evaluated(
         exact,
         baseline,
         policy=_policy(provenance=provenance, protocol_approved=approved),
+        expected_primary=_expected(),
         seed_manager=SeedManager(6),
-        resource_gates={"benchmark": True},
+        resource_gates=_gates(),
     )
 
     assert result.score_bundle.stage_status is StageStatus.BLOCKED
@@ -346,16 +462,18 @@ def test_finite_shot_diagnostics_cannot_change_exact_decision() -> None:
         exact,
         baseline,
         policy=policy,
+        expected_primary=_expected(),
         seed_manager=seed_manager,
-        resource_gates={"benchmark": True},
+        resource_gates=_gates(),
         finite_shot_predictions=finite_a,
     )
     second = evaluate_predictions(
         exact,
         baseline,
         policy=policy,
+        expected_primary=_expected(),
         seed_manager=seed_manager,
-        resource_gates={"benchmark": True},
+        resource_gates=_gates(),
         finite_shot_predictions=finite_b,
     )
 
@@ -398,14 +516,65 @@ def test_decision_uses_ci_calibration_success_and_resource_gates(
     )
 
 
+def test_resource_gate_evidence_rejects_missing_and_unknown_stage_names() -> None:
+    complete: dict[str, bool] = {name: True for name in REQUIRED_RESOURCE_GATES}
+    accepted = ResourceGateEvidence.from_mapping(complete)
+    missing = dict(complete)
+    missing.pop("validate-data")
+    unknown = {**complete, "features": True}
+
+    assert accepted.passed is True
+    assert accepted.failed_stages == ()
+    assert tuple(item.stage for item in accepted.gates) == REQUIRED_RESOURCE_GATES
+
+    with pytest.raises(ValueError, match="missing"):
+        ResourceGateEvidence.from_mapping(missing)
+    with pytest.raises(ValueError, match="unknown"):
+        ResourceGateEvidence.from_mapping(unknown)
+
+
+def test_complete_resource_gate_evidence_is_retained_in_score_bundle() -> None:
+    exact, baseline = _rows(days=3)
+    gates = _gates(**{"build-photonic-features": False})
+    result = evaluate_predictions(
+        exact,
+        baseline,
+        policy=_policy(min_valid_blocks=20),
+        expected_primary=_expected(),
+        seed_manager=SeedManager(15),
+        resource_gates=gates,
+    )
+
+    assert result.score_bundle.resource_gates == gates
+    assert result.score_bundle.resource_gates_passed is False
+    assert result.score_bundle.failed_resource_gates == ("build-photonic-features",)
+    assert result.score_bundle.stage_status is StageStatus.INVALID
+    assert result.score_bundle.decision is ScientificDecision.STOP
+
+
+def test_arbitrary_mapping_cannot_authorize_scientific_decision() -> None:
+    exact, baseline = _rows(days=3)
+
+    with pytest.raises(EvaluationContractError, match="typed"):
+        evaluate_predictions(
+            exact,
+            baseline,
+            policy=_policy(min_valid_blocks=20),
+            expected_primary=_expected(),
+            seed_manager=SeedManager(16),
+            resource_gates={"benchmark": True},  # type: ignore[arg-type]
+        )
+
+
 def test_score_bundle_has_deterministic_json_and_flat_csv_without_nonfinite_values() -> None:
     exact, baseline = _rows(days=3)
     result = evaluate_predictions(
         exact,
         baseline,
         policy=_policy(min_valid_blocks=20),
+        expected_primary=_expected(),
         seed_manager=SeedManager(8),
-        resource_gates={"benchmark": True},
+        resource_gates=_gates(),
     )
     payload = result.score_bundle.deterministic_json()
     row = score_bundle_csv_row(result.score_bundle)
@@ -413,3 +582,5 @@ def test_score_bundle_has_deterministic_json_and_flat_csv_without_nonfinite_valu
     assert "NaN" not in payload and "Infinity" not in payload
     assert row["decision"] == "inconclusive"
     assert row["primary_ci_lower"] is None
+    assert row["resource_gate_validate-data"] is True
+    assert row["failed_resource_gates"] == ""
