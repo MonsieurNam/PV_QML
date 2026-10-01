@@ -52,6 +52,15 @@ class DataProvenance(StrEnum):
     SYNTHETIC = "synthetic"
 
 
+class ScientificDecision(StrEnum):
+    """Conservative terminal conclusion for the application-stage experiment."""
+
+    GO = "go"
+    STOP = "stop"
+    INCONCLUSIVE = "inconclusive"
+    NOT_EVALUATED = "not_evaluated"
+
+
 class DaylightSource(StrEnum):
     """Policy used to identify daylight observations."""
 
@@ -272,6 +281,45 @@ class PhotonicFeatureSet(VersionedRecord):
     feature_count: int = Field(ge=0)
 
 
+class IntervalCalibration(VersionedRecord):
+    """Coverage and normalized width for one central prediction interval."""
+
+    nominal_coverage: float = Field(gt=0, lt=1)
+    coverage: float = Field(ge=0, le=1)
+    mean_normalized_width: float = Field(ge=0)
+    sample_count: int = Field(ge=0)
+
+
+class BootstrapInterval(VersionedRecord):
+    """One paired moving-calendar-block bootstrap confidence interval."""
+
+    scope: Literal["quantum_only", "system"]
+    block_days: int = Field(gt=0)
+    point_estimate: float | None = None
+    lower: float | None = None
+    upper: float | None = None
+    requested_replicates: int = Field(ge=0)
+    valid_replicates: int = Field(ge=0)
+    valid_blocks: int = Field(ge=0)
+    status: Literal[
+        "available",
+        "insufficient_blocks",
+        "incomplete_system",
+        "empty_success_set",
+        "zero_baseline_denominator",
+    ]
+
+
+class CircuitSeedScore(VersionedRecord):
+    """Exact quantum and matched-baseline score for one frozen circuit seed."""
+
+    circuit_seed: int = Field(ge=0)
+    quantum_score: float | None = None
+    matched_baseline_score: float | None = None
+    sample_count: int = Field(ge=0)
+    success_rate: float = Field(ge=0, le=1)
+
+
 class ScoreBundle(VersionedRecord):
     """Matched quantum-only and full-system evaluation metadata."""
 
@@ -286,6 +334,34 @@ class ScoreBundle(VersionedRecord):
     fallback_rate: float = Field(ge=0, le=1)
     coverage: float | None = Field(default=None, ge=0, le=1)
     interval_width: float | None = Field(default=None, ge=0)
+    quantum_only_skill: float | None = None
+    system_skill: float | None = None
+    success_count: int = Field(default=0, ge=0)
+    fallback_count: int = Field(default=0, ge=0)
+    fallback_failure_count: int = Field(default=0, ge=0)
+    system_success_count: int = Field(default=0, ge=0)
+    quantum_only_calibration: tuple[IntervalCalibration, ...] = ()
+    system_calibration: tuple[IntervalCalibration, ...] = ()
+    calibration_passed: bool | None = None
+    primary_quantum_ci: BootstrapInterval | None = None
+    primary_system_ci: BootstrapInterval = Field(
+        default_factory=lambda: BootstrapInterval(
+            scope="system",
+            block_days=1,
+            requested_replicates=0,
+            valid_replicates=0,
+            valid_blocks=0,
+            status="insufficient_blocks",
+        )
+    )
+    sensitivity_system_cis: tuple[BootstrapInterval, ...] = ()
+    circuit_seed_scores: tuple[CircuitSeedScore, ...] = ()
+    resource_gates_passed: bool = False
+    failed_resource_gates: tuple[str, ...] = ()
+    science_eligible: bool = False
+    stage_status: StageStatus = StageStatus.BLOCKED
+    decision: ScientificDecision = ScientificDecision.NOT_EVALUATED
+    conclusion: str = "not_evaluated"
 
 
 def _deterministic_value(value: Any) -> Any:
@@ -335,15 +411,19 @@ def deterministic_json(record: VersionedRecord) -> str:
 
 
 __all__ = [
+    "BootstrapInterval",
     "CanonicalRow",
+    "CircuitSeedScore",
     "DataProvenance",
     "DaylightSource",
     "DetailEntry",
     "FrozenJsonObject",
+    "IntervalCalibration",
     "PhotonicFeatureSet",
     "PortablePath",
     "PredictionRecord",
     "QuantileValue",
+    "ScientificDecision",
     "ScoreBundle",
     "StageResult",
     "StageStatus",
