@@ -383,7 +383,7 @@ def test_selective_verification_requires_inputs_to_be_allowlisted_and_audited(
         )
 
 
-def test_selected_outputs_is_task7_only_and_cannot_hide_benchmark_tamper(
+def test_selected_outputs_rejects_generic_benchmark_allowlist_bypass(
     tmp_path: Path,
 ) -> None:
     store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
@@ -422,7 +422,7 @@ def test_selected_outputs_is_task7_only_and_cannot_hide_benchmark_tamper(
     with pytest.raises(ValueError, match="checksum"):
         store.stage("benchmark", now=FIXED_NOW)
 
-    with pytest.raises(ValueError, match="build-photonic-features"):
+    with pytest.raises(ValueError, match="fixed contract"):
         store.stage(
             "benchmark",
             prerequisite_verification="selected_outputs",
@@ -432,6 +432,95 @@ def test_selected_outputs_is_task7_only_and_cannot_hide_benchmark_tamper(
                     "build-photonic-features/keep.bin",
                 ),
             },
+            now=FIXED_NOW,
+        )
+    assert not (store.root / "benchmark/stage_manifest.json").exists()
+
+
+def test_benchmark_selected_outputs_cannot_ignore_tampered_required_output(
+    tmp_path: Path,
+) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    with store.stage("validate-data", now=FIXED_NOW) as transaction:
+        transaction.write_text("validated.csv", "ok")
+    with store.stage("build-splits", now=FIXED_NOW) as transaction:
+        transaction.write_bytes("development_features.parquet", b"development")
+        transaction.write_bytes("feature_manifest.json", b"{}")
+        transaction.write_bytes("minmax_scalers.json", b"{}")
+        transaction.write_bytes("holdout_features.parquet", b"holdout")
+    with store.stage("train-baselines", now=FIXED_NOW) as transaction:
+        transaction.write_bytes("predictions.parquet", b"predictions")
+    with store.stage(
+        "build-photonic-features",
+        input_paths=(
+            "build-splits/development_features.parquet",
+            "build-splits/feature_manifest.json",
+            "build-splits/minmax_scalers.json",
+        ),
+        prerequisite_verification="selected_outputs",
+        prerequisite_output_allowlist={
+            "build-splits": (
+                "build-splits/development_features.parquet",
+                "build-splits/feature_manifest.json",
+                "build-splits/minmax_scalers.json",
+            )
+        },
+        now=FIXED_NOW,
+    ) as transaction:
+        transaction.write_bytes("development_photonic_features.parquet", b"features")
+        transaction.write_bytes("circuit_manifest.json", b"{}")
+        transaction.write_bytes("feature_manifest.json", b"{}")
+        transaction.write_bytes("state_spaces.json", b"states")
+        transaction.write_bytes("circuits/m4-n2-seed1.npz", b"circuit")
+    for name in ("intent.json", "cache.parquet", "complete.json"):
+        store.write_bytes(f".benchmark-holdout-access/{name}", name.encode("utf-8"))
+
+    state_spaces = store.root / "build-photonic-features/state_spaces.json"
+    state_spaces.write_bytes(b"tampered states")
+    common = {
+        "train-baselines": ("train-baselines/predictions.parquet",),
+        "build-photonic-features": (
+            "build-photonic-features/development_photonic_features.parquet",
+            "build-photonic-features/circuit_manifest.json",
+            "build-photonic-features/feature_manifest.json",
+            "build-photonic-features/circuits/m4-n2-seed1.npz",
+        ),
+    }
+    with pytest.raises(ValueError, match="missing required outputs"):
+        store.stage(
+            "benchmark",
+            input_paths=(
+                "train-baselines/predictions.parquet",
+                "build-photonic-features/development_photonic_features.parquet",
+                "build-photonic-features/circuit_manifest.json",
+                "build-photonic-features/feature_manifest.json",
+                "build-photonic-features/circuits/m4-n2-seed1.npz",
+                ".benchmark-holdout-access/intent.json",
+                ".benchmark-holdout-access/cache.parquet",
+                ".benchmark-holdout-access/complete.json",
+            ),
+            prerequisite_verification="selected_outputs",
+            prerequisite_output_allowlist=common,
+            now=FIXED_NOW,
+        )
+
+    exact = dict(common)
+    exact["build-photonic-features"] = (
+        *common["build-photonic-features"],
+        "build-photonic-features/state_spaces.json",
+    )
+    with pytest.raises(ValueError, match="checksum"):
+        store.stage(
+            "benchmark",
+            input_paths=(
+                "train-baselines/predictions.parquet",
+                *exact["build-photonic-features"],
+                ".benchmark-holdout-access/intent.json",
+                ".benchmark-holdout-access/cache.parquet",
+                ".benchmark-holdout-access/complete.json",
+            ),
+            prerequisite_verification="selected_outputs",
+            prerequisite_output_allowlist=exact,
             now=FIXED_NOW,
         )
     assert not (store.root / "benchmark/stage_manifest.json").exists()

@@ -1027,24 +1027,33 @@ def finite_shot_screen(
     exact_features: pd.DataFrame,
     budgets: tuple[int, ...],
     seed_manager: SeedManager,
+    *,
+    resource_checkpoint: ResourceCheckpoint | None = None,
 ) -> pd.DataFrame:
     """Draw one ideal multinomial sample per seed/sample/budget tuple."""
 
     if budgets != (1000, 10000):
         raise PhotonicBenchmarkContractError("shot budgets must be exactly (1000, 10000)")
     primary = exact_features.loc[exact_features["control"] == "indistinguishable"].copy()
+    checkpoint = resource_checkpoint or (lambda _declared: None)
+    declared = int(primary.memory_usage(index=True, deep=True).sum())
+    checkpoint(declared)
     records: list[dict[str, Any]] = []
     for row in primary.sort_values(
         ["circuit_seed", "site_id", "issued_at_utc", "sample_id"], kind="stable"
     ).itertuples(index=False):
+        checkpoint(declared)
         probabilities = np.asarray(row.probabilities, dtype=np.float64)
         if not math.isclose(float(probabilities.sum()), 1.0, abs_tol=1e-12, rel_tol=0.0):
             raise PhotonicBenchmarkContractError("exact probabilities are not normalized")
         for budget in budgets:
+            checkpoint(declared)
             sampling_seed = seed_manager.seed(
                 SeedComponent.SAMPLING, int(row.circuit_seed), str(row.sample_id), budget
             )
             counts = np.random.default_rng(sampling_seed).multinomial(budget, probabilities)
+            declared += int(counts.nbytes + probabilities.nbytes + 1024)
+            checkpoint(declared)
             records.append(
                 {
                     "sample_id": str(row.sample_id),

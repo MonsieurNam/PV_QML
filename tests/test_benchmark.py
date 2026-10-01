@@ -564,6 +564,50 @@ def test_finite_shot_is_deterministic_and_isolated_by_sampling_seed() -> None:
         assert first[column].equals(changed[column])
 
 
+def test_finite_shot_checks_resource_before_sampling(monkeypatch: pytest.MonkeyPatch) -> None:
+    exact = pd.DataFrame(
+        [
+            {
+                "sample_id": "sample",
+                "site_id": "site-a",
+                "issued_at_utc": pd.Timestamp("2025-01-01T00:00:00Z"),
+                "target_at_utc": pd.Timestamp("2025-01-01T00:15:00Z"),
+                "target_ac_power_kw": 1.0,
+                "capacity_kw": 10.0,
+                "modes": 4,
+                "photons": 2,
+                "phase_scale": math.pi / 2,
+                "circuit_seed": 1,
+                "control": "indistinguishable",
+                "probabilities": [0.2, 0.3, 0.5],
+                "dimension": 3,
+                "state_order_sha256": "a" * 64,
+                "circuit_sha256": "b" * 64,
+            }
+        ]
+    )
+    sampling_calls = 0
+
+    def unexpected_rng(*args: Any, **kwargs: Any) -> object:
+        nonlocal sampling_calls
+        del args, kwargs
+        sampling_calls += 1
+        raise AssertionError("expired finite-shot screen sampled")
+
+    def expired(_declared: int) -> None:
+        raise TimeoutError("finite-shot resource expired")
+
+    monkeypatch.setattr(np.random, "default_rng", unexpected_rng)
+    with pytest.raises(TimeoutError, match="finite-shot"):
+        finite_shot_screen(
+            exact,
+            (1000, 10000),
+            SeedManager(42),
+            resource_checkpoint=expired,
+        )
+    assert sampling_calls == 0
+
+
 def test_real_slos_holdout_both_controls_predictions_and_serialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -678,11 +722,14 @@ def test_benchmark_service_freezes_before_holdout_and_resumes(
 
     store = _make_service_run(tmp_path)
     frozen = False
+    reject_holdout_hash = False
     holdout_materializations = 0
     original_select = benchmark_module.select_photonic_models
     original_artifact_hash = artifacts_module.sha256_file
     original_service_hash = services_module.sha256_file
-    original_dataset = services_module.pds.dataset
+    original_materialize = (
+        services_module.DefaultPilotServices._materialize_benchmark_holdout_source
+    )
 
     def select_then_freeze(*args: Any, **kwargs: Any) -> object:
         nonlocal frozen
@@ -693,6 +740,8 @@ def test_benchmark_service_freezes_before_holdout_and_resumes(
     def guarded_artifact_hash(path: Path) -> str:
         if path.name == "holdout_features.parquet":
             assert frozen, "artifact layer hashed holdout before selection freeze"
+            if reject_holdout_hash:
+                raise AssertionError("terminal verification reopened the physical holdout")
         return cast(str, original_artifact_hash(path))
 
     def guarded_service_hash(path: Path) -> str:
@@ -700,12 +749,12 @@ def test_benchmark_service_freezes_before_holdout_and_resumes(
             assert frozen, "service hashed holdout before selection freeze"
         return cast(str, original_service_hash(path))
 
-    def tracked_dataset(path: Path, *args: Any, **kwargs: Any) -> Any:
+    def tracked_materialize(self: Any, path: Path, *args: Any, **kwargs: Any) -> Any:
         nonlocal holdout_materializations
         if Path(path).name == "holdout_features.parquet":
             assert frozen
             holdout_materializations += 1
-        return original_dataset(path, *args, **kwargs)
+        return original_materialize(self, path, *args, **kwargs)
 
     monkeypatch.setattr(benchmark_module, "select_photonic_models", select_then_freeze)
     monkeypatch.setattr(benchmark_module, "_fit_linear_heads", _fast_heads)
@@ -716,7 +765,11 @@ def test_benchmark_service_freezes_before_holdout_and_resumes(
     )
     monkeypatch.setattr(artifacts_module, "sha256_file", guarded_artifact_hash)
     monkeypatch.setattr(services_module, "sha256_file", guarded_service_hash)
-    monkeypatch.setattr(services_module.pds, "dataset", tracked_dataset)
+    monkeypatch.setattr(
+        services_module.DefaultPilotServices,
+        "_materialize_benchmark_holdout_source",
+        tracked_materialize,
+    )
 
     result = DefaultPilotServices().benchmark(store.root)
     assert result.status is StageStatus.SUCCESS
@@ -737,6 +790,232 @@ def test_benchmark_service_freezes_before_holdout_and_resumes(
     marker = json.loads((store.root / "benchmark/stage_manifest.json").read_text(encoding="utf-8"))
     assert marker["status"] == "SUCCESS"
     assert marker["details"]["selection_freeze_sha256"] == manifest["selection_freeze_sha256"]
+    reject_holdout_hash = True
+    store.verify_terminal_stage("benchmark")
+
+
+def _install_fast_benchmark_service(
+    monkeypatch: pytest.MonkeyPatch, services_module: Any, benchmark_module: Any
+) -> None:
+    monkeypatch.setattr(benchmark_module, "_fit_linear_heads", _fast_heads)
+    monkeypatch.setattr(
+        services_module.baseline_models,
+        "DeadlineProcessFitExecutor",
+        lambda **kwargs: DirectFitExecutor(kwargs["resource_checkpoint"]),
+    )
+
+
+def test_holdout_intent_without_complete_never_reopens_source_and_becomes_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pv_pilot.benchmark as benchmark_module
+
+    services_module: Any = importlib.import_module("pv_pilot.services")
+    artifacts_module: Any = importlib.import_module("pv_pilot.artifacts")
+    store = _make_service_run(tmp_path)
+    _install_fast_benchmark_service(monkeypatch, services_module, benchmark_module)
+    original_materialize = (
+        services_module.DefaultPilotServices._materialize_benchmark_holdout_source
+    )
+    source_opens = 0
+    crash_once = True
+    original_artifact_hash = artifacts_module.sha256_file
+    original_service_hash = services_module.sha256_file
+
+    def reject_source_artifact_hash(path: Path) -> str:
+        if path.name == "holdout_features.parquet":
+            raise AssertionError("physical holdout was hashed outside its exact-once access")
+        return cast(str, original_artifact_hash(path))
+
+    def reject_source_service_hash(path: Path) -> str:
+        if path.name == "holdout_features.parquet":
+            raise AssertionError("physical holdout was hashed outside its exact-once access")
+        return cast(str, original_service_hash(path))
+
+    def counted_materialize(self: Any, *args: Any, **kwargs: Any) -> pd.DataFrame:
+        nonlocal source_opens
+        source_opens += 1
+        return cast(pd.DataFrame, original_materialize(self, *args, **kwargs))
+
+    def crash_after_materialization(self: Any) -> None:
+        nonlocal crash_once
+        del self
+        if crash_once:
+            crash_once = False
+            raise RuntimeError("simulated crash after physical holdout access")
+
+    monkeypatch.setattr(
+        services_module.DefaultPilotServices,
+        "_materialize_benchmark_holdout_source",
+        counted_materialize,
+    )
+    monkeypatch.setattr(
+        services_module.DefaultPilotServices,
+        "_after_benchmark_holdout_materialized",
+        crash_after_materialization,
+    )
+    monkeypatch.setattr(artifacts_module, "sha256_file", reject_source_artifact_hash)
+    monkeypatch.setattr(services_module, "sha256_file", reject_source_service_hash)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        DefaultPilotServices().benchmark(store.root)
+    assert source_opens == 1
+    assert not (store.root / "benchmark/stage_manifest.json").exists()
+
+    result = DefaultPilotServices().benchmark(store.root)
+    assert result.status is StageStatus.INVALID
+    assert source_opens == 1
+    marker = json.loads((store.root / "benchmark/stage_manifest.json").read_text(encoding="utf-8"))
+    assert marker["details"]["gate"] == "holdout_access_indeterminate"
+
+
+def test_holdout_complete_cache_resumes_success_without_reopening_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pv_pilot.benchmark as benchmark_module
+
+    services_module: Any = importlib.import_module("pv_pilot.services")
+    artifacts_module: Any = importlib.import_module("pv_pilot.artifacts")
+    store = _make_service_run(tmp_path)
+    _install_fast_benchmark_service(monkeypatch, services_module, benchmark_module)
+    original_materialize = (
+        services_module.DefaultPilotServices._materialize_benchmark_holdout_source
+    )
+    source_opens = 0
+    crash_once = True
+    original_artifact_hash = artifacts_module.sha256_file
+    original_service_hash = services_module.sha256_file
+
+    def reject_source_artifact_hash(path: Path) -> str:
+        if path.name == "holdout_features.parquet":
+            raise AssertionError("physical holdout was hashed outside its exact-once access")
+        return cast(str, original_artifact_hash(path))
+
+    def reject_source_service_hash(path: Path) -> str:
+        if path.name == "holdout_features.parquet":
+            raise AssertionError("physical holdout was hashed outside its exact-once access")
+        return cast(str, original_service_hash(path))
+
+    def counted_materialize(self: Any, *args: Any, **kwargs: Any) -> pd.DataFrame:
+        nonlocal source_opens
+        source_opens += 1
+        return cast(pd.DataFrame, original_materialize(self, *args, **kwargs))
+
+    def crash_after_complete(self: Any) -> None:
+        nonlocal crash_once
+        del self
+        if crash_once:
+            crash_once = False
+            raise RuntimeError("simulated crash after durable holdout cache")
+
+    monkeypatch.setattr(
+        services_module.DefaultPilotServices,
+        "_materialize_benchmark_holdout_source",
+        counted_materialize,
+    )
+    monkeypatch.setattr(
+        services_module.DefaultPilotServices,
+        "_after_benchmark_holdout_cache_complete",
+        crash_after_complete,
+    )
+    monkeypatch.setattr(artifacts_module, "sha256_file", reject_source_artifact_hash)
+    monkeypatch.setattr(services_module, "sha256_file", reject_source_service_hash)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        DefaultPilotServices().benchmark(store.root)
+    assert source_opens == 1
+    access_root = store.root / ".benchmark-holdout-access"
+    assert (access_root / "intent.json").is_file()
+    assert (access_root / "cache.parquet").is_file()
+    assert (access_root / "complete.json").is_file()
+
+    result = DefaultPilotServices().benchmark(store.root)
+    assert result.status is StageStatus.SUCCESS
+    assert source_opens == 1
+    resumed = DefaultPilotServices().benchmark(store.root)
+    assert resumed.status is StageStatus.SUCCESS
+    assert source_opens == 1
+
+
+@pytest.mark.parametrize("tamper", ["intent", "cache", "source_marker"])
+def test_holdout_access_tamper_fails_closed_without_source_reopen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str
+) -> None:
+    import pv_pilot.benchmark as benchmark_module
+
+    artifacts_module: Any = importlib.import_module("pv_pilot.artifacts")
+    services_module: Any = importlib.import_module("pv_pilot.services")
+    store = _make_service_run(tmp_path)
+    _install_fast_benchmark_service(monkeypatch, services_module, benchmark_module)
+    original_materialize = (
+        services_module.DefaultPilotServices._materialize_benchmark_holdout_source
+    )
+    original_artifact_hash = artifacts_module.sha256_file
+    original_service_hash = services_module.sha256_file
+    source_opens = 0
+
+    def counted_materialize(self: Any, *args: Any, **kwargs: Any) -> pd.DataFrame:
+        nonlocal source_opens
+        source_opens += 1
+        return cast(pd.DataFrame, original_materialize(self, *args, **kwargs))
+
+    def crash_after_complete(self: Any) -> None:
+        del self
+        raise RuntimeError("stop after COMPLETE")
+
+    def reject_source_hash(path: Path, original: Any) -> str:
+        if path.name == "holdout_features.parquet":
+            raise AssertionError("tamper recovery reopened the physical holdout")
+        return cast(str, original(path))
+
+    monkeypatch.setattr(
+        services_module.DefaultPilotServices,
+        "_materialize_benchmark_holdout_source",
+        counted_materialize,
+    )
+    monkeypatch.setattr(
+        services_module.DefaultPilotServices,
+        "_after_benchmark_holdout_cache_complete",
+        crash_after_complete,
+    )
+    monkeypatch.setattr(
+        artifacts_module,
+        "sha256_file",
+        lambda path: reject_source_hash(path, original_artifact_hash),
+    )
+    monkeypatch.setattr(
+        services_module,
+        "sha256_file",
+        lambda path: reject_source_hash(path, original_service_hash),
+    )
+    with pytest.raises(RuntimeError, match="COMPLETE"):
+        DefaultPilotServices().benchmark(store.root)
+    assert source_opens == 1
+
+    access_root = store.root / ".benchmark-holdout-access"
+    if tamper == "intent":
+        intent_path = access_root / "intent.json"
+        intent = json.loads(intent_path.read_text(encoding="utf-8"))
+        intent["access_id"] = "f" * 32
+        intent_path.write_text(json.dumps(intent), encoding="utf-8")
+    elif tamper == "cache":
+        cache_path = access_root / "cache.parquet"
+        cache_path.write_bytes(cache_path.read_bytes() + b"tampered")
+    else:
+        marker_path = store.root / "build-splits/stage_manifest.json"
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["details"]["tampered"] = True
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    monkeypatch.setattr(
+        services_module.DefaultPilotServices,
+        "_after_benchmark_holdout_cache_complete",
+        lambda self: None,
+    )
+    with pytest.raises(ValueError):
+        DefaultPilotServices().benchmark(store.root)
+    assert source_opens == 1
+    assert not (store.root / "benchmark/stage_manifest.json").exists()
 
 
 def test_benchmark_contract_failure_is_durable_invalid_without_holdout(
@@ -825,3 +1104,48 @@ def test_benchmark_expired_resource_is_durable_invalid_before_slos_or_holdout(
     assert marker["details"]["gate"] == "resource_wall_clock"
     assert pd.read_parquet(store.root / "benchmark/exact_predictions.parquet").empty
     assert not [path for path in store.root.rglob("*") if ".tmp" in path.name]
+
+
+def test_benchmark_serializer_resource_expiry_stops_later_serializers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pv_pilot.benchmark as benchmark_module
+
+    services_module: Any = importlib.import_module("pv_pilot.services")
+    store = _make_service_run(tmp_path)
+    _install_fast_benchmark_service(monkeypatch, services_module, benchmark_module)
+    original = services_module.DefaultPilotServices._serialize_benchmark_payload
+    labels: list[str] = []
+
+    def expire_on_exact(
+        self: Any,
+        label: str,
+        producer: Any,
+        *,
+        guard: Any,
+        live_bytes: int,
+    ) -> tuple[bytes, int]:
+        labels.append(label)
+        if label == "exact_predictions":
+            raise services_module._ResourceLimitExceeded("wall_clock")
+        return cast(
+            tuple[bytes, int],
+            original(
+                self,
+                label,
+                producer,
+                guard=guard,
+                live_bytes=live_bytes,
+            ),
+        )
+
+    monkeypatch.setattr(
+        services_module.DefaultPilotServices,
+        "_serialize_benchmark_payload",
+        expire_on_exact,
+    )
+    result = DefaultPilotServices().benchmark(store.root)
+    assert result.status is StageStatus.INVALID
+    assert labels == ["validation_scores", "holdout_features", "exact_predictions"]
+    assert pd.read_parquet(store.root / "benchmark/exact_predictions.parquet").empty
+    assert not [path for path in store.root.glob(".stage-benchmark-*")]

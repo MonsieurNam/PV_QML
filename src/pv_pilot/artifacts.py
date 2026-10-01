@@ -69,6 +69,53 @@ _TASK7_SELECTED_OUTPUTS = (
     "build-splits/feature_manifest.json",
     "build-splits/minmax_scalers.json",
 )
+_BENCHMARK_SELECTED_STAGE = "benchmark"
+_BENCHMARK_BASELINE_OUTPUTS = ("train-baselines/predictions.parquet",)
+_BENCHMARK_PHOTONIC_REQUIRED_OUTPUTS = frozenset(
+    {
+        "build-photonic-features/development_photonic_features.parquet",
+        "build-photonic-features/circuit_manifest.json",
+        "build-photonic-features/feature_manifest.json",
+        "build-photonic-features/state_spaces.json",
+    }
+)
+_BENCHMARK_INTERNAL_INPUTS = frozenset(
+    {
+        ".benchmark-holdout-access/intent.json",
+        ".benchmark-holdout-access/cache.parquet",
+        ".benchmark-holdout-access/complete.json",
+    }
+)
+
+
+def _validate_selected_output_shape(
+    stage: str, normalized_allowlist: Mapping[str, Iterable[str]]
+) -> None:
+    if set(normalized_allowlist) != set(STAGE_PREREQUISITES[stage]):
+        raise ValueError("prerequisite output allowlist must cover exact prerequisites")
+    normalized = {
+        prerequisite: tuple(sorted(paths))
+        for prerequisite, paths in normalized_allowlist.items()
+    }
+    if stage == _TASK7_SELECTED_STAGE:
+        selected = normalized[_TASK7_SELECTED_PREREQUISITE]
+        if selected != tuple(sorted(_TASK7_SELECTED_OUTPUTS)):
+            raise ValueError("Task 7 selected_outputs allowlist must match the fixed contract")
+        return
+    if stage != _BENCHMARK_SELECTED_STAGE:
+        raise ValueError("selected_outputs is not supported for this stage")
+    if normalized["train-baselines"] != tuple(sorted(_BENCHMARK_BASELINE_OUTPUTS)):
+        raise ValueError("benchmark baseline allowlist must match the fixed contract")
+    photonic = set(normalized["build-photonic-features"])
+    if not photonic >= _BENCHMARK_PHOTONIC_REQUIRED_OUTPUTS:
+        raise ValueError("benchmark photonic allowlist is missing required outputs")
+    circuit_paths = photonic - _BENCHMARK_PHOTONIC_REQUIRED_OUTPUTS
+    if not circuit_paths or any(
+        not path.startswith("build-photonic-features/circuits/")
+        or not path.endswith(".npz")
+        for path in circuit_paths
+    ):
+        raise ValueError("benchmark photonic allowlist has invalid circuit outputs")
 
 
 def _normalize_terminal_status(value: object) -> str:
@@ -367,6 +414,33 @@ class RunStore:
         if not resolved.is_relative_to(self.root):
             raise ValueError("artifact path would escape the run directory")
         return resolved
+
+    def _validate_selected_output_policy(
+        self, stage: str, normalized_allowlist: Mapping[str, Iterable[str]]
+    ) -> None:
+        _validate_selected_output_shape(stage, normalized_allowlist)
+        if stage != _BENCHMARK_SELECTED_STAGE:
+            return
+        marker = self._read_json_file(
+            self.root / "build-photonic-features/stage_manifest.json"
+        )
+        outputs = marker.get("outputs")
+        if not isinstance(outputs, list):
+            raise ValueError("benchmark photonic prerequisite marker has invalid outputs")
+        declared_circuits = {
+            str(record.get("path"))
+            for record in outputs
+            if isinstance(record, dict)
+            and isinstance(record.get("path"), str)
+            and str(record.get("path")).startswith("build-photonic-features/circuits/")
+            and str(record.get("path")).endswith(".npz")
+        }
+        expected_photonic = _BENCHMARK_PHOTONIC_REQUIRED_OUTPUTS | declared_circuits
+        actual_photonic = set(normalized_allowlist["build-photonic-features"])
+        if not declared_circuits or actual_photonic != expected_photonic:
+            raise ValueError(
+                "benchmark photonic allowlist must equal the immutable declared circuit set"
+            )
 
     @staticmethod
     def _validate_lock_identity(path: Path, descriptor: int) -> None:
@@ -869,6 +943,36 @@ class RunStore:
             verified = set()
         if stage in verified:
             return sha256_file(self.root / stage / "stage_manifest.json")
+        marker_path = self.root / stage / "stage_manifest.json"
+        if (
+            accepted_statuses == frozenset({"SUCCESS"})
+            and stage in {_TASK7_SELECTED_STAGE, _BENCHMARK_SELECTED_STAGE}
+            and marker_path.is_file()
+            and not marker_path.is_symlink()
+        ):
+            marker = self._read_json_file(marker_path)
+            details = marker.get("details")
+            if (
+                isinstance(details, dict)
+                and details.get("prerequisite_verification") == "selected_outputs"
+            ):
+                raw_allowlist = details.get("prerequisite_output_allowlist")
+                if not isinstance(raw_allowlist, dict) or any(
+                    not isinstance(prerequisite, str)
+                    or not isinstance(paths, list)
+                    or any(not isinstance(path, str) for path in paths)
+                    for prerequisite, paths in raw_allowlist.items()
+                ):
+                    raise ValueError(
+                        f"stage {stage!r} has an invalid selective verification policy"
+                    )
+                return self.verify_terminal_stage(
+                    stage,
+                    prerequisite_output_allowlist={
+                        prerequisite: tuple(paths)
+                        for prerequisite, paths in raw_allowlist.items()
+                    },
+                )
         prerequisite_hashes: dict[str, str] = {}
         for prerequisite in STAGE_PREREQUISITES[stage]:
             prerequisite_hashes[prerequisite] = self._verify_stage(
@@ -1096,20 +1200,21 @@ class RunStore:
         if not accepted_statuses or not accepted_statuses <= {"SUCCESS", "BLOCKED", "INVALID"}:
             raise ValueError("accepted terminal statuses are invalid")
         if prerequisite_output_allowlist is not None:
-            if stage != _TASK7_SELECTED_STAGE or accepted_statuses != frozenset({"SUCCESS"}):
+            if (
+                stage not in {_TASK7_SELECTED_STAGE, _BENCHMARK_SELECTED_STAGE}
+                or accepted_statuses != frozenset({"SUCCESS"})
+            ):
                 raise ValueError(
-                    "selected_outputs verification is limited to build-photonic-features SUCCESS"
+                    "selected_outputs verification is limited to audited SUCCESS stages"
                 )
-            if set(prerequisite_output_allowlist) != set(STAGE_PREREQUISITES[stage]):
-                raise ValueError("prerequisite output allowlist must cover exact prerequisites")
-            selected = tuple(
-                sorted(
+            policy_paths = {
+                prerequisite: tuple(
                     self._validated_target(path).relative_to(self.root).as_posix()
-                    for path in prerequisite_output_allowlist[_TASK7_SELECTED_PREREQUISITE]
+                    for path in paths
                 )
-            )
-            if selected != tuple(sorted(_TASK7_SELECTED_OUTPUTS)):
-                raise ValueError("Task 7 selected_outputs allowlist must match the fixed contract")
+                for prerequisite, paths in prerequisite_output_allowlist.items()
+            }
+            self._validate_selected_output_policy(stage, policy_paths)
             prerequisite_hashes = {
                 prerequisite: self._verify_stage_selected_outputs(
                     prerequisite,
@@ -1145,12 +1250,30 @@ class RunStore:
             inputs = manifest.get("input_hashes")
             if not isinstance(inputs, dict):
                 raise ValueError(f"stage {stage!r} has invalid input hashes")
+            selected_paths = {
+                path for paths in normalized_allowlist.values() for path in paths
+            }
             for relative, expected in inputs.items():
                 if not isinstance(relative, str) or not isinstance(expected, str):
                     raise ValueError(f"stage {stage!r} has invalid input hashes")
                 target = self._validated_target(relative)
+                if (
+                    relative not in selected_paths
+                    and not (
+                        stage == _BENCHMARK_SELECTED_STAGE
+                        and relative in _BENCHMARK_INTERNAL_INPUTS
+                    )
+                ):
+                    raise ValueError("selected-output stage input is not audited")
                 if not target.is_file() or target.is_symlink() or sha256_file(target) != expected:
                     raise ValueError(f"stage input checksum mismatch: {relative}")
+            expected_inputs = selected_paths | (
+                _BENCHMARK_INTERNAL_INPUTS
+                if stage == _BENCHMARK_SELECTED_STAGE
+                else frozenset()
+            )
+            if set(inputs) != expected_inputs:
+                raise ValueError("selected-output stage inputs do not match the fixed contract")
             outputs = manifest.get("outputs")
             if not isinstance(outputs, list):
                 raise ValueError(f"stage {stage!r} has invalid outputs")
@@ -1262,22 +1385,23 @@ class RunStore:
         if prerequisite_verification == "marker_only" and terminal_status != "INVALID":
             raise ValueError("marker_only prerequisite verification is limited to INVALID stages")
         if prerequisite_verification == "selected_outputs":
-            if stage != _TASK7_SELECTED_STAGE or terminal_status != "SUCCESS":
+            if (
+                stage not in {_TASK7_SELECTED_STAGE, _BENCHMARK_SELECTED_STAGE}
+                or terminal_status != "SUCCESS"
+            ):
                 raise ValueError(
-                    "selected_outputs is limited to build-photonic-features SUCCESS"
+                    "selected_outputs is limited to audited SUCCESS stages"
                 )
             if prerequisite_output_allowlist is None:
                 raise ValueError("selected_outputs requires a prerequisite output allowlist")
-            if set(prerequisite_output_allowlist) != set(STAGE_PREREQUISITES[stage]):
-                raise ValueError("prerequisite output allowlist must cover exact prerequisites")
-            selected = tuple(
-                sorted(
+            policy_paths = {
+                prerequisite: tuple(
                     self._validated_target(path).relative_to(self.root).as_posix()
-                    for path in prerequisite_output_allowlist[_TASK7_SELECTED_PREREQUISITE]
+                    for path in paths
                 )
-            )
-            if selected != tuple(sorted(_TASK7_SELECTED_OUTPUTS)):
-                raise ValueError("Task 7 selected_outputs allowlist must match the fixed contract")
+                for prerequisite, paths in prerequisite_output_allowlist.items()
+            }
+            self._validate_selected_output_policy(stage, policy_paths)
         elif prerequisite_output_allowlist is not None:
             raise ValueError(
                 "prerequisite output allowlist requires selected_outputs verification"
@@ -1332,6 +1456,10 @@ class RunStore:
             if (
                 prerequisite_verification == "selected_outputs"
                 and relative not in selected_paths
+                and not (
+                    stage == _BENCHMARK_SELECTED_STAGE
+                    and relative in _BENCHMARK_INTERNAL_INPUTS
+                )
             ):
                 raise ValueError(
                     "selected-output stage inputs must be explicitly allowlisted"
@@ -1341,6 +1469,14 @@ class RunStore:
             inputs[relative] = sha256_file(target)
             if commit_guard is not None:
                 commit_guard()
+        if prerequisite_verification == "selected_outputs":
+            expected_inputs = selected_paths | (
+                _BENCHMARK_INTERNAL_INPUTS
+                if stage == _BENCHMARK_SELECTED_STAGE
+                else frozenset()
+            )
+            if set(inputs) != expected_inputs:
+                raise ValueError("selected-output stage inputs do not match the fixed contract")
         external_inputs: dict[str, str] = {}
         for input_path, expected in (external_input_hashes or {}).items():
             if commit_guard is not None:

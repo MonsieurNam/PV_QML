@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import pickle
+import stat
 import time
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any, Literal, cast
+from uuid import uuid4
 
 import pandas as pd
 import psutil
@@ -55,6 +58,10 @@ class _ResourceLimitExceeded(RuntimeError):
     def __init__(self, gate: str) -> None:
         super().__init__(f"configured resource cap exceeded: {gate}")
         self.gate = gate
+
+
+class _HoldoutAccessIndeterminate(RuntimeError):
+    """A prior process may have physically opened the holdout without caching it."""
 
 
 @dataclass(slots=True)
@@ -115,6 +122,252 @@ class DefaultPilotServices:
         if not isinstance(payload, dict):
             raise ValueError(f"JSON artifact must be an object: {path.name}")
         return payload
+
+    @staticmethod
+    def _after_benchmark_holdout_materialized() -> None:
+        """Crash-injection seam immediately after the sole physical source access."""
+
+    @staticmethod
+    def _after_benchmark_holdout_cache_complete() -> None:
+        """Crash-injection seam after cache and COMPLETE are durable."""
+
+    @staticmethod
+    def _safe_private_bytes(path: Path, *, root: Path, max_bytes: int) -> bytes:
+        resolved = path.resolve(strict=False)
+        if not resolved.is_relative_to(root):
+            raise ValueError("benchmark holdout journal escapes the run directory")
+        path_stat = path.lstat()
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(path_stat.st_mode)
+            or path_stat.st_nlink != 1
+            or path_stat.st_size > max_bytes
+        ):
+            raise ValueError("benchmark holdout journal file is unsafe")
+        return path.read_bytes()
+
+    @classmethod
+    def _safe_private_object(cls, path: Path, *, root: Path) -> dict[str, Any]:
+        try:
+            payload: object = json.loads(
+                cls._safe_private_bytes(path, root=root, max_bytes=64 * 1024).decode("utf-8")
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("benchmark holdout journal JSON is invalid") from error
+        if not isinstance(payload, dict):
+            raise ValueError("benchmark holdout journal JSON must be an object")
+        return payload
+
+    @staticmethod
+    def _holdout_sample_order_sha256(frame: pd.DataFrame) -> str:
+        payload = json.dumps(
+            frame["sample_id"].astype(str).tolist(), separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _materialize_benchmark_holdout_source(
+        self,
+        path: Path,
+        *,
+        expected_sha256: str,
+        guard: _ResourceGuard,
+        declared_bytes: int,
+    ) -> pd.DataFrame:
+        """Read, checksum, and decode the immutable source through one file open."""
+
+        del self
+        guard.checkpoint(declared_bytes)
+        path_stat = path.lstat()
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(path_stat.st_mode)
+            or path_stat.st_nlink != 1
+        ):
+            raise ValueError("physical holdout source is not a safe regular file")
+        payload = path.read_bytes()
+        live_bytes = declared_bytes + len(payload)
+        guard.checkpoint(live_bytes)
+        if hashlib.sha256(payload).hexdigest() != expected_sha256:
+            raise ValueError("physical holdout checksum does not match its trusted marker")
+        frame = pd.read_parquet(io.BytesIO(payload))
+        guard.checkpoint(
+            live_bytes + int(frame.memory_usage(index=True, deep=True).sum())
+        )
+        return frame
+
+    def _load_or_materialize_benchmark_holdout(
+        self,
+        *,
+        store: RunStore,
+        config: PilotConfig,
+        source_relative: str,
+        source_sha256: str,
+        split_marker_sha256: str,
+        selection_freeze_sha256: str,
+        guard: _ResourceGuard,
+        declared_bytes: int,
+    ) -> tuple[pd.DataFrame, dict[str, Any], tuple[str, ...]]:
+        access_relative = ".benchmark-holdout-access"
+        access_root = store.root / access_relative
+        if access_root.exists() or access_root.is_symlink():
+            is_junction = getattr(access_root, "is_junction", lambda: False)()
+            if (
+                access_root.is_symlink()
+                or is_junction
+                or not access_root.is_dir()
+                or not access_root.resolve().is_relative_to(store.root)
+            ):
+                raise ValueError("benchmark holdout access directory is unsafe")
+        expected_identity = {
+            "schema_version": "1.0",
+            "run_id": store.root.name,
+            "run_config_sha256": store.config_hash,
+            "stage": "benchmark",
+            "source_path": source_relative,
+            "source_sha256": source_sha256,
+            "source_marker_sha256": split_marker_sha256,
+            "selection_freeze_sha256": selection_freeze_sha256,
+        }
+        intent_path = access_root / "intent.json"
+        cache_path = access_root / "cache.parquet"
+        complete_path = access_root / "complete.json"
+        if intent_path.exists() or intent_path.is_symlink():
+            intent = self._safe_private_object(intent_path, root=store.root)
+            if any(intent.get(key) != value for key, value in expected_identity.items()):
+                raise ValueError("benchmark holdout intent identity changed")
+            access_id = intent.get("access_id")
+            if not isinstance(access_id, str) or len(access_id) != 32:
+                raise ValueError("benchmark holdout intent access ID is invalid")
+            if intent.get("transaction_id") != access_id:
+                raise ValueError("benchmark holdout transaction ID is invalid")
+            if intent.get("state") != "INTENT":
+                raise ValueError("benchmark holdout intent state is invalid")
+            if not complete_path.exists() or complete_path.is_symlink():
+                raise _HoldoutAccessIndeterminate(
+                    "holdout INTENT exists without durable COMPLETE; a new run is required"
+                )
+            complete = self._safe_private_object(complete_path, root=store.root)
+            expected_complete_identity = {
+                **expected_identity,
+                "access_id": access_id,
+                "transaction_id": access_id,
+                "state": "COMPLETE",
+            }
+            if any(
+                complete.get(key) != value
+                for key, value in expected_complete_identity.items()
+            ):
+                raise ValueError("benchmark holdout COMPLETE identity changed")
+            cache_bytes = self._safe_private_bytes(
+                cache_path, root=store.root, max_bytes=guard.memory_bytes
+            )
+            guard.checkpoint(declared_bytes + len(cache_bytes))
+            if hashlib.sha256(cache_bytes).hexdigest() != complete.get("cache_sha256"):
+                raise ValueError("benchmark holdout cache checksum mismatch")
+            holdout = pd.read_parquet(io.BytesIO(cache_bytes))
+            guard.checkpoint(
+                declared_bytes
+                + len(cache_bytes)
+                + int(holdout.memory_usage(index=True, deep=True).sum())
+            )
+            if (
+                complete.get("row_count") != len(holdout)
+                or complete.get("schema_sha256") != feature_schema_sha256(config)
+                or complete.get("sample_id_order_sha256")
+                != self._holdout_sample_order_sha256(holdout)
+            ):
+                raise ValueError("benchmark holdout cache semantic contract mismatch")
+            audit = dict(complete)
+            audit["source_materializations"] = 1
+            audit["resume_source_reopened"] = False
+            return (
+                holdout,
+                audit,
+                (
+                    f"{access_relative}/intent.json",
+                    f"{access_relative}/cache.parquet",
+                    f"{access_relative}/complete.json",
+                ),
+            )
+
+        if cache_path.exists() or complete_path.exists():
+            raise ValueError("benchmark holdout cache exists without INTENT")
+        access_id = uuid4().hex
+        intent = {
+            **expected_identity,
+            "access_id": access_id,
+            "transaction_id": access_id,
+            "state": "INTENT",
+        }
+        guard.checkpoint(declared_bytes)
+        store.write_json(f"{access_relative}/intent.json", intent)
+        guard.checkpoint(declared_bytes)
+        holdout = self._materialize_benchmark_holdout_source(
+            store.root / source_relative,
+            expected_sha256=source_sha256,
+            guard=guard,
+            declared_bytes=declared_bytes,
+        )
+        self._after_benchmark_holdout_materialized()
+        holdout_memory = int(holdout.memory_usage(index=True, deep=True).sum())
+        guard.checkpoint(declared_bytes + holdout_memory)
+        holdout_bytes = feature_dataframe_parquet_bytes(holdout, config)
+        guard.checkpoint(declared_bytes + holdout_memory + len(holdout_bytes))
+        cache = store.write_bytes(f"{access_relative}/cache.parquet", holdout_bytes)
+        complete = {
+            **expected_identity,
+            "access_id": access_id,
+            "transaction_id": access_id,
+            "state": "COMPLETE",
+            "cache_path": f"{access_relative}/cache.parquet",
+            "cache_sha256": sha256_file(cache),
+            "row_count": len(holdout),
+            "schema_sha256": feature_schema_sha256(config),
+            "sample_id_order_sha256": self._holdout_sample_order_sha256(holdout),
+        }
+        guard.checkpoint(declared_bytes + holdout_memory + len(holdout_bytes))
+        store.write_json(f"{access_relative}/complete.json", complete)
+        guard.checkpoint(declared_bytes + holdout_memory + len(holdout_bytes))
+        self._after_benchmark_holdout_cache_complete()
+        audit = dict(complete)
+        audit["source_materializations"] = 1
+        audit["resume_source_reopened"] = False
+        return (
+            holdout,
+            audit,
+            (
+                f"{access_relative}/intent.json",
+                f"{access_relative}/cache.parquet",
+                f"{access_relative}/complete.json",
+            ),
+        )
+
+    def _serialize_benchmark_payload(
+        self,
+        label: str,
+        producer: Callable[[], bytes],
+        *,
+        guard: _ResourceGuard,
+        live_bytes: int,
+    ) -> tuple[bytes, int]:
+        """Bound one large serialization and carry conservative live-byte accounting."""
+
+        del self, label
+        guard.checkpoint(live_bytes)
+        payload = producer()
+        updated_live_bytes = live_bytes + len(payload)
+        guard.checkpoint(updated_live_bytes)
+        return payload, updated_live_bytes
+
+    @staticmethod
+    def _benchmark_json_bytes(value: object) -> bytes:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
 
     @classmethod
     def _run_config(cls, store: RunStore) -> PilotConfig:
@@ -235,7 +488,24 @@ class DefaultPilotServices:
         if status not in {"SUCCESS", "INVALID"}:
             raise ValueError("benchmark has an invalid terminal marker")
         if status == "SUCCESS":
-            store.verify_terminal_stage("benchmark", accepted_statuses=frozenset({"SUCCESS"}))
+            details = manifest.get("details")
+            raw_allowlist = (
+                details.get("prerequisite_output_allowlist")
+                if isinstance(details, dict)
+                else None
+            )
+            if not isinstance(raw_allowlist, dict) or not all(
+                isinstance(key, str)
+                and isinstance(paths, list)
+                and all(isinstance(path, str) for path in paths)
+                for key, paths in raw_allowlist.items()
+            ):
+                raise ValueError("benchmark selected-output audit is missing")
+            store.verify_terminal_stage(
+                "benchmark",
+                accepted_statuses=frozenset({"SUCCESS"}),
+                prerequisite_output_allowlist=cast(dict[str, list[str]], raw_allowlist),
+            )
         else:
             store.verify_terminal_diagnostic_stage("benchmark")
         result = StageResult.model_validate_json(
@@ -1991,16 +2261,23 @@ class DefaultPilotServices:
 
             # All holdout-bound verification is deliberately below the immutable freeze.
             guard.checkpoint(declared)
-            baseline_marker_hash = store.verify_terminal_stage(
-                "train-baselines", accepted_statuses=frozenset({"SUCCESS"})
-            )
             baseline_predictions_relative = "train-baselines/predictions.parquet"
+            baseline_marker_hash = store._verify_stage_selected_outputs(
+                "train-baselines", (baseline_predictions_relative,)
+            )
             baseline_predictions_path = store.root / baseline_predictions_relative
             baseline_predictions_sha256 = sha256_file(baseline_predictions_path)
 
-            split_marker_hash = store.verify_terminal_stage(
-                "build-splits", accepted_statuses=frozenset({"SUCCESS"})
+            raw_prerequisite_hashes = task7_manifest.get("prerequisite_manifest_hashes")
+            split_marker_hash = (
+                raw_prerequisite_hashes.get("build-splits")
+                if isinstance(raw_prerequisite_hashes, dict)
+                else None
             )
+            if not isinstance(split_marker_hash, str) or len(split_marker_hash) != 64:
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "Task 7 does not bind a valid split marker"
+                )
             split_manifest = self._read_object(store.root / "build-splits/feature_manifest.json")
             split_stage_manifest = self._read_object(
                 store.root / "build-splits/stage_manifest.json"
@@ -2016,11 +2293,10 @@ class DefaultPilotServices:
                 if isinstance(record, dict)
             }
             holdout_relative = "build-splits/holdout_features.parquet"
-            holdout_path = store.root / holdout_relative
-            guard.checkpoint(declared)
-            if split_hashes.get(holdout_relative) != sha256_file(holdout_path):
+            holdout_sha256 = split_hashes.get(holdout_relative)
+            if not isinstance(holdout_sha256, str) or len(holdout_sha256) != 64:
                 raise photonic_benchmark.PhotonicBenchmarkContractError(
-                    "holdout checksum changed after selection freeze"
+                    "split marker does not bind the physical holdout"
                 )
             partitions = split_manifest.get("partitions")
             holdout_contract = partitions.get("holdout") if isinstance(partitions, dict) else None
@@ -2028,9 +2304,18 @@ class DefaultPilotServices:
                 raise photonic_benchmark.PhotonicBenchmarkContractError(
                     "holdout partition contract is missing"
                 )
-            # Exactly one dataframe materialization of the test partition.
-            guard.checkpoint(declared)
-            holdout = pds.dataset(holdout_path, format="parquet").to_table().to_pandas()
+            holdout, holdout_access_audit, holdout_access_paths = (
+                self._load_or_materialize_benchmark_holdout(
+                    store=store,
+                    config=config,
+                    source_relative=holdout_relative,
+                    source_sha256=holdout_sha256,
+                    split_marker_sha256=split_marker_hash,
+                    selection_freeze_sha256=freeze_hash,
+                    guard=guard,
+                    declared_bytes=declared,
+                )
+            )
             holdout_declared = int(holdout.memory_usage(index=True, deep=True).sum())
             declared += holdout_declared
             guard.checkpoint(declared)
@@ -2087,6 +2372,7 @@ class DefaultPilotServices:
                 exact_features,
                 tuple(config.photonics.raw_attempt_budgets),
                 SeedManager(config.seeds.master_seed),
+                resource_checkpoint=guard.checkpoint,
             )
             expected_finite_rows = (
                 len(holdout)
@@ -2104,23 +2390,71 @@ class DefaultPilotServices:
             if len(finite_predictions) != expected_finite_rows:
                 raise RuntimeError("finite-shot predictions are incomplete")
 
-            validation_bytes = photonic_benchmark.parquet_bytes(
-                selection.validation_scores,
-                photonic_benchmark.validation_score_arrow_schema(),
+            dataframe_live_bytes = sum(
+                int(frame.memory_usage(index=True, deep=True).sum())
+                for frame in (
+                    selection.validation_scores,
+                    exact_predictions,
+                    finite_counts,
+                    finite_predictions,
+                )
             )
-            feature_bytes = photonic_features.feature_parquet_bytes(exact_features)
-            exact_prediction_bytes = photonic_benchmark.parquet_bytes(
-                exact_predictions, photonic_benchmark.exact_prediction_arrow_schema()
+            serialization_live_bytes = declared + dataframe_live_bytes
+            guard.checkpoint(serialization_live_bytes)
+            validation_bytes, serialization_live_bytes = self._serialize_benchmark_payload(
+                "validation_scores",
+                lambda: photonic_benchmark.parquet_bytes(
+                    selection.validation_scores,
+                    photonic_benchmark.validation_score_arrow_schema(),
+                ),
+                guard=guard,
+                live_bytes=serialization_live_bytes,
             )
-            finite_count_bytes = photonic_benchmark.parquet_bytes(
-                finite_counts, photonic_benchmark.finite_shot_count_arrow_schema()
+            feature_bytes, serialization_live_bytes = self._serialize_benchmark_payload(
+                "holdout_features",
+                lambda: photonic_features.feature_parquet_bytes(exact_features),
+                guard=guard,
+                live_bytes=serialization_live_bytes,
             )
-            finite_prediction_bytes = photonic_benchmark.parquet_bytes(
-                finite_predictions,
-                photonic_benchmark.finite_shot_prediction_arrow_schema(),
+            exact_prediction_bytes, serialization_live_bytes = (
+                self._serialize_benchmark_payload(
+                    "exact_predictions",
+                    lambda: photonic_benchmark.parquet_bytes(
+                        exact_predictions,
+                        photonic_benchmark.exact_prediction_arrow_schema(),
+                    ),
+                    guard=guard,
+                    live_bytes=serialization_live_bytes,
+                )
             )
-            model_bytes = photonic_benchmark.model_pickle_bytes(selection.selected_models)
+            finite_count_bytes, serialization_live_bytes = self._serialize_benchmark_payload(
+                "finite_shot_counts",
+                lambda: photonic_benchmark.parquet_bytes(
+                    finite_counts, photonic_benchmark.finite_shot_count_arrow_schema()
+                ),
+                guard=guard,
+                live_bytes=serialization_live_bytes,
+            )
+            finite_prediction_bytes, serialization_live_bytes = (
+                self._serialize_benchmark_payload(
+                    "finite_shot_predictions",
+                    lambda: photonic_benchmark.parquet_bytes(
+                        finite_predictions,
+                        photonic_benchmark.finite_shot_prediction_arrow_schema(),
+                    ),
+                    guard=guard,
+                    live_bytes=serialization_live_bytes,
+                )
+            )
+            model_bytes, serialization_live_bytes = self._serialize_benchmark_payload(
+                "photonic_models",
+                lambda: photonic_benchmark.model_pickle_bytes(selection.selected_models),
+                guard=guard,
+                live_bytes=serialization_live_bytes,
+            )
+            guard.checkpoint(serialization_live_bytes)
             restored = pickle.loads(model_bytes)
+            guard.checkpoint(serialization_live_bytes)
             if not isinstance(restored, dict) or set(restored) != set(selection.selected_models):
                 raise RuntimeError("photonic model serialization round-trip failed")
             for key, model in restored.items():
@@ -2131,20 +2465,7 @@ class DefaultPilotServices:
                     or model.modes != original.modes
                 ):
                     raise RuntimeError("photonic model metadata changed after serialization")
-            output_bytes = sum(
-                map(
-                    len,
-                    (
-                        validation_bytes,
-                        feature_bytes,
-                        exact_prediction_bytes,
-                        finite_count_bytes,
-                        finite_prediction_bytes,
-                        model_bytes,
-                    ),
-                )
-            )
-            guard.checkpoint(declared + output_bytes)
+            guard.checkpoint(serialization_live_bytes)
         except _ResourceLimitExceeded as error:
             return self._publish_benchmark_invalid(
                 store=store,
@@ -2166,6 +2487,13 @@ class DefaultPilotServices:
                 gate="resource_fit_memory_rss",
                 message="photonic benchmark fit exceeded aggregate RSS",
             )
+        except _HoldoutAccessIndeterminate as error:
+            return self._publish_benchmark_invalid(
+                store=store,
+                guard=guard,
+                gate="holdout_access_indeterminate",
+                message=f"photonic benchmark cannot safely reopen the holdout: {error}",
+            )
         except photonic_benchmark.PhotonicBenchmarkContractError as error:
             return self._publish_benchmark_invalid(
                 store=store,
@@ -2178,6 +2506,7 @@ class DefaultPilotServices:
         selection_manifest.update(
             {
                 "holdout_audit": {
+                    **holdout_access_audit,
                     "opened_after_selection_freeze_sha256": freeze_hash,
                     "materialization_count": 1,
                     "prediction_passes": 1,
@@ -2271,13 +2600,57 @@ class DefaultPilotServices:
             circuit_manifest_relative,
             feature_manifest_relative,
             state_spaces_relative,
-            development_reference_relative,
             *trusted_circuit_paths,
-            holdout_relative,
-            "build-splits/feature_manifest.json",
+            *holdout_access_paths,
             baseline_predictions_relative,
         )
+        benchmark_prerequisite_allowlist = {
+            "train-baselines": (baseline_predictions_relative,),
+            "build-photonic-features": (
+                development_relative,
+                circuit_manifest_relative,
+                feature_manifest_relative,
+                state_spaces_relative,
+                *trusted_circuit_paths,
+            ),
+        }
         try:
+            selection_manifest_bytes, serialization_live_bytes = (
+                self._serialize_benchmark_payload(
+                    "selection_manifest_json",
+                    lambda: self._benchmark_json_bytes(selection_manifest),
+                    guard=guard,
+                    live_bytes=serialization_live_bytes,
+                )
+            )
+            model_manifest_bytes, serialization_live_bytes = self._serialize_benchmark_payload(
+                "model_manifest_json",
+                lambda: self._benchmark_json_bytes(model_manifest),
+                guard=guard,
+                live_bytes=serialization_live_bytes,
+            )
+            diagnostics_bytes, serialization_live_bytes = self._serialize_benchmark_payload(
+                "diagnostics_json",
+                lambda: self._benchmark_json_bytes(diagnostics),
+                guard=guard,
+                live_bytes=serialization_live_bytes,
+            )
+            ledger_bytes, serialization_live_bytes = self._serialize_benchmark_payload(
+                "resource_ledger_json",
+                lambda: self._benchmark_json_bytes(ledger),
+                guard=guard,
+                live_bytes=serialization_live_bytes,
+            )
+            result_bytes, serialization_live_bytes = self._serialize_benchmark_payload(
+                "stage_result_json",
+                lambda: self._benchmark_json_bytes(deterministic_data(result)),
+                guard=guard,
+                live_bytes=serialization_live_bytes,
+            )
+
+            def publication_checkpoint() -> None:
+                guard.checkpoint(serialization_live_bytes)
+
             with store.stage(
                 "benchmark",
                 input_paths=input_paths,
@@ -2287,20 +2660,22 @@ class DefaultPilotServices:
                     "selection_freeze_sha256": freeze_hash,
                     "holdout_materialization_count": 1,
                 },
-                commit_guard=guard.checkpoint,
-                private_write_guard=guard.checkpoint,
+                prerequisite_verification="selected_outputs",
+                prerequisite_output_allowlist=benchmark_prerequisite_allowlist,
+                commit_guard=publication_checkpoint,
+                private_write_guard=publication_checkpoint,
             ) as transaction:
-                transaction.write_json("selection_manifest.json", selection_manifest)
+                transaction.write_bytes("selection_manifest.json", selection_manifest_bytes)
                 transaction.write_bytes("validation_scores.parquet", validation_bytes)
                 transaction.write_bytes("holdout_photonic_features.parquet", feature_bytes)
                 transaction.write_bytes("exact_predictions.parquet", exact_prediction_bytes)
                 transaction.write_bytes("finite_shot_counts.parquet", finite_count_bytes)
                 transaction.write_bytes("finite_shot_predictions.parquet", finite_prediction_bytes)
                 transaction.write_bytes("models/photonic_models.pkl", model_bytes)
-                transaction.write_json("models/manifest.json", model_manifest)
-                transaction.write_json("diagnostics.json", diagnostics)
-                transaction.write_json("resource_ledger.json", ledger)
-                transaction.write_json("stage_result.json", deterministic_data(result))
+                transaction.write_bytes("models/manifest.json", model_manifest_bytes)
+                transaction.write_bytes("diagnostics.json", diagnostics_bytes)
+                transaction.write_bytes("resource_ledger.json", ledger_bytes)
+                transaction.write_bytes("stage_result.json", result_bytes)
         except _ResourceLimitExceeded as error:
             return self._publish_benchmark_invalid(
                 store=store,
