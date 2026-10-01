@@ -64,6 +64,14 @@ class _HoldoutAccessIndeterminate(RuntimeError):
     """A prior process may have physically opened the holdout without caching it."""
 
 
+@dataclass(frozen=True, slots=True)
+class _MaterializedHoldout:
+    """One physical holdout read plus the exact authenticated source snapshot."""
+
+    frame: pd.DataFrame
+    source_bytes: bytes
+
+
 @dataclass(slots=True)
 class _ResourceGuard:
     started: float
@@ -172,7 +180,7 @@ class DefaultPilotServices:
         expected_sha256: str,
         guard: _ResourceGuard,
         declared_bytes: int,
-    ) -> pd.DataFrame:
+    ) -> _MaterializedHoldout:
         """Read, checksum, and decode the immutable source through one file open."""
 
         del self
@@ -193,7 +201,7 @@ class DefaultPilotServices:
         guard.checkpoint(
             live_bytes + int(frame.memory_usage(index=True, deep=True).sum())
         )
-        return frame
+        return _MaterializedHoldout(frame=frame, source_bytes=payload)
 
     def _load_or_materialize_benchmark_holdout(
         self,
@@ -262,7 +270,15 @@ class DefaultPilotServices:
                 cache_path, root=store.root, max_bytes=guard.memory_bytes
             )
             guard.checkpoint(declared_bytes + len(cache_bytes))
-            if hashlib.sha256(cache_bytes).hexdigest() != complete.get("cache_sha256"):
+            cache_sha256 = hashlib.sha256(cache_bytes).hexdigest()
+            if cache_sha256 != source_sha256:
+                raise ValueError(
+                    "benchmark holdout cache is not anchored to the trusted source checksum"
+                )
+            if (
+                complete.get("cache_kind") != "exact_source_snapshot"
+                or cache_sha256 != complete.get("cache_sha256")
+            ):
                 raise ValueError("benchmark holdout cache checksum mismatch")
             holdout = pd.read_parquet(io.BytesIO(cache_bytes))
             guard.checkpoint(
@@ -302,25 +318,29 @@ class DefaultPilotServices:
         guard.checkpoint(declared_bytes)
         store.write_json(f"{access_relative}/intent.json", intent)
         guard.checkpoint(declared_bytes)
-        holdout = self._materialize_benchmark_holdout_source(
+        materialized = self._materialize_benchmark_holdout_source(
             store.root / source_relative,
             expected_sha256=source_sha256,
             guard=guard,
             declared_bytes=declared_bytes,
         )
+        holdout = materialized.frame
         self._after_benchmark_holdout_materialized()
         holdout_memory = int(holdout.memory_usage(index=True, deep=True).sum())
-        guard.checkpoint(declared_bytes + holdout_memory)
-        holdout_bytes = feature_dataframe_parquet_bytes(holdout, config)
+        holdout_bytes = materialized.source_bytes
         guard.checkpoint(declared_bytes + holdout_memory + len(holdout_bytes))
         cache = store.write_bytes(f"{access_relative}/cache.parquet", holdout_bytes)
+        cache_sha256 = sha256_file(cache)
+        if cache_sha256 != source_sha256:
+            raise ValueError("durable holdout snapshot changed while being published")
         complete = {
             **expected_identity,
             "access_id": access_id,
             "transaction_id": access_id,
             "state": "COMPLETE",
             "cache_path": f"{access_relative}/cache.parquet",
-            "cache_sha256": sha256_file(cache),
+            "cache_kind": "exact_source_snapshot",
+            "cache_sha256": cache_sha256,
             "row_count": len(holdout),
             "schema_sha256": feature_schema_sha256(config),
             "sample_id_order_sha256": self._holdout_sample_order_sha256(holdout),

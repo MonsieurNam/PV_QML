@@ -937,7 +937,9 @@ def test_holdout_complete_cache_resumes_success_without_reopening_source(
     assert source_opens == 1
 
 
-@pytest.mark.parametrize("tamper", ["intent", "cache", "source_marker"])
+@pytest.mark.parametrize(
+    "tamper", ["intent", "cache", "cache_and_complete", "source_marker"]
+)
 def test_holdout_access_tamper_fails_closed_without_source_reopen(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str
 ) -> None:
@@ -1001,6 +1003,16 @@ def test_holdout_access_tamper_fails_closed_without_source_reopen(
     elif tamper == "cache":
         cache_path = access_root / "cache.parquet"
         cache_path.write_bytes(cache_path.read_bytes() + b"tampered")
+    elif tamper == "cache_and_complete":
+        cache_path = access_root / "cache.parquet"
+        tampered_holdout = pd.read_parquet(cache_path)
+        tampered_holdout.loc[0, "target_ac_power_kw"] += 0.125
+        tampered_cache = feature_dataframe_parquet_bytes(tampered_holdout, _config())
+        cache_path.write_bytes(tampered_cache)
+        complete_path = access_root / "complete.json"
+        complete = json.loads(complete_path.read_text(encoding="utf-8"))
+        complete["cache_sha256"] = hashlib.sha256(tampered_cache).hexdigest()
+        complete_path.write_text(json.dumps(complete), encoding="utf-8")
     else:
         marker_path = store.root / "build-splits/stage_manifest.json"
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
