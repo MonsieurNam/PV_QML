@@ -109,6 +109,7 @@ _REPORT_FIXED_INPUTS = frozenset(
         "train-baselines/selection_manifest.json",
         "train-baselines/predictions.parquet",
         "train-baselines/diagnostics.json",
+        "train-baselines/models/baseline_models.pkl",
         "train-baselines/models/manifest.json",
         "train-baselines/resource_ledger.json",
         "train-baselines/stage_result.json",
@@ -118,6 +119,7 @@ _REPORT_FIXED_INPUTS = frozenset(
         "build-photonic-features/feature_manifest.json",
         "build-photonic-features/resource_ledger.json",
         "build-photonic-features/stage_result.json",
+        "benchmark/models/photonic_models.pkl",
         *_REPORT_BENCHMARK_OUTPUTS,
     }
 )

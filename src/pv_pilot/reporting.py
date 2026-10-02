@@ -336,6 +336,52 @@ def resource_gate_evidence(
             or int(ledger["max_memory_bytes"]) != expected_memory
         ):
             raise ReportContractError(f"resource ledger limits drifted for {stage}")
+        if float(ledger["wall_clock_seconds"]) > float(
+            ledger["max_wall_clock_seconds"]
+        ):
+            raise ReportContractError(f"resource ledger wall-clock cap was exceeded for {stage}")
+        for field in ("peak_rss_bytes", "peak_declared_bytes"):
+            if float(ledger[field]) > float(ledger["max_memory_bytes"]):
+                raise ReportContractError(
+                    f"resource ledger memory cap was exceeded by {field} for {stage}"
+                )
+        component_fields = (
+            "peak_parent_rss_bytes",
+            "peak_child_tree_rss_bytes",
+            "peak_combined_rss_bytes",
+        )
+        present_components = {field for field in component_fields if field in ledger}
+        if present_components and present_components != set(component_fields):
+            raise ReportContractError(
+                f"resource ledger component evidence is incomplete for {stage}"
+            )
+        if present_components:
+            for field in component_fields:
+                value = ledger[field]
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not np.isfinite(float(value))
+                    or float(value) < 0
+                    or float(value) > float(ledger["max_memory_bytes"])
+                ):
+                    raise ReportContractError(
+                        f"resource ledger component {field} is invalid for {stage}"
+                    )
+            combined = float(ledger["peak_combined_rss_bytes"])
+            # These are independently sampled maxima; their sum need not be
+            # contemporaneous. Each component must still fit under combined peak.
+            if any(
+                float(ledger[field]) > combined
+                for field in (
+                    "peak_parent_rss_bytes",
+                    "peak_child_tree_rss_bytes",
+                    "peak_rss_bytes",
+                )
+            ):
+                raise ReportContractError(
+                    f"resource ledger combined RSS is inconsistent for {stage}"
+                )
         passed[stage] = True
     return ResourceGateEvidence.from_mapping(passed)
 
@@ -694,6 +740,25 @@ def build_report_products(
 
     _validate_schema(exact_predictions, exact_prediction_arrow_schema(), "exact predictions")
     _validate_schema(baseline_predictions, prediction_arrow_schema(), "baseline predictions")
+    model_payloads = {
+        "baseline": (
+            baseline_model_manifest,
+            "train-baselines/models/baseline_models.pkl",
+        ),
+        "benchmark": (
+            benchmark_model_manifest,
+            "benchmark/models/photonic_models.pkl",
+        ),
+    }
+    for label, (manifest, path) in model_payloads.items():
+        captured_digest = input_hashes.get(path)
+        if (
+            not _is_sha256(captured_digest)
+            or manifest.get("models_sha256") != captured_digest
+        ):
+            raise ReportContractError(
+                f"{label} models checksum does not match the captured serialized model"
+            )
     validate_model_and_selection_lineage(
         config=config,
         selection_manifest=selection_manifest,

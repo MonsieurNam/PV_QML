@@ -62,6 +62,9 @@ def _ledger(stage: str) -> dict[str, Any]:
         "wall_clock_seconds": 0.25,
         "peak_rss_bytes": 1024,
         "peak_declared_bytes": 512,
+        "peak_parent_rss_bytes": 900,
+        "peak_child_tree_rss_bytes": 200,
+        "peak_combined_rss_bytes": 1024,
         "max_wall_clock_seconds": 3600,
         "max_memory_bytes": 8 * 1024**3,
         "cpu_only": True,
@@ -973,6 +976,111 @@ def test_report_rejects_malformed_typed_resource_evidence(
     )
 
     with pytest.raises(ValueError, match=r"resource ledger|resource evidence"):
+        DefaultPilotServices().report(store.root)
+
+
+@pytest.mark.parametrize(
+    ("stage", "field", "value"),
+    [
+        ("benchmark", "wall_clock_seconds", 3600.01),
+        ("benchmark", "peak_rss_bytes", 8 * 1024**3 + 1),
+        ("benchmark", "peak_combined_rss_bytes", 8 * 1024**3 + 1),
+        ("build-photonic-features", "peak_declared_bytes", 8 * 1024**3 + 1),
+        ("benchmark", "peak_combined_rss_bytes", 100),
+    ],
+)
+def test_report_rejects_resource_evidence_that_exceeds_caps_or_components(
+    tmp_path: Path, stage: str, field: str, value: float | int
+) -> None:
+    store = _make_completed_run(tmp_path)
+    relative = (
+        "validate-data/cleaning_ledger.json"
+        if stage == "validate-data"
+        else f"{stage}/resource_ledger.json"
+    )
+    _rewrite_json_output(
+        store, stage, relative, lambda payload: payload.__setitem__(field, value)
+    )
+    if stage != "benchmark":
+        downstream = (
+            "benchmark"
+            if stage in {"train-baselines", "build-photonic-features"}
+            else "build-splits"
+        )
+        downstream_marker_path = store.root / downstream / "stage_manifest.json"
+        downstream_marker = json.loads(downstream_marker_path.read_text(encoding="utf-8"))
+        downstream_marker["prerequisite_manifest_hashes"][stage] = sha256_file(
+            store.root / f"{stage}/stage_manifest.json"
+        )
+        downstream_marker_path.write_text(
+            json.dumps(downstream_marker, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        if downstream not in {"benchmark", "build-splits"}:
+            benchmark_marker_path = store.root / "benchmark/stage_manifest.json"
+            benchmark_marker = json.loads(
+                benchmark_marker_path.read_text(encoding="utf-8")
+            )
+            benchmark_marker["prerequisite_manifest_hashes"][downstream] = sha256_file(
+                downstream_marker_path
+            )
+            benchmark_marker_path.write_text(
+                json.dumps(benchmark_marker, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+
+    with pytest.raises(ValueError, match=r"resource ledger|resource evidence"):
+        DefaultPilotServices().report(store.root)
+
+
+@pytest.mark.parametrize(
+    ("stage", "relative"),
+    [
+        ("train-baselines", "train-baselines/models/baseline_models.pkl"),
+        ("benchmark", "benchmark/models/photonic_models.pkl"),
+    ],
+)
+def test_report_rejects_tampered_serialized_model_bytes(
+    tmp_path: Path, stage: str, relative: str
+) -> None:
+    store = _make_completed_run(tmp_path)
+    (store.root / relative).write_bytes(b"tampered-model")
+
+    with pytest.raises(ValueError, match=r"checksum|captured"):
+        DefaultPilotServices().report(store.root)
+
+
+@pytest.mark.parametrize(
+    ("stage", "relative"),
+    [
+        ("train-baselines", "train-baselines/models/baseline_models.pkl"),
+        ("benchmark", "benchmark/models/photonic_models.pkl"),
+    ],
+)
+def test_report_rejects_model_marker_manifest_checksum_mismatch(
+    tmp_path: Path, stage: str, relative: str
+) -> None:
+    store = _make_completed_run(tmp_path)
+    model_path = store.root / relative
+    model_path.write_bytes(b"replacement-model")
+    marker_path = store.root / f"{stage}/stage_manifest.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    next(item for item in marker["outputs"] if item["path"] == relative)["sha256"] = (
+        sha256_file(model_path)
+    )
+    marker_path.write_text(
+        json.dumps(marker, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+    if stage == "train-baselines":
+        benchmark_marker_path = store.root / "benchmark/stage_manifest.json"
+        benchmark_marker = json.loads(benchmark_marker_path.read_text(encoding="utf-8"))
+        benchmark_marker["prerequisite_manifest_hashes"][stage] = sha256_file(marker_path)
+        benchmark_marker_path.write_text(
+            json.dumps(benchmark_marker, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+
+    with pytest.raises(ValueError, match=r"models|checksum|lineage"):
         DefaultPilotServices().report(store.root)
 
 
