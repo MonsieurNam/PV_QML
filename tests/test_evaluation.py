@@ -117,6 +117,27 @@ def _rows(
     return pd.DataFrame(exact), pd.DataFrame(baseline)
 
 
+def _go_rows() -> tuple[pd.DataFrame, pd.DataFrame]:
+    exact, baseline = _rows(days=24)
+    for sample_id in ("sample-005", "sample-017"):
+        exact.loc[exact["sample_id"] == sample_id, list(Q_COLUMNS)] = 5.1
+    return exact, baseline
+
+
+def test_adversarial_provenance_fixture_would_otherwise_go() -> None:
+    exact, baseline = _go_rows()
+    result = evaluate_predictions(
+        exact,
+        baseline,
+        policy=_policy(),
+        expected_primary=_expected(),
+        seed_manager=SeedManager(20),
+        resource_gates=_gates(),
+    )
+
+    assert result.score_bundle.decision is ScientificDecision.GO
+
+
 def test_wis_matches_hand_calculation_through_centralized_metric() -> None:
     predictions = np.array([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
     score = timestamp_normalized_wis(
@@ -267,6 +288,84 @@ def test_exact_primary_requires_full_provenance_schema(column: str) -> None:
             policy=_policy(),
             expected_primary=_expected(),
             seed_manager=SeedManager(14),
+            resource_gates=_gates(),
+        )
+
+
+@pytest.mark.parametrize("column", ["split", "fit_phase"])
+def test_baseline_requires_full_holdout_provenance_schema(column: str) -> None:
+    exact, baseline = _go_rows()
+
+    with pytest.raises(EvaluationContractError, match="missing required columns"):
+        evaluate_predictions(
+            exact,
+            baseline.drop(columns=column),
+            policy=_policy(),
+            expected_primary=_expected(),
+            seed_manager=SeedManager(17),
+            resource_gates=_gates(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("model", "column", "value"),
+    [
+        ("xgboost", "split", "validation"),
+        ("persistence", "split", "validation"),
+        ("xgboost", "fit_phase", "validation_fit"),
+        ("persistence", "fit_phase", "validation_fit"),
+    ],
+)
+def test_mixed_or_wrong_baseline_provenance_is_rejected_before_go_decision(
+    model: str, column: str, value: str
+) -> None:
+    exact, baseline = _go_rows()
+    baseline.loc[
+        (baseline["model"] == model) & (baseline["sample_id"] == "sample-000"),
+        column,
+    ] = value
+
+    with pytest.raises(EvaluationContractError, match=column):
+        evaluate_predictions(
+            exact,
+            baseline,
+            policy=_policy(),
+            expected_primary=_expected(),
+            seed_manager=SeedManager(18),
+            resource_gates=_gates(),
+        )
+
+
+@pytest.mark.parametrize("source", ["quantum", "baseline"])
+@pytest.mark.parametrize(
+    ("column", "value", "message"),
+    [
+        ("issued_at_utc", pd.NaT, "timestamp"),
+        ("target_at_utc", pd.NaT, "timestamp"),
+        ("issued_at_utc", datetime(2026, 1, 1, 12), "timezone-aware"),
+        ("target_at_utc", datetime(2026, 1, 1, 12), "timezone-aware"),
+        ("target_at_utc", datetime(2026, 1, 1, 12, 10, tzinfo=UTC), "15 minutes"),
+        ("target_at_utc", datetime(2026, 1, 1, 11, 55, tzinfo=UTC), "15 minutes"),
+        ("sample_id", "   ", "nonblank"),
+        ("site_id", "", "nonblank"),
+    ],
+)
+def test_quantum_and_baseline_inputs_reject_invalid_identity_or_time_contract(
+    source: str, column: str, value: Any, message: str
+) -> None:
+    exact, baseline = _rows(days=4)
+    target = exact if source == "quantum" else baseline
+    if isinstance(value, datetime) and value.tzinfo is None:
+        target[column] = target[column].astype(object)
+    target.loc[target.index[0], column] = value
+
+    with pytest.raises(EvaluationContractError, match=message):
+        evaluate_predictions(
+            exact,
+            baseline,
+            policy=_policy(),
+            expected_primary=_expected(),
+            seed_manager=SeedManager(19),
             resource_gates=_gates(),
         )
 

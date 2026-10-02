@@ -181,11 +181,35 @@ def _required_columns(frame: pd.DataFrame, required: set[str], label: str) -> No
 
 def _normalize_timestamps(frame: pd.DataFrame, label: str) -> pd.DataFrame:
     work = frame.copy()
+    for column in ("sample_id", "site_id"):
+        values = work[column].tolist()
+        if any(not isinstance(value, str) or not value.strip() for value in values):
+            raise EvaluationContractError(f"{label} {column} values must be nonblank strings")
     for column in ("issued_at_utc", "target_at_utc"):
+        for value in work[column].tolist():
+            if pd.isna(value):
+                raise EvaluationContractError(f"{label} contains a null timestamp")
+            try:
+                timestamp = pd.Timestamp(value)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise EvaluationContractError(f"{label} contains an invalid timestamp") from error
+            if pd.isna(timestamp):
+                raise EvaluationContractError(f"{label} contains a null timestamp")
+            if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+                raise EvaluationContractError(
+                    f"{label} timestamps must be timezone-aware"
+                )
         try:
             work[column] = pd.to_datetime(work[column], utc=True, errors="raise")
-        except (TypeError, ValueError) as error:
+        except (TypeError, ValueError, OverflowError) as error:
             raise EvaluationContractError(f"{label} contains invalid {column}") from error
+        if work[column].isna().any():
+            raise EvaluationContractError(f"{label} contains a null timestamp")
+    horizons = work["target_at_utc"] - work["issued_at_utc"]
+    if not (horizons == pd.Timedelta(minutes=15)).all():
+        raise EvaluationContractError(
+            f"{label} target_at_utc must be exactly 15 minutes after issued_at_utc"
+        )
     return work
 
 
@@ -313,6 +337,8 @@ def _prepare_baselines(frame: pd.DataFrame, policy: EvaluationPolicy) -> pd.Data
         "capacity_kw",
         "model",
         "status",
+        "split",
+        "fit_phase",
         *q_columns,
     }
     _required_columns(frame, required, "baseline predictions")
@@ -320,6 +346,12 @@ def _prepare_baselines(frame: pd.DataFrame, policy: EvaluationPolicy) -> pd.Data
     work = work.loc[
         work["model"].astype(str).isin({policy.comparison_model, policy.fallback_model})
     ].copy()
+    if set(work["split"].astype(str)) != {"test"}:
+        raise EvaluationContractError("baseline split must be exactly 'test'")
+    if set(work["fit_phase"].astype(str)) != {"train_plus_validation_refit"}:
+        raise EvaluationContractError(
+            "baseline fit_phase must be exactly 'train_plus_validation_refit'"
+        )
     if work.duplicated([*_KEY_COLUMNS, "model"]).any():
         raise EvaluationContractError("baseline predictions contain duplicate model rows")
     inconsistent = (
