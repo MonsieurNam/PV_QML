@@ -86,6 +86,16 @@ _BENCHMARK_INTERNAL_INPUTS = frozenset(
         ".benchmark-holdout-access/complete.json",
     }
 )
+_REPORT_SELECTED_STAGE = "report"
+_REPORT_BENCHMARK_OUTPUTS = (
+    "benchmark/selection_manifest.json",
+    "benchmark/exact_predictions.parquet",
+    "benchmark/finite_shot_predictions.parquet",
+    "benchmark/diagnostics.json",
+    "benchmark/models/manifest.json",
+    "benchmark/resource_ledger.json",
+    "benchmark/stage_result.json",
+)
 
 
 def _validate_selected_output_shape(
@@ -101,6 +111,10 @@ def _validate_selected_output_shape(
         selected = normalized[_TASK7_SELECTED_PREREQUISITE]
         if selected != tuple(sorted(_TASK7_SELECTED_OUTPUTS)):
             raise ValueError("Task 7 selected_outputs allowlist must match the fixed contract")
+        return
+    if stage == _REPORT_SELECTED_STAGE:
+        if normalized["benchmark"] != tuple(sorted(_REPORT_BENCHMARK_OUTPUTS)):
+            raise ValueError("report benchmark allowlist must match the fixed contract")
         return
     if stage != _BENCHMARK_SELECTED_STAGE:
         raise ValueError("selected_outputs is not supported for this stage")
@@ -945,8 +959,19 @@ class RunStore:
             return sha256_file(self.root / stage / "stage_manifest.json")
         marker_path = self.root / stage / "stage_manifest.json"
         if (
-            accepted_statuses == frozenset({"SUCCESS"})
-            and stage in {_TASK7_SELECTED_STAGE, _BENCHMARK_SELECTED_STAGE}
+            (
+                accepted_statuses == frozenset({"SUCCESS"})
+                or (
+                    stage == _REPORT_SELECTED_STAGE
+                    and accepted_statuses == frozenset({"BLOCKED"})
+                )
+            )
+            and stage
+            in {
+                _TASK7_SELECTED_STAGE,
+                _BENCHMARK_SELECTED_STAGE,
+                _REPORT_SELECTED_STAGE,
+            }
             and marker_path.is_file()
             and not marker_path.is_symlink()
         ):
@@ -1147,6 +1172,41 @@ class RunStore:
             raise ValueError("prerequisite output allowlist cannot be empty")
         return marker_hash
 
+    def _declared_report_input_sha256(self, relative: str) -> str | None:
+        """Return a five-stage output's authoritative checksum, or reject it."""
+
+        source_stage = relative.split("/", 1)[0]
+        if source_stage not in {
+            "validate-data",
+            "build-splits",
+            "train-baselines",
+            "build-photonic-features",
+            "benchmark",
+        }:
+            return None
+        marker_path = self.root / source_stage / "stage_manifest.json"
+        if not marker_path.is_file() or marker_path.is_symlink():
+            return None
+        manifest = self._read_json_file(marker_path)
+        if (
+            manifest.get("schema_version") != SCHEMA_VERSION
+            or manifest.get("stage") != source_stage
+            or manifest.get("status") != "SUCCESS"
+            or manifest.get("config_hash") != self.config_hash
+        ):
+            return None
+        outputs = manifest.get("outputs")
+        if not isinstance(outputs, list):
+            return None
+        matches = [
+            record.get("sha256")
+            for record in outputs
+            if isinstance(record, dict) and record.get("path") == relative
+        ]
+        if len(matches) != 1 or not isinstance(matches[0], str):
+            return None
+        return matches[0]
+
     def _verify_terminal_result_contract(self, manifest: Mapping[str, object]) -> None:
         """Bind the conventional JSON result to its marker even if declaration is removed."""
 
@@ -1200,12 +1260,19 @@ class RunStore:
         if not accepted_statuses or not accepted_statuses <= {"SUCCESS", "BLOCKED", "INVALID"}:
             raise ValueError("accepted terminal statuses are invalid")
         if prerequisite_output_allowlist is not None:
-            if (
-                stage not in {_TASK7_SELECTED_STAGE, _BENCHMARK_SELECTED_STAGE}
-                or accepted_statuses != frozenset({"SUCCESS"})
+            if stage not in {
+                _TASK7_SELECTED_STAGE,
+                _BENCHMARK_SELECTED_STAGE,
+                _REPORT_SELECTED_STAGE,
+            } or (
+                accepted_statuses != frozenset({"SUCCESS"})
+                and not (
+                    stage == _REPORT_SELECTED_STAGE
+                    and accepted_statuses == frozenset({"BLOCKED"})
+                )
             ):
                 raise ValueError(
-                    "selected_outputs verification is limited to audited SUCCESS stages"
+                    "selected_outputs verification is limited to audited terminal stages"
                 )
             policy_paths = {
                 prerequisite: tuple(
@@ -1263,8 +1330,18 @@ class RunStore:
                         stage == _BENCHMARK_SELECTED_STAGE
                         and relative in _BENCHMARK_INTERNAL_INPUTS
                     )
+                    and not (
+                        stage == _REPORT_SELECTED_STAGE
+                        and self._declared_report_input_sha256(relative) is not None
+                    )
                 ):
                     raise ValueError("selected-output stage input is not audited")
+                if stage == _REPORT_SELECTED_STAGE:
+                    declared_checksum = self._declared_report_input_sha256(relative)
+                    if declared_checksum != expected:
+                        raise ValueError(
+                            "report input checksum is not anchored to its source marker"
+                        )
                 if not target.is_file() or target.is_symlink() or sha256_file(target) != expected:
                     raise ValueError(f"stage input checksum mismatch: {relative}")
             expected_inputs = selected_paths | (
@@ -1272,7 +1349,12 @@ class RunStore:
                 if stage == _BENCHMARK_SELECTED_STAGE
                 else frozenset()
             )
-            if set(inputs) != expected_inputs:
+            if (
+                stage == _REPORT_SELECTED_STAGE
+                and not selected_paths <= set(inputs)
+            ) or (
+                stage != _REPORT_SELECTED_STAGE and set(inputs) != expected_inputs
+            ):
                 raise ValueError("selected-output stage inputs do not match the fixed contract")
             outputs = manifest.get("outputs")
             if not isinstance(outputs, list):
@@ -1300,12 +1382,14 @@ class RunStore:
             self._validated_target(path).relative_to(self.root).as_posix()
             for path in output_paths
         )
-        if stage != _TASK7_SELECTED_PREREQUISITE or tuple(sorted(paths)) != tuple(
-            sorted(_TASK7_SELECTED_OUTPUTS)
-        ):
-            raise ValueError(
-                "selected stage output verification is limited to the fixed Task 7 inputs"
-            )
+        valid_task7 = stage == _TASK7_SELECTED_PREREQUISITE and tuple(
+            sorted(paths)
+        ) == tuple(sorted(_TASK7_SELECTED_OUTPUTS))
+        valid_report = stage == _BENCHMARK_SELECTED_STAGE and tuple(
+            sorted(paths)
+        ) == tuple(sorted(_REPORT_BENCHMARK_OUTPUTS))
+        if not (valid_task7 or valid_report):
+            raise ValueError("selected stage output verification violates a fixed contract")
         return self._verify_stage_selected_outputs(stage, paths)
 
     def verify_terminal_diagnostic_stage(self, stage: str) -> str:
@@ -1385,12 +1469,19 @@ class RunStore:
         if prerequisite_verification == "marker_only" and terminal_status != "INVALID":
             raise ValueError("marker_only prerequisite verification is limited to INVALID stages")
         if prerequisite_verification == "selected_outputs":
-            if (
-                stage not in {_TASK7_SELECTED_STAGE, _BENCHMARK_SELECTED_STAGE}
-                or terminal_status != "SUCCESS"
+            if stage not in {
+                _TASK7_SELECTED_STAGE,
+                _BENCHMARK_SELECTED_STAGE,
+                _REPORT_SELECTED_STAGE,
+            } or (
+                terminal_status != "SUCCESS"
+                and not (
+                    stage == _REPORT_SELECTED_STAGE
+                    and terminal_status == "BLOCKED"
+                )
             ):
                 raise ValueError(
-                    "selected_outputs is limited to audited SUCCESS stages"
+                    "selected_outputs is limited to audited terminal stages"
                 )
             if prerequisite_output_allowlist is None:
                 raise ValueError("selected_outputs requires a prerequisite output allowlist")
@@ -1460,6 +1551,10 @@ class RunStore:
                     stage == _BENCHMARK_SELECTED_STAGE
                     and relative in _BENCHMARK_INTERNAL_INPUTS
                 )
+                and not (
+                    stage == _REPORT_SELECTED_STAGE
+                    and self._declared_report_input_sha256(relative) is not None
+                )
             ):
                 raise ValueError(
                     "selected-output stage inputs must be explicitly allowlisted"
@@ -1467,6 +1562,14 @@ class RunStore:
             if not target.is_file():
                 raise FileNotFoundError(f"stage input is not a file: {relative}")
             inputs[relative] = sha256_file(target)
+            if (
+                prerequisite_verification == "selected_outputs"
+                and stage == _REPORT_SELECTED_STAGE
+                and self._declared_report_input_sha256(relative) != inputs[relative]
+            ):
+                raise ValueError(
+                    "report input checksum is not anchored to its source marker"
+                )
             if commit_guard is not None:
                 commit_guard()
         if prerequisite_verification == "selected_outputs":
@@ -1475,7 +1578,12 @@ class RunStore:
                 if stage == _BENCHMARK_SELECTED_STAGE
                 else frozenset()
             )
-            if set(inputs) != expected_inputs:
+            if (
+                stage == _REPORT_SELECTED_STAGE
+                and not selected_paths <= set(inputs)
+            ) or (
+                stage != _REPORT_SELECTED_STAGE and set(inputs) != expected_inputs
+            ):
                 raise ValueError("selected-output stage inputs do not match the fixed contract")
         external_inputs: dict[str, str] = {}
         for input_path, expected in (external_input_hashes or {}).items():

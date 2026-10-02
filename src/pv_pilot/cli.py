@@ -29,9 +29,11 @@ class PilotServices(Protocol):
 
     def benchmark(self, run_dir: Path) -> StageResult | None: ...
 
-    def report(self, run_dir: Path) -> None: ...
+    def report(self, run_dir: Path) -> StageResult | None: ...
 
-    def run_pilot(self, *, config: Path | None, run_dir: Path | None) -> None: ...
+    def run_pilot(
+        self, *, config: Path | None, run_dir: Path | None
+    ) -> StageResult | None: ...
 
 
 services: PilotServices = DefaultPilotServices()
@@ -40,7 +42,7 @@ services: PilotServices = DefaultPilotServices()
 def _run_service(action: Callable[[], StageResult | None]) -> None:
     try:
         result = action()
-    except (FileNotFoundError, NotImplementedError) as error:
+    except (FileNotFoundError, NotImplementedError, ValueError) as error:
         typer.echo(f"Error: {error}", err=True)
         raise typer.Exit(code=1) from None
     if result is None:

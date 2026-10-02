@@ -71,6 +71,22 @@ def test_photonic_service_reports_missing_run_without_traceback() -> None:
     assert "traceback" not in result.output.lower()
 
 
+def test_report_contract_error_is_concise_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BrokenReport(RecordingServices):
+        def report(self, run_dir: Path) -> None:
+            del run_dir
+            raise ValueError("report artifact checksum mismatch")
+
+    monkeypatch.setattr(cli, "services", BrokenReport())
+    result = runner.invoke(app, ["report", "--run-dir", "run"])
+
+    assert result.exit_code == 1
+    assert "report artifact checksum mismatch" in result.output
+    assert "traceback" not in result.output.lower()
+
+
 class RecordingServices:
     def __init__(self) -> None:
         self.calls: list[tuple[str, object]] = []

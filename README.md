@@ -15,7 +15,7 @@ uv run mypy
 uv run pytest
 ```
 
-The implemented G0/G1 surface initializes immutable run directories and validates CSV or
+The implemented G0-G3 surface initializes immutable run directories and validates CSV or
 Parquet PV observations into a canonical five-minute Parquet dataset. For one-minute input,
 bins are right-closed: the interval ending at `t` contains exactly `t-4m, ..., t`. Incomplete
 bins are excluded rather than interpolated. Source timestamps are normalized to UTC, data
@@ -46,7 +46,24 @@ The bundled fixture is synthetic and exists only for software acceptance:
 ```powershell
 uv run pv-pilot init-run --config configs/pilot.synthetic.yaml
 uv run pv-pilot validate-data --run-dir <printed-run-directory>
+uv run pv-pilot build-splits --run-dir <printed-run-directory>
+uv run pv-pilot train-baselines --run-dir <printed-run-directory>
+uv run pv-pilot build-photonic-features --run-dir <printed-run-directory>
+uv run pv-pilot benchmark --run-dir <printed-run-directory>
+uv run pv-pilot report --run-dir <printed-run-directory>
 ```
 
+The same immutable sequence can be started or resumed with one command:
+
+```powershell
+uv run pv-pilot run-pilot --config configs/pilot.synthetic.yaml
+uv run pv-pilot run-pilot --run-dir <printed-run-directory>
+```
+
+The report reads only finalized artifacts; it does not retrain models, rebuild photonic
+features, rerun the benchmark, or reopen the configured raw input and physical split holdout.
+It reports exact quantum-only, full-system, and matched-baseline scores separately. Finite-shot
+results are explicitly `ideal_shot_noise_only` diagnostics and never drive GO/STOP.
+
 Synthetic runs and unapproved protocols always remain `NOT_EVALUATED`; they cannot produce a
-scientific GO/STOP decision.
+scientific GO/STOP decision or a quantum-advantage claim.

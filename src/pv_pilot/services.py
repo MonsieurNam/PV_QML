@@ -37,6 +37,8 @@ from .data import (
 )
 from .data import dataframe_parquet_bytes as dataframe_parquet_bytes
 from .domain import DetailEntry, StageResult, StageStatus, deterministic_data
+from .evaluation import EvaluationContractError
+from .reporting import ReportContractError, build_report_products
 from .seeds import SeedManager
 from .splits import (
     COMBINED_MEMBERSHIP_POLICY,
@@ -532,6 +534,88 @@ class DefaultPilotServices:
             (store.root / "benchmark/stage_result.json").read_text(encoding="utf-8")
         )
         return result.model_copy(update={"message": f"benchmark already {status.lower()}"})
+
+    @classmethod
+    def _existing_report_result(cls, store: RunStore) -> StageResult | None:
+        marker = store.root / "report/stage_manifest.json"
+        if not marker.is_file():
+            return None
+        manifest = cls._read_object(marker)
+        status = manifest.get("status")
+        if status not in {"SUCCESS", "BLOCKED", "INVALID"}:
+            raise ValueError("report has an invalid terminal marker")
+        if status == "INVALID":
+            store.verify_terminal_diagnostic_stage("report")
+        else:
+            details = manifest.get("details")
+            raw_allowlist = (
+                details.get("prerequisite_output_allowlist")
+                if isinstance(details, dict)
+                else None
+            )
+            if not isinstance(raw_allowlist, dict) or not all(
+                isinstance(key, str)
+                and isinstance(paths, list)
+                and all(isinstance(path, str) for path in paths)
+                for key, paths in raw_allowlist.items()
+            ):
+                raise ValueError("report selected-output audit is missing")
+            store.verify_terminal_stage(
+                "report",
+                accepted_statuses=frozenset({str(status)}),
+                prerequisite_output_allowlist=cast(dict[str, list[str]], raw_allowlist),
+            )
+        result = StageResult.model_validate_json(
+            (store.root / "report/stage_result.json").read_text(encoding="utf-8")
+        )
+        return result.model_copy(update={"message": f"report already {status.lower()}"})
+
+    @staticmethod
+    def _report_benchmark_allowlist() -> dict[str, tuple[str, ...]]:
+        return {
+            "benchmark": (
+                "benchmark/selection_manifest.json",
+                "benchmark/exact_predictions.parquet",
+                "benchmark/finite_shot_predictions.parquet",
+                "benchmark/diagnostics.json",
+                "benchmark/models/manifest.json",
+                "benchmark/resource_ledger.json",
+                "benchmark/stage_result.json",
+            )
+        }
+
+    @classmethod
+    def _read_declared_stage_artifact(
+        cls, store: RunStore, stage: str, relative_path: str
+    ) -> Path:
+        marker = cls._read_object(store.root / stage / "stage_manifest.json")
+        if (
+            marker.get("schema_version") != "1.0"
+            or marker.get("stage") != stage
+            or marker.get("status") != "SUCCESS"
+            or marker.get("config_hash") != store.config_hash
+        ):
+            raise ValueError(f"{stage} has an invalid SUCCESS marker")
+        outputs = marker.get("outputs")
+        if not isinstance(outputs, list):
+            raise ValueError(f"{stage} has an invalid output inventory")
+        matches = [
+            record
+            for record in outputs
+            if isinstance(record, dict) and record.get("path") == relative_path
+        ]
+        if len(matches) != 1 or not isinstance(matches[0].get("sha256"), str):
+            raise ValueError(f"{stage} output inventory is missing {relative_path}")
+        raw_target = store.root / relative_path
+        target = raw_target.resolve(strict=False)
+        if (
+            not target.is_relative_to(store.root)
+            or raw_target.is_symlink()
+            or not target.is_file()
+            or sha256_file(target) != matches[0]["sha256"]
+        ):
+            raise ValueError(f"stage output checksum mismatch: {relative_path}")
+        return target
 
     @staticmethod
     def _publish_benchmark_invalid(
@@ -2705,11 +2789,431 @@ class DefaultPilotServices:
             )
         return result
 
-    def report(self, run_dir: Path) -> None:
-        self._unimplemented("report")
+    @staticmethod
+    def _publish_report_invalid(
+        *,
+        store: RunStore,
+        guard: _ResourceGuard,
+        gate: str,
+        message: str,
+    ) -> StageResult:
+        result = StageResult(
+            stage="report",
+            status=StageStatus.INVALID,
+            message=message,
+            artifacts=(
+                Path("report/report.md"),
+                Path("report/scores.json"),
+                Path("report/scores.csv"),
+                Path("report/decision.json"),
+                Path("report/report_manifest.json"),
+                Path("report/resource_ledger.json"),
+            ),
+            details=(
+                DetailEntry(key="resource_gate", value=gate),
+                DetailEntry(key="scientific_decision", value="NOT_EVALUATED"),
+            ),
+        )
+        diagnostic = {
+            "schema_version": "1.0",
+            "stage_status": "invalid",
+            "scientific_decision": "not_evaluated",
+            "conclusion": "resource_gate_failed",
+            "gate": gate,
+        }
+        ledger = {
+            "schema_version": "1.0",
+            "stage": "report",
+            "status": "invalid",
+            "resource_status": "EXCEEDED",
+            "resource_gate": gate,
+            "wall_clock_seconds": time.perf_counter() - guard.started,
+            "peak_rss_bytes": guard.peak_rss_bytes,
+            "peak_declared_bytes": guard.peak_declared_bytes,
+            "max_wall_clock_seconds": guard.wall_seconds,
+            "max_memory_bytes": guard.memory_bytes,
+            "cpu_only": True,
+        }
+        with store.stage(
+            "report",
+            terminal_status="INVALID",
+            prerequisite_verification="marker_only",
+            details={
+                "result_status": "invalid",
+                "scientific_decision": "NOT_EVALUATED",
+                "resource_gate": gate,
+            },
+        ) as transaction:
+            transaction.write_text(
+                "report.md",
+                "# Photonic PV Pilot — Report unavailable\n\n"
+                f"INVALID / NOT_EVALUATED: {message}\n",
+            )
+            transaction.write_json("scores.json", diagnostic)
+            transaction.write_text(
+                "scores.csv",
+                "stage_status,scientific_decision,conclusion,gate\n"
+                f"invalid,not_evaluated,resource_gate_failed,{gate}\n",
+            )
+            transaction.write_json("decision.json", diagnostic)
+            transaction.write_json(
+                "report_manifest.json",
+                {
+                    **diagnostic,
+                    "pipeline_scope": "G0-G3",
+                    "limitations": ["report_resource_gate_failed"],
+                },
+            )
+            transaction.write_json("resource_ledger.json", ledger)
+            transaction.write_json("stage_result.json", deterministic_data(result))
+        return result
 
-    def run_pilot(self, *, config: Path | None, run_dir: Path | None) -> None:
-        self._unimplemented("run-pilot")
+    def report(self, run_dir: Path) -> StageResult:
+        """Score frozen G3 artifacts and publish a read-only decision report."""
+
+        started = time.perf_counter()
+        store = RunStore.open(run_dir)
+        existing = self._existing_report_result(store)
+        if existing is not None:
+            return existing
+        config = self._run_config(store)
+        guard = _ResourceGuard(
+            started=started,
+            wall_seconds=config.resources.max_wall_clock_seconds,
+            memory_bytes=int(config.resources.max_memory_gb * 1024**3),
+        )
+        try:
+            # This recursively verifies the benchmark and its audited prerequisite
+            # policy.  On real service artifacts that policy deliberately never opens
+            # the original raw input or the physical split holdout.
+            store.verify_selected_stage_outputs(
+                "benchmark", self._report_benchmark_allowlist()["benchmark"]
+            )
+            required: dict[str, tuple[str, ...]] = {
+                "validate-data": (
+                    "validate-data/data_card.json",
+                    "validate-data/cleaning_ledger.json",
+                    "validate-data/stage_result.json",
+                ),
+                "build-splits": (
+                    "build-splits/feature_manifest.json",
+                    "build-splits/minmax_scalers.json",
+                    "build-splits/clip_rates.json",
+                    "build-splits/resource_ledger.json",
+                    "build-splits/stage_result.json",
+                ),
+                "train-baselines": (
+                    "train-baselines/selection_manifest.json",
+                    "train-baselines/predictions.parquet",
+                    "train-baselines/diagnostics.json",
+                    "train-baselines/models/manifest.json",
+                    "train-baselines/resource_ledger.json",
+                    "train-baselines/stage_result.json",
+                ),
+                "build-photonic-features": (
+                    "build-photonic-features/state_spaces.json",
+                    "build-photonic-features/circuit_manifest.json",
+                    "build-photonic-features/feature_manifest.json",
+                    "build-photonic-features/resource_ledger.json",
+                    "build-photonic-features/stage_result.json",
+                ),
+                "benchmark": (
+                    "benchmark/selection_manifest.json",
+                    "benchmark/exact_predictions.parquet",
+                    "benchmark/finite_shot_predictions.parquet",
+                    "benchmark/diagnostics.json",
+                    "benchmark/models/manifest.json",
+                    "benchmark/resource_ledger.json",
+                    "benchmark/stage_result.json",
+                ),
+            }
+            declared_paths: dict[str, Path] = {}
+            for stage, paths in required.items():
+                for relative in paths:
+                    guard.checkpoint()
+                    declared_paths[relative] = self._read_declared_stage_artifact(
+                        store, stage, relative
+                    )
+            circuit_manifest = self._read_object(
+                declared_paths["build-photonic-features/circuit_manifest.json"]
+            )
+            raw_circuits = circuit_manifest.get("circuits")
+            if not isinstance(raw_circuits, list):
+                raise ReportContractError("circuit manifest has no circuit inventory")
+            for item in raw_circuits:
+                if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                    raise ReportContractError("circuit inventory contains an invalid path")
+                path = str(item["path"])
+                circuit_path = self._read_declared_stage_artifact(
+                    store, "build-photonic-features", path
+                )
+                if sha256_file(circuit_path) != item.get("npz_sha256"):
+                    raise ReportContractError("circuit NPZ checksum does not match its inventory")
+                declared_paths[path] = circuit_path
+
+            total_file_bytes = sum(path.stat().st_size for path in declared_paths.values())
+            guard.checkpoint(total_file_bytes)
+            selection_manifest = self._read_object(
+                declared_paths["benchmark/selection_manifest.json"]
+            )
+            baseline_selection = self._read_object(
+                declared_paths["train-baselines/selection_manifest.json"]
+            )
+            split_feature_manifest = self._read_object(
+                declared_paths["build-splits/feature_manifest.json"]
+            )
+            photonic_feature_manifest = self._read_object(
+                declared_paths["build-photonic-features/feature_manifest.json"]
+            )
+            state_spaces = self._read_object(
+                declared_paths["build-photonic-features/state_spaces.json"]
+            )
+            benchmark_diagnostics = self._read_object(
+                declared_paths["benchmark/diagnostics.json"]
+            )
+            data_card = self._read_object(declared_paths["validate-data/data_card.json"])
+            if (
+                data_card.get("provenance") != config.protocol.provenance.value
+                or bool(data_card.get("synthetic"))
+                != (config.protocol.provenance.value == "synthetic")
+                or data_card.get("status") != "success"
+            ):
+                raise ReportContractError("data-card provenance does not match the frozen config")
+            ledger_paths = {
+                "validate-data": "validate-data/cleaning_ledger.json",
+                "build-splits": "build-splits/resource_ledger.json",
+                "train-baselines": "train-baselines/resource_ledger.json",
+                "build-photonic-features": "build-photonic-features/resource_ledger.json",
+                "benchmark": "benchmark/resource_ledger.json",
+            }
+            resource_ledgers = {
+                stage: self._read_object(declared_paths[path])
+                for stage, path in ledger_paths.items()
+            }
+            exact = pd.read_parquet(declared_paths["benchmark/exact_predictions.parquet"])
+            baselines = pd.read_parquet(
+                declared_paths["train-baselines/predictions.parquet"]
+            )
+            finite = pd.read_parquet(
+                declared_paths["benchmark/finite_shot_predictions.parquet"]
+            )
+            declared = total_file_bytes + sum(
+                int(frame.memory_usage(index=True, deep=True).sum())
+                for frame in (exact, baselines, finite)
+            )
+            guard.checkpoint(declared)
+            base_hash_paths = {
+                "config": store.root / "config.json",
+                "environment": store.root / "environment_manifest.json",
+                "source": store.root / "source_manifest.json",
+                "run": store.root / "run_manifest.json",
+            }
+            provenance = {
+                "run_id": store.root.name,
+                "config_sha256": store.config_hash,
+                "canonical_data_sha256": data_card.get("canonical_sha256"),
+                "environment_manifest_sha256": sha256_file(
+                    base_hash_paths["environment"]
+                ),
+                "source_manifest_sha256": sha256_file(base_hash_paths["source"]),
+                "run_manifest_sha256": sha256_file(base_hash_paths["run"]),
+                "code": self._read_object(base_hash_paths["environment"]).get("git"),
+                "stage_manifest_sha256": {
+                    stage: sha256_file(store.root / stage / "stage_manifest.json")
+                    for stage in (
+                        "validate-data",
+                        "build-splits",
+                        "train-baselines",
+                        "build-photonic-features",
+                        "benchmark",
+                    )
+                },
+            }
+            input_hashes = {
+                relative: sha256_file(path)
+                for relative, path in sorted(declared_paths.items())
+            }
+            products = build_report_products(
+                config=config,
+                exact_predictions=exact,
+                baseline_predictions=baselines,
+                finite_shot_predictions=finite,
+                selection_manifest=selection_manifest,
+                circuit_manifest=circuit_manifest,
+                state_spaces=state_spaces,
+                benchmark_diagnostics=benchmark_diagnostics,
+                resource_ledgers=resource_ledgers,
+                provenance=provenance,
+                input_hashes=input_hashes,
+                versions={
+                    "protocol": config.protocol.version,
+                    "canonical_data_schema": data_card.get("canonical_schema_version"),
+                    "split_feature_schema": split_feature_manifest.get("schema_version"),
+                    "photonic_feature_schema": photonic_feature_manifest.get(
+                        "schema_version"
+                    ),
+                    "benchmark_schema": selection_manifest.get("schema_version"),
+                    "prediction_fit_phase": "train_plus_validation_refit",
+                },
+                baseline_selection=baseline_selection,
+                resource_checkpoint=guard.checkpoint,
+            )
+            report_manifest_bytes = self._benchmark_json_bytes(products.report_manifest)
+            markdown_bytes = products.report_markdown.encode("utf-8")
+            output_bytes = sum(
+                len(payload)
+                for payload in (
+                    products.timestamp_scores_parquet,
+                    products.evaluated_predictions_parquet,
+                    products.bootstrap_replicates_parquet,
+                    products.scores_json,
+                    products.scores_csv,
+                    products.decision_json,
+                    report_manifest_bytes,
+                    markdown_bytes,
+                )
+            )
+            guard.checkpoint(declared + output_bytes)
+        except _ResourceLimitExceeded as error:
+            return self._publish_report_invalid(
+                store=store,
+                guard=guard,
+                gate=f"resource_{error.gate}",
+                message="report generation exceeded a configured resource cap",
+            )
+        except (EvaluationContractError, ReportContractError) as error:
+            raise ValueError(f"report artifact contract is invalid: {error}") from error
+
+        bundle = products.evaluation.score_bundle
+        terminal_status = cast(
+            Literal["SUCCESS", "BLOCKED", "INVALID"], bundle.stage_status.value.upper()
+        )
+        artifacts = (
+            Path("report/report.md"),
+            Path("report/timestamp_scores.parquet"),
+            Path("report/evaluated_predictions.parquet"),
+            Path("report/bootstrap_replicates.parquet"),
+            Path("report/scores.json"),
+            Path("report/scores.csv"),
+            Path("report/decision.json"),
+            Path("report/report_manifest.json"),
+            Path("report/resource_ledger.json"),
+        )
+        result = StageResult(
+            stage="report",
+            status=bundle.stage_status,
+            message=(
+                "pilot report produced; scientific decision is not evaluated"
+                if bundle.stage_status is StageStatus.BLOCKED
+                else f"pilot report produced: {bundle.decision.value}"
+            ),
+            artifacts=artifacts,
+            details=(
+                DetailEntry(key="scientific_decision", value=bundle.decision.value),
+                DetailEntry(key="conclusion", value=bundle.conclusion),
+            ),
+        )
+        guard.sample_without_enforcement()
+        ledger = {
+            "schema_version": "1.0",
+            "stage": "report",
+            "status": bundle.stage_status.value,
+            "resource_status": "WITHIN_LIMIT",
+            "wall_clock_seconds": time.perf_counter() - started,
+            "peak_rss_bytes": guard.peak_rss_bytes,
+            "peak_parent_rss_bytes": guard.peak_parent_rss_bytes,
+            "peak_child_tree_rss_bytes": guard.peak_child_tree_rss_bytes,
+            "peak_combined_rss_bytes": guard.peak_combined_rss_bytes,
+            "peak_declared_bytes": guard.peak_declared_bytes,
+            "max_wall_clock_seconds": guard.wall_seconds,
+            "max_memory_bytes": guard.memory_bytes,
+            "cpu_only": True,
+        }
+
+        def publication_checkpoint() -> None:
+            guard.checkpoint(declared + output_bytes)
+
+        try:
+            with store.stage(
+                "report",
+                input_paths=tuple(sorted(declared_paths)),
+                terminal_status=terminal_status,
+                prerequisite_verification="selected_outputs",
+                prerequisite_output_allowlist=self._report_benchmark_allowlist(),
+                details={
+                    "result_status": bundle.stage_status.value,
+                    "scientific_decision": bundle.decision.value,
+                    "conclusion": bundle.conclusion,
+                    "read_only_consumer": True,
+                },
+                commit_guard=publication_checkpoint,
+                private_write_guard=publication_checkpoint,
+            ) as transaction:
+                transaction.write_bytes("report.md", markdown_bytes)
+                transaction.write_bytes(
+                    "timestamp_scores.parquet", products.timestamp_scores_parquet
+                )
+                transaction.write_bytes(
+                    "evaluated_predictions.parquet",
+                    products.evaluated_predictions_parquet,
+                )
+                transaction.write_bytes(
+                    "bootstrap_replicates.parquet",
+                    products.bootstrap_replicates_parquet,
+                )
+                transaction.write_bytes("scores.json", products.scores_json)
+                transaction.write_bytes("scores.csv", products.scores_csv)
+                transaction.write_bytes("decision.json", products.decision_json)
+                transaction.write_bytes("report_manifest.json", report_manifest_bytes)
+                transaction.write_json("resource_ledger.json", ledger)
+                transaction.write_json("stage_result.json", deterministic_data(result))
+        except _ResourceLimitExceeded as error:
+            return self._publish_report_invalid(
+                store=store,
+                guard=guard,
+                gate=f"resource_{error.gate}",
+                message="report publication exceeded a configured resource cap",
+            )
+        return result
+
+    def run_pilot(
+        self, *, config: Path | None, run_dir: Path | None
+    ) -> StageResult:
+        """Initialize or resume the exact immutable G0-G3 stage sequence."""
+
+        if (config is None) == (run_dir is None):
+            raise ValueError("provide exactly one of config or run_dir")
+        active_run = self.init_run(config) if config is not None else cast(Path, run_dir)
+        stages: tuple[Callable[[Path], StageResult], ...] = (
+            self.validate_data,
+            self.build_splits,
+            self.train_baselines,
+            self.build_photonic_features,
+            self.benchmark,
+            self.report,
+        )
+        final: StageResult | None = None
+
+        def with_run_path(result: StageResult) -> StageResult:
+            message = result.message or result.stage
+            details = (
+                *(item for item in result.details if item.key != "run_dir"),
+                DetailEntry(key="run_dir", value=active_run.as_posix()),
+            )
+            return result.model_copy(
+                update={
+                    "message": f"{message} [run: {active_run}]",
+                    "details": details,
+                }
+            )
+
+        for stage in stages:
+            final = stage(active_run)
+            if final.status is not StageStatus.SUCCESS:
+                return with_run_path(final)
+        if final is None:
+            raise RuntimeError("pipeline has no stages")
+        return with_run_path(final)
 
 
 def init_run(config: Path) -> Path:
