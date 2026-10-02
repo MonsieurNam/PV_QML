@@ -98,9 +98,15 @@ _REPORT_BENCHMARK_OUTPUTS = (
 )
 _REPORT_FIXED_INPUTS = frozenset(
     {
+        "config.json",
+        "environment_manifest.json",
+        "source_manifest.json",
+        "run_manifest.json",
+        "validate-data/stage_manifest.json",
         "validate-data/data_card.json",
         "validate-data/cleaning_ledger.json",
         "validate-data/stage_result.json",
+        "build-splits/stage_manifest.json",
         "build-splits/feature_manifest.json",
         "build-splits/minmax_scalers.json",
         "build-splits/clip_rates.json",
@@ -113,6 +119,8 @@ _REPORT_FIXED_INPUTS = frozenset(
         "train-baselines/models/manifest.json",
         "train-baselines/resource_ledger.json",
         "train-baselines/stage_result.json",
+        "train-baselines/stage_manifest.json",
+        "build-photonic-features/stage_manifest.json",
         "build-photonic-features/development_photonic_features.parquet",
         "build-photonic-features/state_spaces.json",
         "build-photonic-features/circuit_manifest.json",
@@ -120,6 +128,7 @@ _REPORT_FIXED_INPUTS = frozenset(
         "build-photonic-features/resource_ledger.json",
         "build-photonic-features/stage_result.json",
         "benchmark/models/photonic_models.pkl",
+        "benchmark/stage_manifest.json",
         *_REPORT_BENCHMARK_OUTPUTS,
     }
 )
@@ -1280,7 +1289,7 @@ class RunStore:
 
         self._verify_stage_marker_only("benchmark")
         marker_by_stage: dict[str, Mapping[str, object]] = {}
-        output_by_stage: dict[str, dict[str, str]] = {}
+        marker_hashes: dict[str, str] = {}
         for stage in (
             "validate-data",
             "build-splits",
@@ -1300,6 +1309,49 @@ class RunStore:
             ):
                 raise ValueError(f"stage {stage!r} has an invalid SUCCESS marker")
             marker_by_stage[stage] = marker
+            marker_hashes[stage] = sha256_file(marker_path)
+
+        return self.report_input_inventory_from_captured_manifests(
+            marker_by_stage, marker_hashes
+        )
+
+    def report_input_inventory_from_captured_manifests(
+        self,
+        marker_by_stage: Mapping[str, Mapping[str, object]],
+        marker_hashes: Mapping[str, str],
+    ) -> frozenset[str]:
+        """Validate captured marker snapshots without reopening their paths."""
+
+        expected_stages = (
+            "validate-data",
+            "build-splits",
+            "train-baselines",
+            "build-photonic-features",
+            "benchmark",
+        )
+        if set(marker_by_stage) != set(expected_stages) or set(marker_hashes) != set(
+            expected_stages
+        ):
+            raise ValueError("report stage-marker snapshots must cover the exact lineage")
+        output_by_stage: dict[str, dict[str, str]] = {}
+        for stage in expected_stages:
+            marker = marker_by_stage[stage]
+            digest = marker_hashes[stage]
+            if (
+                len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+                or marker.get("schema_version") != SCHEMA_VERSION
+                or marker.get("stage") != stage
+                or marker.get("status") != "SUCCESS"
+                or marker.get("config_hash") != self.config_hash
+            ):
+                raise ValueError(f"stage {stage!r} has an invalid captured SUCCESS marker")
+            expected_prerequisites = {
+                prerequisite: marker_hashes[prerequisite]
+                for prerequisite in STAGE_PREREQUISITES[stage]
+            }
+            if marker.get("prerequisite_manifest_hashes") != expected_prerequisites:
+                raise ValueError(f"stage {stage!r} captured prerequisite lineage is invalid")
             output_by_stage[stage] = self._exact_output_map(marker, stage)
 
         circuit_paths = {
@@ -1483,13 +1535,14 @@ class RunStore:
                     )
                     and not (
                         stage == _REPORT_SELECTED_STAGE
-                        and self._declared_report_input_sha256(relative) is not None
+                        and report_expected_inputs is not None
+                        and relative in report_expected_inputs
                     )
                 ):
                     raise ValueError("selected-output stage input is not audited")
                 if stage == _REPORT_SELECTED_STAGE:
                     declared_checksum = self._declared_report_input_sha256(relative)
-                    if declared_checksum != expected:
+                    if declared_checksum is not None and declared_checksum != expected:
                         raise ValueError(
                             "report input checksum is not anchored to its source marker"
                         )
@@ -1671,7 +1724,13 @@ class RunStore:
             self._cleanup_stale_stage_directories()
         if commit_guard is not None:
             commit_guard()
-        self._verify_base(expected_config_hash=config_hash)
+        report_preverified = (
+            stage == _REPORT_SELECTED_STAGE and preverified_input_hashes is not None
+        )
+        if not report_preverified:
+            self._verify_base(expected_config_hash=config_hash)
+        elif config_hash is not None and config_hash != self.config_hash:
+            raise ValueError("expected config hash does not match run config hash")
         if commit_guard is not None:
             commit_guard()
         marker = self.root / stage / "stage_manifest.json"
@@ -1692,12 +1751,18 @@ class RunStore:
                     self._validated_target(path).relative_to(self.root).as_posix()
                     for path in prerequisite_output_allowlist[prerequisite]
                 )
-                prerequisite_hashes[prerequisite] = (
-                    self._verify_stage_marker_only(prerequisite)
-                    if stage == _REPORT_SELECTED_STAGE
-                    and preverified_input_hashes is not None
-                    else self._verify_stage_selected_outputs(prerequisite, paths)
-                )
+                if report_preverified:
+                    assert preverified_input_hashes is not None
+                    marker_digest = preverified_input_hashes.get(
+                        f"{prerequisite}/stage_manifest.json"
+                    )
+                    if not isinstance(marker_digest, str):
+                        raise ValueError("captured prerequisite marker checksum is invalid")
+                    prerequisite_hashes[prerequisite] = marker_digest
+                else:
+                    prerequisite_hashes[prerequisite] = (
+                        self._verify_stage_selected_outputs(prerequisite, paths)
+                    )
                 normalized_allowlist[prerequisite] = sorted(paths)
             else:
                 prerequisite_hashes[prerequisite] = self._verify_stage(prerequisite)
@@ -1731,7 +1796,21 @@ class RunStore:
                 )
                 and not (
                     stage == _REPORT_SELECTED_STAGE
-                    and self._declared_report_input_sha256(relative) is not None
+                    and (
+                        (
+                            report_preverified
+                            and (
+                                relative in _REPORT_FIXED_INPUTS
+                                or (
+                                    relative.startswith(
+                                        "build-photonic-features/circuits/"
+                                    )
+                                    and relative.endswith(".npz")
+                                )
+                            )
+                        )
+                        or self._declared_report_input_sha256(relative) is not None
+                    )
                 )
             ):
                 raise ValueError(
@@ -1749,6 +1828,7 @@ class RunStore:
             if (
                 prerequisite_verification == "selected_outputs"
                 and stage == _REPORT_SELECTED_STAGE
+                and not report_preverified
                 and self._declared_report_input_sha256(relative) != inputs[relative]
             ):
                 raise ValueError(
@@ -1762,9 +1842,24 @@ class RunStore:
                 if stage == _BENCHMARK_SELECTED_STAGE
                 else frozenset()
             )
+            report_circuits = {
+                path
+                for path in inputs
+                if path.startswith("build-photonic-features/circuits/")
+                and path.endswith(".npz")
+            }
+            captured_report_inputs = frozenset({*_REPORT_FIXED_INPUTS, *report_circuits})
             if (
                 stage == _REPORT_SELECTED_STAGE
-                and set(inputs) != self._expected_report_inputs_and_verify_lineage()
+                and (
+                    not report_circuits
+                    or set(inputs)
+                    != (
+                        captured_report_inputs
+                        if report_preverified
+                        else self._expected_report_inputs_and_verify_lineage()
+                    )
+                )
             ) or (
                 stage != _REPORT_SELECTED_STAGE and set(inputs) != expected_inputs
             ):

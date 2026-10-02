@@ -17,6 +17,7 @@ import pv_pilot.artifacts as artifacts_module
 import pv_pilot.baselines as baseline_module
 import pv_pilot.benchmark as benchmark_module
 import pv_pilot.photonics as photonics_module
+import pv_pilot.reporting as reporting_module
 import pv_pilot.services as service_module
 from pv_pilot.artifacts import RunStore, StageTransaction, sha256_file
 from pv_pilot.baselines import (
@@ -633,6 +634,41 @@ def test_report_resource_expiry_publishes_durable_invalid(
     assert resumed.status is StageStatus.INVALID
 
 
+def test_report_low_memory_stops_before_next_parquet_serializer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _make_completed_run(tmp_path)
+    serializer_calls: list[str] = []
+    guards: list[service_module._ResourceGuard] = []
+    real_serializer = reporting_module._parquet_bytes
+    real_guard = service_module._ResourceGuard
+
+    def tracked_serializer(frame: pd.DataFrame, schema: Any) -> bytes:
+        serializer_calls.append(str(getattr(schema, "names", "unknown")))
+        payload = real_serializer(frame, schema)
+        if len(serializer_calls) == 1:
+            guards[0].memory_bytes = 1
+        return payload
+
+    def tracked_guard(**kwargs: Any) -> service_module._ResourceGuard:
+        guard = real_guard(**kwargs)
+        guards.append(guard)
+        return guard
+
+    monkeypatch.setattr(reporting_module, "_parquet_bytes", tracked_serializer)
+    monkeypatch.setattr(service_module, "_ResourceGuard", tracked_guard)
+
+    result = DefaultPilotServices().report(store.root)
+
+    assert result.status is StageStatus.INVALID
+    assert len(serializer_calls) == 1
+    assert not (store.root / "report/timestamp_scores.parquet").exists()
+    marker = json.loads((store.root / "report/stage_manifest.json").read_text(encoding="utf-8"))
+    assert marker["status"] == "INVALID"
+    assert marker["details"]["resource_gate"] == "resource_memory_rss"
+    assert DefaultPilotServices().report(store.root).status is StageStatus.INVALID
+
+
 def test_run_pilot_stops_on_first_non_success_and_resumes_in_exact_order(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -840,6 +876,109 @@ def test_report_rejects_transient_prediction_swap_between_hash_and_parse(
         DefaultPilotServices().report(store.root)
 
 
+def test_report_provenance_cannot_swap_between_digest_and_parse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _make_completed_run(tmp_path)
+    environment_path = store.root / "environment_manifest.json"
+    original_bytes = environment_path.read_bytes()
+    original_payload = json.loads(original_bytes.decode("utf-8"))
+    altered_payload = {**original_payload, "git": {"head": "f" * 40, "tracked_dirty": False}}
+    altered_bytes = json.dumps(
+        altered_payload, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    real_hash = cast(Callable[[Path], str], service_module.__dict__["sha256_file"])
+    real_read = DefaultPilotServices._read_object
+    swapped = False
+
+    def swap_after_checksum(path: Path) -> str:
+        nonlocal swapped
+        digest = real_hash(path)
+        if path == environment_path and not swapped:
+            environment_path.write_bytes(altered_bytes)
+            swapped = True
+        return digest
+
+    def restore_after_parse(path: Path) -> dict[str, Any]:
+        payload = real_read(path)
+        if path == environment_path and swapped:
+            environment_path.write_bytes(original_bytes)
+        return payload
+
+    monkeypatch.setattr(service_module, "sha256_file", swap_after_checksum)
+    monkeypatch.setattr(
+        DefaultPilotServices, "_read_object", staticmethod(restore_after_parse)
+    )
+
+    assert DefaultPilotServices().report(store.root).status is StageStatus.BLOCKED
+    report_manifest = json.loads(
+        (store.root / "report/report_manifest.json").read_text(encoding="utf-8")
+    )
+    assert report_manifest["provenance"]["environment_manifest_sha256"] == hashlib.sha256(
+        original_bytes
+    ).hexdigest()
+    assert report_manifest["provenance"]["code"] == original_payload["git"]
+    assert swapped is False
+
+
+def test_report_rejects_transient_base_provenance_swap_during_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _make_completed_run(tmp_path)
+    environment_path = store.root / "environment_manifest.json"
+    original = environment_path.read_bytes()
+    altered_payload = json.loads(original.decode("utf-8"))
+    altered_payload["git"] = {"head": "e" * 40, "tracked_dirty": False}
+    altered = json.dumps(
+        altered_payload, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    real_capture = DefaultPilotServices._capture_report_artifact
+
+    def swap_before_capture(
+        run_store: RunStore,
+        relative: str,
+        expected: str | None,
+        guard: object,
+        live_bytes: int,
+    ) -> tuple[bytes, int]:
+        if relative == "environment_manifest.json":
+            environment_path.write_bytes(altered)
+            try:
+                return real_capture(
+                    run_store, relative, expected, guard, live_bytes  # type: ignore[arg-type]
+                )
+            finally:
+                environment_path.write_bytes(original)
+        return real_capture(
+            run_store, relative, expected, guard, live_bytes  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(
+        DefaultPilotServices, "_capture_report_artifact", staticmethod(swap_before_capture)
+    )
+
+    with pytest.raises(ValueError, match=r"checksum|captured|provenance"):
+        DefaultPilotServices().report(store.root)
+    assert not (store.root / "report/stage_manifest.json").exists()
+
+
+def test_report_rejects_multilink_base_provenance_manifest(tmp_path: Path) -> None:
+    store = _make_completed_run(tmp_path)
+    environment_path = store.root / "environment_manifest.json"
+    linked_copy = store.root / ".environment-manifest-linked-copy"
+    environment_bytes = environment_path.read_bytes()
+    linked_copy.write_bytes(environment_bytes)
+    environment_path.unlink()
+    try:
+        environment_path.hardlink_to(linked_copy)
+    except OSError as error:
+        pytest.skip(f"hard links unavailable: {error}")
+
+    with pytest.raises(ValueError, match=r"regular single-link|unsafe|provenance"):
+        DefaultPilotServices().report(store.root)
+    assert not (store.root / "report/stage_manifest.json").exists()
+
+
 def test_report_captures_each_input_once_without_path_rehash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -851,6 +990,7 @@ def test_report_captures_each_input_once_without_path_rehash(
     real_service_hash = cast(
         Callable[[Path], str], service_module.__dict__["sha256_file"]
     )
+    capture_started = False
 
     def tracked_capture(
         run_store: RunStore,
@@ -859,6 +999,8 @@ def test_report_captures_each_input_once_without_path_rehash(
         guard: object,
         live_bytes: int,
     ) -> tuple[bytes, int]:
+        nonlocal capture_started
+        capture_started = True
         captured.append(relative)
         return real_capture(run_store, relative, digest, guard, live_bytes)  # type: ignore[arg-type]
 
@@ -867,7 +1009,7 @@ def test_report_captures_each_input_once_without_path_rehash(
             relative = Path(path).resolve().relative_to(store.root).as_posix()
         except ValueError:
             return real_artifact_hash(path)
-        if relative in expected:
+        if capture_started and relative in expected:
             raise AssertionError(f"report input was reopened for hashing: {relative}")
         return real_artifact_hash(path)
 
@@ -876,7 +1018,7 @@ def test_report_captures_each_input_once_without_path_rehash(
             relative = Path(path).resolve().relative_to(store.root).as_posix()
         except ValueError:
             return real_service_hash(path)
-        if relative in expected:
+        if capture_started and relative in expected:
             raise AssertionError(f"report input was reopened for hashing: {relative}")
         return real_service_hash(path)
 
@@ -887,7 +1029,7 @@ def test_report_captures_each_input_once_without_path_rehash(
     monkeypatch.setattr(service_module, "sha256_file", reject_service_input_rehash)
 
     assert DefaultPilotServices().report(store.root).status is StageStatus.BLOCKED
-    assert captured == sorted(expected)
+    assert set(captured) == expected
     assert len(captured) == len(set(captured))
 
 

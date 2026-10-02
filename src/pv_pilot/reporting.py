@@ -49,8 +49,9 @@ class ReportProducts:
     scores_json: bytes
     scores_csv: bytes
     decision_json: bytes
-    report_manifest: dict[str, Any]
-    report_markdown: str
+    report_manifest_json: bytes
+    report_markdown: bytes
+    declared_live_bytes: int
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -736,6 +737,7 @@ def build_report_products(
     versions: Mapping[str, Any],
     baseline_selection: Mapping[str, Any],
     baseline_model_manifest: Mapping[str, Any],
+    initial_live_bytes: int,
     resource_checkpoint: ResourceCheckpoint,
 ) -> ReportProducts:
     """Evaluate and serialize a report without fitting or reading source data."""
@@ -796,11 +798,17 @@ def build_report_products(
     ):
         raise ReportContractError("benchmark diagnostics/model/holdout evidence is inconsistent")
     gates = resource_gate_evidence(resource_ledgers, config=config)
+    if initial_live_bytes < 0:
+        raise ReportContractError("initial live-byte evidence is invalid")
     declared = sum(
         int(frame.memory_usage(index=True, deep=True).sum())
         for frame in (exact_predictions, baseline_predictions, finite_shot_predictions)
     )
-    resource_checkpoint(declared)
+
+    def evaluation_checkpoint(additional_bytes: int = 0) -> None:
+        resource_checkpoint(initial_live_bytes + additional_bytes)
+
+    evaluation_checkpoint(declared)
     policy = EvaluationPolicy.from_config(config)
     evaluation = evaluate_predictions(
         exact_predictions,
@@ -810,7 +818,7 @@ def build_report_products(
         seed_manager=SeedManager(config.seeds.master_seed),
         resource_gates=gates,
         finite_shot_predictions=finite_shot_predictions,
-        resource_checkpoint=resource_checkpoint,
+        resource_checkpoint=evaluation_checkpoint,
     )
     matched = _require_object(selection_manifest.get("matched_control"), "matched control")
     try:
@@ -835,14 +843,39 @@ def build_report_products(
         benchmark_diagnostics,
     )
     audit = _audit_predictions(exact_predictions, evaluation.per_timestamp)
-    timestamp_bytes = _parquet_bytes(evaluation.per_timestamp, _timestamp_schema())
-    audit_bytes = _parquet_bytes(audit, _audit_schema())
-    bootstrap_bytes = _parquet_bytes(evaluation.bootstrap_replicates, _bootstrap_schema())
-    resource_checkpoint(declared + len(timestamp_bytes) + len(audit_bytes) + len(bootstrap_bytes))
+    frame_live_bytes = initial_live_bytes + declared + sum(
+        int(frame.memory_usage(index=True, deep=True).sum())
+        for frame in (evaluation.per_timestamp, audit, evaluation.bootstrap_replicates)
+    )
+    resource_checkpoint(frame_live_bytes)
+    serialized_live_bytes = 0
+
+    def serialize_parquet(frame: pd.DataFrame, schema: pa.Schema) -> bytes:
+        nonlocal serialized_live_bytes
+        frame_bytes = int(frame.memory_usage(index=True, deep=True).sum())
+        resource_checkpoint(frame_live_bytes + serialized_live_bytes + frame_bytes)
+        payload = _parquet_bytes(frame, schema)
+        serialized_live_bytes += len(payload)
+        resource_checkpoint(frame_live_bytes + serialized_live_bytes)
+        return payload
+
+    timestamp_bytes = serialize_parquet(
+        evaluation.per_timestamp, _timestamp_schema()
+    )
+    audit_bytes = serialize_parquet(audit, _audit_schema())
+    bootstrap_bytes = serialize_parquet(
+        evaluation.bootstrap_replicates, _bootstrap_schema()
+    )
     bundle = evaluation.score_bundle
     scores_data = deterministic_data(bundle)
+    resource_checkpoint(frame_live_bytes + serialized_live_bytes)
     scores_json = _canonical_json_bytes(scores_data)
+    serialized_live_bytes += len(scores_json)
+    resource_checkpoint(frame_live_bytes + serialized_live_bytes)
+    resource_checkpoint(frame_live_bytes + serialized_live_bytes)
     scores_csv = _csv_bytes(bundle)
+    serialized_live_bytes += len(scores_csv)
+    resource_checkpoint(frame_live_bytes + serialized_live_bytes)
     decision_data = {
         "schema_version": "1.0",
         "stage_status": bundle.stage_status.value,
@@ -852,7 +885,10 @@ def build_report_products(
         "decision_basis": "exact_primary_system_score_calibration_resource_gates",
         "finite_shot_used": False,
     }
+    resource_checkpoint(frame_live_bytes + serialized_live_bytes)
     decision_json = _canonical_json_bytes(decision_data)
+    serialized_live_bytes += len(decision_json)
+    resource_checkpoint(frame_live_bytes + serialized_live_bytes)
     provenance_object = dict(provenance)
     report_manifest: dict[str, Any] = {
         "schema_version": "1.0",
@@ -903,19 +939,19 @@ def build_report_products(
             "no_quantum_advantage_claim",
         ],
     }
-    report_markdown = _render_markdown(
+    report_markdown_text = _render_markdown(
         bundle,
         provenance=config.protocol.provenance.value,
         finite_shot=finite_summary,
     )
-    for payload in (
-        scores_json,
-        scores_csv,
-        decision_json,
-        _canonical_json_bytes(report_manifest),
-        report_markdown.encode("utf-8"),
-    ):
-        resource_checkpoint(declared + len(payload))
+    resource_checkpoint(frame_live_bytes + serialized_live_bytes)
+    report_manifest_json = _canonical_json_bytes(report_manifest)
+    serialized_live_bytes += len(report_manifest_json)
+    resource_checkpoint(frame_live_bytes + serialized_live_bytes)
+    resource_checkpoint(frame_live_bytes + serialized_live_bytes)
+    report_markdown = report_markdown_text.encode("utf-8")
+    serialized_live_bytes += len(report_markdown)
+    resource_checkpoint(frame_live_bytes + serialized_live_bytes)
     return ReportProducts(
         evaluation=evaluation,
         expected_primary=expected,
@@ -925,8 +961,9 @@ def build_report_products(
         scores_json=scores_json,
         scores_csv=scores_csv,
         decision_json=decision_json,
-        report_manifest=report_manifest,
+        report_manifest_json=report_manifest_json,
         report_markdown=report_markdown,
+        declared_live_bytes=frame_live_bytes + serialized_live_bytes,
     )
 
 

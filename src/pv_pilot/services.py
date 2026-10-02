@@ -395,6 +395,12 @@ class DefaultPilotServices:
     @classmethod
     def _run_config(cls, store: RunStore) -> PilotConfig:
         payload = cls._read_object(store.root / "config.json")
+        return cls._config_from_snapshot(payload, store.config_hash)
+
+    @staticmethod
+    def _config_from_snapshot(
+        payload: Mapping[str, Any], expected_config_hash: str
+    ) -> PilotConfig:
         paths = payload.get("paths")
         if not isinstance(paths, dict):
             raise ValueError("run config snapshot has invalid paths")
@@ -407,7 +413,7 @@ class DefaultPilotServices:
             restored_paths[key] = record["value"]
         restored["paths"] = restored_paths
         config = PilotConfig.model_validate(restored)
-        if config.config_hash() != store.config_hash:
+        if config.config_hash() != expected_config_hash:
             raise ValueError("run config snapshot does not reproduce its config hash")
         return config
 
@@ -646,7 +652,7 @@ class DefaultPilotServices:
     def _capture_report_artifact(
         store: RunStore,
         relative_path: str,
-        expected_sha256: str,
+        expected_sha256: str | None,
         guard: _ResourceGuard,
         live_bytes: int,
     ) -> tuple[bytes, int]:
@@ -659,7 +665,9 @@ class DefaultPilotServices:
         before = raw_path.lstat()
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
             raise ValueError(f"report input is not a regular single-link file: {relative_path}")
-        guard.checkpoint(live_bytes + before.st_size)
+        # Chunk storage and the immutable joined payload coexist briefly. Refuse
+        # the capture unless that conservative peak fits before allocating either.
+        guard.checkpoint(live_bytes + 2 * before.st_size)
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(raw_path, flags)
         chunks: list[bytes] = []
@@ -686,7 +694,7 @@ class DefaultPilotServices:
             os.close(descriptor)
         payload = b"".join(chunks)
         digest = hashlib.sha256(payload).hexdigest()
-        if digest != expected_sha256:
+        if expected_sha256 is not None and digest != expected_sha256:
             raise ValueError(f"report captured checksum mismatch: {relative_path}")
         return payload, live_bytes + len(payload)
 
@@ -699,6 +707,101 @@ class DefaultPilotServices:
         if not isinstance(value, dict):
             raise ValueError(f"captured JSON artifact must be an object: {label}")
         return value
+
+    @classmethod
+    def _capture_report_provenance(
+        cls,
+        store: RunStore,
+        guard: _ResourceGuard,
+    ) -> tuple[
+        PilotConfig,
+        dict[str, bytes],
+        dict[str, str],
+        dict[str, dict[str, Any]],
+        frozenset[str],
+        int,
+    ]:
+        """Capture base and stage provenance once, then validate the frozen lineage."""
+
+        captured: dict[str, bytes] = {}
+        digests: dict[str, str] = {}
+        live_bytes = 0
+
+        def capture(relative: str, expected: str | None = None) -> dict[str, Any]:
+            nonlocal live_bytes
+            payload, live_bytes = cls._capture_report_artifact(
+                store, relative, expected, guard, live_bytes
+            )
+            captured[relative] = payload
+            digests[relative] = hashlib.sha256(payload).hexdigest()
+            return cls._object_from_captured(payload, relative)
+
+        run_manifest = capture("run_manifest.json")
+        if (
+            run_manifest.get("schema_version") != "1.0"
+            or run_manifest.get("stage") != "init"
+            or run_manifest.get("status") != "SUCCESS"
+            or run_manifest.get("config_hash") != store.config_hash
+            or run_manifest.get("input_hashes") != {}
+            or run_manifest.get("prerequisite_manifest_hashes") != {}
+        ):
+            raise ValueError("captured run provenance manifest is invalid")
+        raw_base_outputs = run_manifest.get("outputs")
+        if not isinstance(raw_base_outputs, list):
+            raise ValueError("captured run provenance outputs are invalid")
+        base_outputs: dict[str, str] = {}
+        for record in raw_base_outputs:
+            if not isinstance(record, dict):
+                raise ValueError("captured run provenance output is invalid")
+            path = record.get("path")
+            digest = record.get("sha256")
+            if (
+                not isinstance(path, str)
+                or not isinstance(digest, str)
+                or path in base_outputs
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise ValueError("captured run provenance output is invalid")
+            base_outputs[path] = digest
+        expected_base_outputs = {
+            "config.json",
+            "seed_manifest.json",
+            "environment_manifest.json",
+            "source_manifest.json",
+        }
+        if set(base_outputs) != expected_base_outputs:
+            raise ValueError("captured run provenance inventory is invalid")
+        if base_outputs["config.json"] != store.config_hash:
+            raise ValueError("captured config checksum is not anchored to the run")
+
+        config_payload = capture("config.json", base_outputs["config.json"])
+        config = cls._config_from_snapshot(config_payload, store.config_hash)
+        for relative in ("environment_manifest.json", "source_manifest.json"):
+            payload = capture(relative, base_outputs[relative])
+            if (
+                payload.get("schema_version") != "1.0"
+                or payload.get("config_hash") != store.config_hash
+            ):
+                raise ValueError(f"captured base provenance is invalid: {relative}")
+
+        stages = (
+            "validate-data",
+            "build-splits",
+            "train-baselines",
+            "build-photonic-features",
+            "benchmark",
+        )
+        stage_manifests: dict[str, dict[str, Any]] = {}
+        stage_hashes: dict[str, str] = {}
+        for stage in stages:
+            relative = f"{stage}/stage_manifest.json"
+            stage_manifests[stage] = capture(relative)
+            stage_hashes[stage] = digests[relative]
+        inventory = store.report_input_inventory_from_captured_manifests(
+            stage_manifests, stage_hashes
+        )
+        return config, captured, digests, stage_manifests, inventory, live_bytes
 
     @staticmethod
     def _publish_benchmark_invalid(
@@ -2983,6 +3086,14 @@ class DefaultPilotServices:
             memory_bytes=int(config.resources.max_memory_gb * 1024**3),
         )
         try:
+            (
+                config,
+                captured,
+                input_hashes,
+                stage_manifests,
+                inventory,
+                total_file_bytes,
+            ) = self._capture_report_provenance(store, guard)
             required: dict[str, tuple[str, ...]] = {
                 "validate-data": (
                     "validate-data/data_card.json",
@@ -3024,17 +3135,23 @@ class DefaultPilotServices:
                     "benchmark/stage_result.json",
                 ),
             }
-            inventory = store.report_input_inventory()
             required_fixed = {path for paths in required.values() for path in paths}
             if not required_fixed <= set(inventory):
                 raise ReportContractError("report fixed input inventory is incomplete")
-            captured: dict[str, bytes] = {}
-            input_hashes: dict[str, str] = {}
-            total_file_bytes = 0
-            for relative in inventory:
+            output_hashes_by_stage = {
+                stage: RunStore._exact_output_map(marker, stage)
+                for stage, marker in stage_manifests.items()
+            }
+            for relative in sorted(inventory):
+                if relative in captured:
+                    continue
                 guard.checkpoint(total_file_bytes)
                 stage = relative.split("/", 1)[0]
-                expected = self._declared_stage_artifact_sha256(store, stage, relative)
+                expected = output_hashes_by_stage.get(stage, {}).get(relative)
+                if expected is None:
+                    raise ReportContractError(
+                        f"captured stage marker does not declare report input: {relative}"
+                    )
                 payload, total_file_bytes = self._capture_report_artifact(
                     store, relative, expected, guard, total_file_bytes
                 )
@@ -3104,36 +3221,34 @@ class DefaultPilotServices:
                 stage: captured_object(path)
                 for stage, path in ledger_paths.items()
             }
-            exact = pd.read_parquet(io.BytesIO(captured["benchmark/exact_predictions.parquet"]))
-            baselines = pd.read_parquet(
-                io.BytesIO(captured["train-baselines/predictions.parquet"])
-            )
-            finite = pd.read_parquet(
-                io.BytesIO(captured["benchmark/finite_shot_predictions.parquet"])
-            )
-            declared = total_file_bytes + sum(
-                int(frame.memory_usage(index=True, deep=True).sum())
-                for frame in (exact, baselines, finite)
-            )
+            declared = total_file_bytes
+
+            def decode_parquet(relative: str) -> pd.DataFrame:
+                nonlocal declared
+                payload = captured[relative]
+                guard.checkpoint(declared + len(payload))
+                frame = pd.read_parquet(io.BytesIO(payload))
+                declared += int(frame.memory_usage(index=True, deep=True).sum())
+                guard.checkpoint(declared)
+                return frame
+
+            exact = decode_parquet("benchmark/exact_predictions.parquet")
+            baselines = decode_parquet("train-baselines/predictions.parquet")
+            finite = decode_parquet("benchmark/finite_shot_predictions.parquet")
             guard.checkpoint(declared)
-            base_hash_paths = {
-                "config": store.root / "config.json",
-                "environment": store.root / "environment_manifest.json",
-                "source": store.root / "source_manifest.json",
-                "run": store.root / "run_manifest.json",
-            }
+            environment_manifest = captured_object("environment_manifest.json")
             provenance = {
                 "run_id": store.root.name,
                 "config_sha256": store.config_hash,
                 "canonical_data_sha256": data_card.get("canonical_sha256"),
-                "environment_manifest_sha256": sha256_file(
-                    base_hash_paths["environment"]
-                ),
-                "source_manifest_sha256": sha256_file(base_hash_paths["source"]),
-                "run_manifest_sha256": sha256_file(base_hash_paths["run"]),
-                "code": self._read_object(base_hash_paths["environment"]).get("git"),
+                "environment_manifest_sha256": input_hashes[
+                    "environment_manifest.json"
+                ],
+                "source_manifest_sha256": input_hashes["source_manifest.json"],
+                "run_manifest_sha256": input_hashes["run_manifest.json"],
+                "code": environment_manifest.get("git"),
                 "stage_manifest_sha256": {
-                    stage: sha256_file(store.root / stage / "stage_manifest.json")
+                    stage: input_hashes[f"{stage}/stage_manifest.json"]
                     for stage in (
                         "validate-data",
                         "build-splits",
@@ -3168,24 +3283,12 @@ class DefaultPilotServices:
                 },
                 baseline_selection=baseline_selection,
                 baseline_model_manifest=baseline_model_manifest,
+                initial_live_bytes=total_file_bytes,
                 resource_checkpoint=guard.checkpoint,
             )
-            report_manifest_bytes = self._benchmark_json_bytes(products.report_manifest)
-            markdown_bytes = products.report_markdown.encode("utf-8")
-            output_bytes = sum(
-                len(payload)
-                for payload in (
-                    products.timestamp_scores_parquet,
-                    products.evaluated_predictions_parquet,
-                    products.bootstrap_replicates_parquet,
-                    products.scores_json,
-                    products.scores_csv,
-                    products.decision_json,
-                    report_manifest_bytes,
-                    markdown_bytes,
-                )
-            )
-            guard.checkpoint(declared + output_bytes)
+            report_manifest_bytes = products.report_manifest_json
+            markdown_bytes = products.report_markdown
+            guard.checkpoint(products.declared_live_bytes)
         except _ResourceLimitExceeded as error:
             return self._publish_report_invalid(
                 store=store,
@@ -3243,7 +3346,7 @@ class DefaultPilotServices:
         }
 
         def publication_checkpoint() -> None:
-            guard.checkpoint(declared + output_bytes)
+            guard.checkpoint(products.declared_live_bytes)
 
         try:
             with store.stage(
