@@ -6,10 +6,12 @@ import math
 import shutil
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
 import pandas as pd
+import psutil
 import pytest
 import yaml
 
@@ -667,6 +669,119 @@ def test_report_low_memory_stops_before_next_parquet_serializer(
     assert marker["status"] == "INVALID"
     assert marker["details"]["resource_gate"] == "resource_memory_rss"
     assert DefaultPilotServices().report(store.root).status is StageStatus.INVALID
+
+
+def test_report_rejects_dictionary_compression_expansion_before_pandas_decode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _make_completed_run(tmp_path)
+    relative = "benchmark/exact_predictions.parquet"
+    path = store.root / relative
+    frame = pd.read_parquet(path)
+    frame["sample_id"] = "x" * 1_000_000
+    malicious = parquet_bytes(frame, benchmark_module.exact_prediction_arrow_schema())
+    assert len(malicious) < 5 * 1024**2
+    path.write_bytes(malicious)
+    marker_path = store.root / "benchmark/stage_manifest.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    next(item for item in marker["outputs"] if item["path"] == relative)["sha256"] = (
+        sha256_file(path)
+    )
+    marker_path.write_text(
+        json.dumps(marker, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+    del frame, malicious
+
+    real_guard = service_module._ResourceGuard
+    guards: list[service_module._ResourceGuard] = []
+    decode_calls: list[object] = []
+    real_decode = pd.read_parquet
+
+    def intermediate_guard(**kwargs: Any) -> service_module._ResourceGuard:
+        kwargs["memory_bytes"] = 64 * 1024**2
+        guard = real_guard(**kwargs)
+        guards.append(guard)
+        return guard
+
+    def forbidden_decode(*args: object, **kwargs: object) -> pd.DataFrame:
+        decode_calls.append((args, kwargs))
+        return real_decode(*args, **kwargs)
+
+    monkeypatch.setattr(service_module, "_ResourceGuard", intermediate_guard)
+    monkeypatch.setattr(
+        psutil,
+        "Process",
+        lambda: SimpleNamespace(memory_info=lambda: SimpleNamespace(rss=0)),
+    )
+    monkeypatch.setattr(pd, "read_parquet", forbidden_decode)
+
+    result = DefaultPilotServices().report(store.root)
+
+    assert result.status is StageStatus.INVALID
+    assert decode_calls == []
+    assert guards[0].peak_declared_bytes > guards[0].memory_bytes
+    marker = json.loads((store.root / "report/stage_manifest.json").read_text(encoding="utf-8"))
+    assert marker["status"] == "INVALID"
+    assert marker["details"]["resource_gate"] == "resource_dataframe_or_output_bytes"
+    assert not (store.root / "report/timestamp_scores.parquet").exists()
+    assert DefaultPilotServices().report(store.root).status is StageStatus.INVALID
+
+
+def test_report_evaluation_checkpoint_counts_source_frames_with_captured_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _make_completed_run(tmp_path)
+    inventory = store.report_input_inventory()
+    captured_bytes = sum((store.root / relative).stat().st_size for relative in inventory)
+    source_frame_bytes = sum(
+        int(pd.read_parquet(store.root / relative).memory_usage(index=True, deep=True).sum())
+        for relative in (
+            "benchmark/exact_predictions.parquet",
+            "train-baselines/predictions.parquet",
+            "benchmark/finite_shot_predictions.parquet",
+        )
+    )
+    assert source_frame_bytes > 0
+    sentinel = 512 * 1024**2
+    old_underestimate = captured_bytes + sentinel
+    true_combined = old_underestimate + source_frame_bytes
+    cap_between = old_underestimate + source_frame_bytes // 2
+    guards: list[service_module._ResourceGuard] = []
+    real_guard = service_module._ResourceGuard
+    attempted: list[int] = []
+
+    def tracked_guard(**kwargs: Any) -> service_module._ResourceGuard:
+        guard = real_guard(**kwargs)
+        guards.append(guard)
+        return guard
+
+    def fail_at_evaluation(
+        *_args: object,
+        resource_checkpoint: Callable[[int], None],
+        **_kwargs: object,
+    ) -> object:
+        guards[0].memory_bytes = cap_between
+        try:
+            resource_checkpoint(sentinel)
+        finally:
+            attempted.append(guards[0].peak_declared_bytes)
+        raise AssertionError("combined evaluation checkpoint did not enforce its cap")
+
+    monkeypatch.setattr(service_module, "_ResourceGuard", tracked_guard)
+    monkeypatch.setattr(
+        psutil,
+        "Process",
+        lambda: SimpleNamespace(memory_info=lambda: SimpleNamespace(rss=0)),
+    )
+    monkeypatch.setattr(reporting_module, "evaluate_predictions", fail_at_evaluation)
+
+    result = DefaultPilotServices().report(store.root)
+
+    assert result.status is StageStatus.INVALID
+    assert attempted == [true_combined]
+    assert old_underestimate < cap_between < attempted[0]
+    marker = json.loads((store.root / "report/stage_manifest.json").read_text(encoding="utf-8"))
+    assert marker["details"]["resource_gate"] == "resource_dataframe_or_output_bytes"
 
 
 def test_run_pilot_stops_on_first_non_success_and_resumes_in_exact_order(

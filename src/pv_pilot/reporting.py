@@ -804,11 +804,12 @@ def build_report_products(
         int(frame.memory_usage(index=True, deep=True).sum())
         for frame in (exact_predictions, baseline_predictions, finite_shot_predictions)
     )
+    evaluation_base = initial_live_bytes + declared
 
     def evaluation_checkpoint(additional_bytes: int = 0) -> None:
-        resource_checkpoint(initial_live_bytes + additional_bytes)
+        resource_checkpoint(evaluation_base + additional_bytes)
 
-    evaluation_checkpoint(declared)
+    resource_checkpoint(evaluation_base)
     policy = EvaluationPolicy.from_config(config)
     evaluation = evaluate_predictions(
         exact_predictions,
@@ -853,7 +854,10 @@ def build_report_products(
     def serialize_parquet(frame: pd.DataFrame, schema: pa.Schema) -> bytes:
         nonlocal serialized_live_bytes
         frame_bytes = int(frame.memory_usage(index=True, deep=True).sum())
-        resource_checkpoint(frame_live_bytes + serialized_live_bytes + frame_bytes)
+        # The source pandas frame is already included in frame_live_bytes. Reserve
+        # one additional frame-sized buffer for Arrow materialization and another
+        # for the Parquet output before entering the serializer.
+        resource_checkpoint(frame_live_bytes + serialized_live_bytes + 2 * frame_bytes)
         payload = _parquet_bytes(frame, schema)
         serialized_live_bytes += len(payload)
         resource_checkpoint(frame_live_bytes + serialized_live_bytes)

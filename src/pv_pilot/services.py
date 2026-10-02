@@ -8,6 +8,8 @@ import json
 import os
 import pickle
 import stat
+import struct
+import sys
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping
@@ -19,7 +21,9 @@ from uuid import uuid4
 
 import pandas as pd
 import psutil
+import pyarrow as pa
 import pyarrow.dataset as pds
+import pyarrow.parquet as pq
 
 from . import baselines as baseline_models
 from . import benchmark as photonic_benchmark
@@ -707,6 +711,69 @@ class DefaultPilotServices:
         if not isinstance(value, dict):
             raise ValueError(f"captured JSON artifact must be an object: {label}")
         return value
+
+    @staticmethod
+    def _parquet_decode_upper_bound(
+        payload: bytes, expected_schema: pa.Schema, label: str
+    ) -> int:
+        """Bound pandas materialization from Parquet metadata without decoding pages."""
+
+        try:
+            parquet_file = pq.ParquetFile(io.BytesIO(payload))
+        except (OSError, pa.ArrowException) as error:
+            raise ValueError(f"captured Parquet artifact is invalid: {label}") from error
+        actual_schema = parquet_file.schema_arrow.remove_metadata()
+        expected = expected_schema.remove_metadata()
+        if not actual_schema.equals(expected, check_metadata=False):
+            raise ValueError(f"captured Parquet schema is invalid: {label}")
+        metadata = parquet_file.metadata
+        if metadata.num_rows < 0 or metadata.num_row_groups < 0:
+            raise ValueError(f"captured Parquet metadata is invalid: {label}")
+
+        object_slot = struct.calcsize("P")
+        object_overhead = object_slot + sys.getsizeof("")
+        estimated = metadata.num_rows * 8 + 256
+        for row_group_index in range(metadata.num_row_groups):
+            row_group = metadata.row_group(row_group_index)
+            if row_group.num_columns != len(expected):
+                raise ValueError(f"captured Parquet column inventory is invalid: {label}")
+            for column_index, field in enumerate(expected):
+                column = row_group.column(column_index)
+                values = int(column.num_values)
+                uncompressed = int(column.total_uncompressed_size)
+                if values < 0 or uncompressed < 0:
+                    raise ValueError(f"captured Parquet column metadata is invalid: {label}")
+                field_type = field.type
+                if pa.types.is_string(field_type) or pa.types.is_large_string(field_type) or (
+                    pa.types.is_binary(field_type) or pa.types.is_large_binary(field_type)
+                ):
+                    encodings = {str(encoding).upper() for encoding in column.encodings}
+                    dictionary_encoded = bool(
+                        encodings & {"RLE_DICTIONARY", "PLAIN_DICTIONARY"}
+                    )
+                    # A dictionary payload can legally contain one very large value
+                    # referenced by every row. The decoded pandas object column must
+                    # therefore budget that value once per logical value, not once per
+                    # dictionary entry.
+                    value_bytes = (
+                        uncompressed * max(values, 1)
+                        if dictionary_encoded
+                        else uncompressed
+                    )
+                    estimated += value_bytes + values * object_overhead
+                elif pa.types.is_boolean(field_type):
+                    estimated += values
+                elif (
+                    pa.types.is_integer(field_type)
+                    or pa.types.is_floating(field_type)
+                    or pa.types.is_temporal(field_type)
+                ):
+                    bit_width = int(getattr(field_type, "bit_width", 64))
+                    estimated += values * max(1, bit_width // 8)
+                else:
+                    raise ValueError(f"captured Parquet type is unsupported: {label}")
+                estimated += (values + 7) // 8
+        return int(estimated)
 
     @classmethod
     def _capture_report_provenance(
@@ -3223,18 +3290,37 @@ class DefaultPilotServices:
             }
             declared = total_file_bytes
 
-            def decode_parquet(relative: str) -> pd.DataFrame:
+            def decode_parquet(
+                relative: str, expected_schema: pa.Schema
+            ) -> pd.DataFrame:
                 nonlocal declared
                 payload = captured[relative]
-                guard.checkpoint(declared + len(payload))
+                decode_upper_bound = self._parquet_decode_upper_bound(
+                    payload, expected_schema, relative
+                )
+                guard.checkpoint(declared + decode_upper_bound)
                 frame = pd.read_parquet(io.BytesIO(payload))
-                declared += int(frame.memory_usage(index=True, deep=True).sum())
+                actual_bytes = int(frame.memory_usage(index=True, deep=True).sum())
+                if actual_bytes > decode_upper_bound:
+                    raise ReportContractError(
+                        f"Parquet decode exceeded its metadata bound: {relative}"
+                    )
+                declared += actual_bytes
                 guard.checkpoint(declared)
                 return frame
 
-            exact = decode_parquet("benchmark/exact_predictions.parquet")
-            baselines = decode_parquet("train-baselines/predictions.parquet")
-            finite = decode_parquet("benchmark/finite_shot_predictions.parquet")
+            exact = decode_parquet(
+                "benchmark/exact_predictions.parquet",
+                photonic_benchmark.exact_prediction_arrow_schema(),
+            )
+            baselines = decode_parquet(
+                "train-baselines/predictions.parquet",
+                baseline_models.prediction_arrow_schema(),
+            )
+            finite = decode_parquet(
+                "benchmark/finite_shot_predictions.parquet",
+                photonic_benchmark.finite_shot_prediction_arrow_schema(),
+            )
             guard.checkpoint(declared)
             environment_manifest = captured_object("environment_manifest.json")
             provenance = {
