@@ -351,11 +351,13 @@ def resource_gate_evidence(
             "peak_combined_rss_bytes",
         )
         present_components = {field for field in component_fields if field in ledger}
-        if present_components and present_components != set(component_fields):
+        subprocess_stages = {"train-baselines", "benchmark"}
+        expected_components = set(component_fields) if stage in subprocess_stages else set()
+        if present_components != expected_components:
             raise ReportContractError(
-                f"resource ledger component evidence is incomplete for {stage}"
+                f"resource ledger component schema is invalid for {stage}"
             )
-        if present_components:
+        if expected_components:
             for field in component_fields:
                 value = ledger[field]
                 if (
