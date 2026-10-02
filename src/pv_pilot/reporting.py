@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 from collections.abc import Callable, Mapping
@@ -68,6 +69,134 @@ def _require_object(value: object, label: str) -> dict[str, Any]:
     return value
 
 
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _require_sha256(value: object, label: str) -> str:
+    if not _is_sha256(value):
+        raise ReportContractError(f"{label} must be a lowercase SHA-256 digest")
+    return str(value)
+
+
+def _freeze_sha256(manifest: Mapping[str, Any], post_freeze_fields: set[str]) -> str:
+    frozen = {
+        key: value
+        for key, value in manifest.items()
+        if key != "selection_freeze_sha256" and key not in post_freeze_fields
+    }
+    return hashlib.sha256(_canonical_json_bytes(frozen)).hexdigest()
+
+
+def validate_model_and_selection_lineage(
+    *,
+    config: PilotConfig,
+    selection_manifest: Mapping[str, Any],
+    benchmark_model_manifest: Mapping[str, Any],
+    baseline_selection: Mapping[str, Any],
+    baseline_model_manifest: Mapping[str, Any],
+) -> None:
+    """Validate both frozen selections and their serialized model inventories."""
+
+    quantiles = list(config.evaluation.quantiles)
+    if quantiles != list(LOCKED_QUANTILES):
+        raise ReportContractError("configured quantile grid is not the locked grid")
+    if selection_manifest.get("quantiles") != quantiles:
+        raise ReportContractError("benchmark quantiles drifted from the frozen protocol")
+    if selection_manifest.get("selection_role") != "indistinguishable_primary":
+        raise ReportContractError("benchmark selection role is invalid")
+    if selection_manifest.get("seed_policy") != "equal_weight_mean_no_best_seed":
+        raise ReportContractError("benchmark seed selection policy is invalid")
+    if selection_manifest.get("selection_data") != ["train", "validation"]:
+        raise ReportContractError("benchmark selection data policy is invalid")
+    if selection_manifest.get("refit") != "heads_only_on_train_plus_validation":
+        raise ReportContractError("benchmark refit policy is invalid")
+    freeze = _require_sha256(
+        selection_manifest.get("selection_freeze_sha256"),
+        "benchmark selection freeze",
+    )
+    recomputed = _freeze_sha256(
+        selection_manifest,
+        {
+            "holdout_audit",
+            "prerequisite_manifest_hashes_after_freeze",
+            "baseline_predictions",
+            "scientific_decision",
+        },
+    )
+    if freeze != recomputed:
+        raise ReportContractError("benchmark selection freeze checksum is invalid")
+    holdout = _require_object(selection_manifest.get("holdout_audit"), "holdout audit")
+    if (
+        holdout.get("opened_after_selection_freeze_sha256") != freeze
+        or holdout.get("materialization_count") != 1
+        or holdout.get("prediction_passes") != 1
+    ):
+        raise ReportContractError("benchmark holdout evidence is inconsistent")
+    if benchmark_model_manifest.get("selection_freeze_sha256") != freeze:
+        raise ReportContractError("benchmark model selection lineage is inconsistent")
+    _require_sha256(benchmark_model_manifest.get("models_sha256"), "benchmark models")
+    if (
+        benchmark_model_manifest.get("schema_version") != "1.0"
+        or benchmark_model_manifest.get("format") != "python_pickle_protocol_5"
+        or benchmark_model_manifest.get("serialization_roundtrip_verified") is not True
+        or benchmark_model_manifest.get("holdout_reinference_for_serialization") is not False
+    ):
+        raise ReportContractError("benchmark model manifest policy is invalid")
+    expected_keys = {
+        f"{control}:seed={seed}"
+        for control in ("distinguishable", "indistinguishable")
+        for seed in config.seeds.circuit_seeds
+    }
+    model_keys = benchmark_model_manifest.get("model_keys")
+    if (
+        not isinstance(model_keys, list)
+        or len(model_keys) != len(set(model_keys))
+        or set(model_keys) != expected_keys
+    ):
+        raise ReportContractError("benchmark model key inventory is invalid")
+
+    if baseline_selection.get("quantiles") != quantiles:
+        raise ReportContractError("baseline quantiles drifted from the frozen protocol")
+    if baseline_selection.get("quantile_columns") != list(quantile_columns(LOCKED_QUANTILES)):
+        raise ReportContractError("baseline quantile column policy is invalid")
+    baseline_freeze = _require_sha256(
+        baseline_selection.get("selection_freeze_sha256"), "baseline selection freeze"
+    )
+    if baseline_freeze != _freeze_sha256(baseline_selection, {"holdout_audit"}):
+        raise ReportContractError("baseline selection freeze checksum is invalid")
+    baseline_holdout = _require_object(
+        baseline_selection.get("holdout_audit"), "baseline holdout audit"
+    )
+    if (
+        baseline_holdout.get("opened_after_selection_freeze_sha256") != baseline_freeze
+        or baseline_holdout.get("prediction_passes") != 1
+    ):
+        raise ReportContractError("baseline holdout evidence is inconsistent")
+    if baseline_model_manifest.get("selection_freeze_sha256") != baseline_freeze:
+        raise ReportContractError("baseline model selection lineage is inconsistent")
+    _require_sha256(baseline_model_manifest.get("models_sha256"), "baseline models")
+    selected_models = baseline_selection.get("selected")
+    if not isinstance(selected_models, dict) or set(selected_models) != {
+        "persistence",
+        "raw",
+        "rff",
+        "xgboost",
+    }:
+        raise ReportContractError("baseline selected model inventory is invalid")
+    baseline_models = baseline_model_manifest.get("models")
+    if (
+        not isinstance(baseline_models, list)
+        or len(baseline_models) != len(set(baseline_models))
+        or set(baseline_models) != set(selected_models)
+    ):
+        raise ReportContractError("baseline model key inventory is invalid")
+
+
 def _validate_schema(frame: pd.DataFrame, schema: pa.Schema, label: str) -> None:
     if list(frame.columns) != schema.names:
         raise ReportContractError(f"{label} columns do not match the frozen schema")
@@ -118,6 +247,9 @@ def expected_primary_configuration(
             raise ReportContractError("selected circuit inventory contains duplicate seeds")
         selected_circuits[seed] = checksum
         selected_state_orders.add(state_order)
+        _require_sha256(checksum, "selected circuit checksum")
+        _require_sha256(state_order, "selected state-order checksum")
+        _require_sha256(record.get("npz_sha256"), "selected circuit NPZ checksum")
     if set(selected_circuits) != set(configured_seeds):
         raise ReportContractError("selected circuit inventory is not the exact five-seed set")
     if len(selected_state_orders) != 1:
@@ -135,6 +267,7 @@ def expected_primary_configuration(
     if len(matches) != 1:
         raise ReportContractError("selected state-space identity is missing or ambiguous")
     state_order_sha256 = matches[0].get("state_order_sha256")
+    _require_sha256(state_order_sha256, "selected state-order checksum")
     if state_order_sha256 not in selected_state_orders:
         raise ReportContractError("circuit and state-space order checksums disagree")
     expected = ExpectedPrimaryConfiguration(
@@ -151,23 +284,59 @@ def expected_primary_configuration(
 
 def resource_gate_evidence(
     ledgers: Mapping[str, Mapping[str, Any]],
+    *,
+    config: PilotConfig,
 ) -> ResourceGateEvidence:
     """Construct complete resource evidence only from authoritative stage ledgers."""
 
-    passed: dict[str, bool] = {}
-    for stage in (
+    expected_stages = (
         "validate-data",
         "build-splits",
         "train-baselines",
         "build-photonic-features",
         "benchmark",
-    ):
+    )
+    if set(ledgers) != set(expected_stages):
+        raise ReportContractError("resource evidence must contain the exact five stages")
+    passed: dict[str, bool] = {}
+    expected_memory = int(config.resources.max_memory_gb * 1024**3)
+    for stage in expected_stages:
         ledger = ledgers.get(stage)
         if ledger is None:
             raise ReportContractError(f"resource ledger is missing for {stage}")
-        status = str(ledger.get("status", "")).lower()
-        resource_status = ledger.get("resource_status")
-        passed[stage] = status == "success" and resource_status == "WITHIN_LIMIT"
+        if (
+            ledger.get("schema_version") != "1.0"
+            or ledger.get("stage") != stage
+            or ledger.get("status") != "success"
+            or ledger.get("resource_status") != "WITHIN_LIMIT"
+            or ledger.get("cpu_only") is not True
+        ):
+            raise ReportContractError(f"resource ledger policy is invalid for {stage}")
+        numeric = (
+            "wall_clock_seconds",
+            "peak_rss_bytes",
+            "peak_declared_bytes",
+            "max_wall_clock_seconds",
+            "max_memory_bytes",
+        )
+        for field in numeric:
+            value = ledger.get(field)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not np.isfinite(float(value))
+                or float(value) < 0
+            ):
+                raise ReportContractError(
+                    f"resource ledger field {field} is invalid for {stage}"
+                )
+        if (
+            float(ledger["max_wall_clock_seconds"])
+            != float(config.resources.max_wall_clock_seconds)
+            or int(ledger["max_memory_bytes"]) != expected_memory
+        ):
+            raise ReportContractError(f"resource ledger limits drifted for {stage}")
+        passed[stage] = True
     return ResourceGateEvidence.from_mapping(passed)
 
 
@@ -280,18 +449,47 @@ def _audit_predictions(
     return pd.DataFrame.from_records(records)
 
 
-def _physical_control_summary(exact: pd.DataFrame) -> dict[str, Any]:
+def _validate_physical_quantiles(frame: pd.DataFrame, label: str) -> None:
+    q_columns = quantile_columns(LOCKED_QUANTILES)
+    values = frame.loc[:, q_columns].to_numpy(dtype=np.float64)
+    capacity = frame["capacity_kw"].to_numpy(dtype=np.float64)
+    targets = frame["target_ac_power_kw"].to_numpy(dtype=np.float64)
+    if (
+        not np.isfinite(values).all()
+        or not np.isfinite(capacity).all()
+        or not np.isfinite(targets).all()
+        or (capacity <= 0).any()
+        or (targets < 0).any()
+        or (targets > capacity).any()
+        or (values < 0).any()
+        or (values > capacity[:, None]).any()
+    ):
+        raise ReportContractError(f"{label} target/capacity/quantile range is invalid")
+    if (np.diff(values, axis=1) < 0).any():
+        raise ReportContractError(f"{label} quantiles are not monotone")
+
+
+def _physical_control_summary(
+    exact: pd.DataFrame, expected: ExpectedPrimaryConfiguration, matched_alpha: float
+) -> dict[str, Any]:
     controls = sorted(set(exact["control"].astype(str)))
     if controls != ["distinguishable", "indistinguishable"]:
         raise ReportContractError("exact predictions do not contain both physical controls")
     counts = {control: int((exact["control"] == control).sum()) for control in controls}
     if len(set(counts.values())) != 1:
         raise ReportContractError("physical controls are not matched row-for-row")
+    if set(exact["status"].astype(str)) != {"success"}:
+        raise ReportContractError("physical control status must be successful")
+    if set(exact["fit_phase"].astype(str)) != {"train_plus_validation_refit"}:
+        raise ReportContractError("physical control fit phase is invalid")
+    _validate_physical_quantiles(exact, "physical control")
     identity = [
         "sample_id",
         "site_id",
         "issued_at_utc",
         "target_at_utc",
+        "target_ac_power_kw",
+        "capacity_kw",
         "circuit_seed",
         "modes",
         "photons",
@@ -308,6 +506,22 @@ def _physical_control_summary(exact: pd.DataFrame) -> dict[str, Any]:
         )
     if memberships[0] != memberships[1]:
         raise ReportContractError("physical controls do not share an exact identity grid")
+    primary = exact.loc[exact["control"] == "indistinguishable"]
+    control = exact.loc[exact["control"] == "distinguishable"]
+    if (
+        set(primary["modes"].astype(int)) != {expected.modes}
+        or set(primary["photons"].astype(int)) != {expected.photons}
+        or set(primary["phase_scale"].astype(float)) != {expected.phase_scale}
+        or set(primary["alpha"].astype(float)) != {expected.alpha}
+        or set(control["alpha"].astype(float)) != {matched_alpha}
+    ):
+        raise ReportContractError("physical control frozen configuration drifted")
+    checksums = expected.circuit_checksums
+    if any(
+        str(row.circuit_sha256) != checksums.get(int(row.circuit_seed))
+        for row in exact.itertuples(index=False)
+    ):
+        raise ReportContractError("physical control circuit identity drifted")
     return {
         "controls": controls,
         "row_counts": counts,
@@ -339,6 +553,16 @@ def _finite_shot_summary(
         == finite["budget"].to_numpy(dtype=np.int64)
     ).all():
         raise ReportContractError("finite-shot accepted/raw counts must equal the budget")
+    if set(finite["status"].astype(str)) != {"success"}:
+        raise ReportContractError("finite-shot status must be successful")
+    if (
+        set(finite["modes"].astype(int)) != {expected.modes}
+        or set(finite["photons"].astype(int)) != {expected.photons}
+        or set(finite["phase_scale"].astype(float)) != {expected.phase_scale}
+        or set(finite["alpha"].astype(float)) != {expected.alpha}
+    ):
+        raise ReportContractError("finite-shot frozen configuration drifted")
+    _validate_physical_quantiles(finite, "finite-shot")
     identity = ["sample_id", "site_id", "issued_at_utc", "target_at_utc"]
     primary = exact.loc[exact["control"] == "indistinguishable"]
     exact_membership = set(
@@ -358,6 +582,13 @@ def _finite_shot_summary(
         for row in finite.itertuples(index=False)
     ):
         raise ReportContractError("finite-shot circuit identity drifted from exact primary")
+    primary_identity = primary.set_index([*identity, "circuit_seed"])
+    finite_identity = finite.set_index([*identity, "circuit_seed"])
+    for field in ("target_ac_power_kw", "capacity_kw"):
+        expected_values = primary_identity[field].sort_index()
+        actual_values = finite_identity.groupby(level=list(range(5)))[field].first().sort_index()
+        if not expected_values.equals(actual_values):
+            raise ReportContractError(f"finite-shot {field} drifted from exact primary")
     finite_diagnostics = diagnostics.get("finite_shot")
     if not isinstance(finite_diagnostics, dict) or (
         finite_diagnostics.get("ideal_shot_noise_only") is not True
@@ -450,21 +681,54 @@ def build_report_products(
     circuit_manifest: Mapping[str, Any],
     state_spaces: Mapping[str, Any],
     benchmark_diagnostics: Mapping[str, Any],
+    benchmark_model_manifest: Mapping[str, Any],
     resource_ledgers: Mapping[str, Mapping[str, Any]],
     provenance: Mapping[str, Any],
     input_hashes: Mapping[str, str],
     versions: Mapping[str, Any],
     baseline_selection: Mapping[str, Any],
+    baseline_model_manifest: Mapping[str, Any],
     resource_checkpoint: ResourceCheckpoint,
 ) -> ReportProducts:
     """Evaluate and serialize a report without fitting or reading source data."""
 
     _validate_schema(exact_predictions, exact_prediction_arrow_schema(), "exact predictions")
     _validate_schema(baseline_predictions, prediction_arrow_schema(), "baseline predictions")
+    validate_model_and_selection_lineage(
+        config=config,
+        selection_manifest=selection_manifest,
+        benchmark_model_manifest=benchmark_model_manifest,
+        baseline_selection=baseline_selection,
+        baseline_model_manifest=baseline_model_manifest,
+    )
     expected, state_order_sha256 = expected_primary_configuration(
         config, selection_manifest, circuit_manifest, state_spaces
     )
-    gates = resource_gate_evidence(resource_ledgers)
+    baseline_link = _require_object(
+        selection_manifest.get("baseline_predictions"), "baseline prediction lineage"
+    )
+    baseline_path = "train-baselines/predictions.parquet"
+    if (
+        baseline_link.get("path") != baseline_path
+        or baseline_link.get("sha256") != input_hashes.get(baseline_path)
+        or baseline_link.get("policy") != "immutable_reuse_no_retrain_no_repredict"
+    ):
+        raise ReportContractError("baseline prediction lineage is inconsistent")
+    expected_model_keys = {
+        f"{control}:seed={seed}"
+        for control in ("distinguishable", "indistinguishable")
+        for seed in config.seeds.circuit_seeds
+    }
+    exact_holdout = benchmark_diagnostics.get("exact_holdout")
+    if (
+        benchmark_diagnostics.get("ensemble_prediction") is not False
+        or benchmark_diagnostics.get("model_count") != len(expected_model_keys)
+        or benchmark_diagnostics.get("exact_prediction_rows") != len(exact_predictions)
+        or not isinstance(exact_holdout, dict)
+        or set(exact_holdout) != expected_model_keys
+    ):
+        raise ReportContractError("benchmark diagnostics/model/holdout evidence is inconsistent")
+    gates = resource_gate_evidence(resource_ledgers, config=config)
     declared = sum(
         int(frame.memory_usage(index=True, deep=True).sum())
         for frame in (exact_predictions, baseline_predictions, finite_shot_predictions)
@@ -481,7 +745,21 @@ def build_report_products(
         finite_shot_predictions=finite_shot_predictions,
         resource_checkpoint=resource_checkpoint,
     )
-    physical_controls = _physical_control_summary(exact_predictions)
+    matched = _require_object(selection_manifest.get("matched_control"), "matched control")
+    try:
+        matched_alpha = float(matched["selected_alpha"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ReportContractError("matched-control alpha is invalid") from error
+    if (
+        int(matched.get("modes", -1)) != expected.modes
+        or float(matched.get("phase_scale", float("nan"))) != expected.phase_scale
+        or matched.get("alpha_policy")
+        != "separate_validation_common_alpha_all_seeds_fixed_primary_m_c"
+    ):
+        raise ReportContractError("matched-control selection policy is invalid")
+    physical_controls = _physical_control_summary(
+        exact_predictions, expected, matched_alpha
+    )
     finite_summary = _finite_shot_summary(
         finite_shot_predictions,
         exact_predictions,

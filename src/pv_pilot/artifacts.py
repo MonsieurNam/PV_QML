@@ -96,6 +96,56 @@ _REPORT_BENCHMARK_OUTPUTS = (
     "benchmark/resource_ledger.json",
     "benchmark/stage_result.json",
 )
+_REPORT_FIXED_INPUTS = frozenset(
+    {
+        "validate-data/data_card.json",
+        "validate-data/cleaning_ledger.json",
+        "validate-data/stage_result.json",
+        "build-splits/feature_manifest.json",
+        "build-splits/minmax_scalers.json",
+        "build-splits/clip_rates.json",
+        "build-splits/resource_ledger.json",
+        "build-splits/stage_result.json",
+        "train-baselines/selection_manifest.json",
+        "train-baselines/predictions.parquet",
+        "train-baselines/diagnostics.json",
+        "train-baselines/models/manifest.json",
+        "train-baselines/resource_ledger.json",
+        "train-baselines/stage_result.json",
+        "build-photonic-features/development_photonic_features.parquet",
+        "build-photonic-features/state_spaces.json",
+        "build-photonic-features/circuit_manifest.json",
+        "build-photonic-features/feature_manifest.json",
+        "build-photonic-features/resource_ledger.json",
+        "build-photonic-features/stage_result.json",
+        *_REPORT_BENCHMARK_OUTPUTS,
+    }
+)
+_REPORT_TERMINAL_OUTPUTS = frozenset(
+    {
+        "report/report.md",
+        "report/timestamp_scores.parquet",
+        "report/evaluated_predictions.parquet",
+        "report/bootstrap_replicates.parquet",
+        "report/scores.json",
+        "report/scores.csv",
+        "report/decision.json",
+        "report/report_manifest.json",
+        "report/resource_ledger.json",
+        "report/stage_result.json",
+    }
+)
+_REPORT_INVALID_OUTPUTS = frozenset(
+    {
+        "report/report.md",
+        "report/scores.json",
+        "report/scores.csv",
+        "report/decision.json",
+        "report/report_manifest.json",
+        "report/resource_ledger.json",
+        "report/stage_result.json",
+    }
+)
 
 
 def _validate_selected_output_shape(
@@ -1207,6 +1257,93 @@ class RunStore:
             return None
         return matches[0]
 
+    @staticmethod
+    def _exact_output_map(manifest: Mapping[str, object], stage: str) -> dict[str, str]:
+        outputs = manifest.get("outputs")
+        if not isinstance(outputs, list):
+            raise ValueError(f"stage {stage!r} has an invalid output inventory")
+        result: dict[str, str] = {}
+        for record in outputs:
+            if not isinstance(record, dict):
+                raise ValueError(f"stage {stage!r} has an invalid output inventory")
+            path = record.get("path")
+            digest = record.get("sha256")
+            if not isinstance(path, str) or not isinstance(digest, str) or path in result:
+                raise ValueError(f"stage {stage!r} has duplicate or invalid outputs")
+            result[path] = digest
+        return result
+
+    def _expected_report_inputs_and_verify_lineage(self) -> frozenset[str]:
+        """Derive the exact report input inventory and bind Task 8 to upstream outputs."""
+
+        self._verify_stage_marker_only("benchmark")
+        marker_by_stage: dict[str, Mapping[str, object]] = {}
+        output_by_stage: dict[str, dict[str, str]] = {}
+        for stage in (
+            "validate-data",
+            "build-splits",
+            "train-baselines",
+            "build-photonic-features",
+            "benchmark",
+        ):
+            marker_path = self.root / stage / "stage_manifest.json"
+            if not marker_path.is_file() or marker_path.is_symlink():
+                raise ValueError(f"stage {stage!r} has no regular SUCCESS marker")
+            marker = self._read_json_file(marker_path)
+            if (
+                marker.get("schema_version") != SCHEMA_VERSION
+                or marker.get("stage") != stage
+                or marker.get("status") != "SUCCESS"
+                or marker.get("config_hash") != self.config_hash
+            ):
+                raise ValueError(f"stage {stage!r} has an invalid SUCCESS marker")
+            marker_by_stage[stage] = marker
+            output_by_stage[stage] = self._exact_output_map(marker, stage)
+
+        circuit_paths = {
+            path
+            for path in output_by_stage["build-photonic-features"]
+            if path.startswith("build-photonic-features/circuits/")
+            and path.endswith(".npz")
+        }
+        if not circuit_paths:
+            raise ValueError("photonic output marker has no circuit inventory")
+
+        benchmark_inputs = marker_by_stage["benchmark"].get("input_hashes")
+        if not isinstance(benchmark_inputs, dict) or any(
+            not isinstance(path, str) or not isinstance(digest, str)
+            for path, digest in benchmark_inputs.items()
+        ):
+            raise ValueError("benchmark input lineage is invalid")
+        upstream_paths = {
+            *_BENCHMARK_BASELINE_OUTPUTS,
+            *_BENCHMARK_PHOTONIC_REQUIRED_OUTPUTS,
+            *circuit_paths,
+        }
+        exact_benchmark_inputs = upstream_paths | set(_BENCHMARK_INTERNAL_INPUTS)
+        if set(benchmark_inputs) != exact_benchmark_inputs:
+            raise ValueError("benchmark input lineage has missing or extra entries")
+        for path in upstream_paths:
+            source_stage = path.split("/", 1)[0]
+            authoritative = output_by_stage[source_stage].get(path)
+            if authoritative is None or benchmark_inputs.get(path) != authoritative:
+                raise ValueError("benchmark input checksum is not anchored upstream")
+        for path in _BENCHMARK_INTERNAL_INPUTS:
+            digest = benchmark_inputs[path]
+            if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                raise ValueError("benchmark internal input checksum is invalid")
+        return frozenset({*_REPORT_FIXED_INPUTS, *circuit_paths})
+
+    @staticmethod
+    def _verify_report_output_inventory(manifest: Mapping[str, object]) -> None:
+        status = manifest.get("status")
+        expected = (
+            _REPORT_INVALID_OUTPUTS if status == "INVALID" else _REPORT_TERMINAL_OUTPUTS
+        )
+        actual = set(RunStore._exact_output_map(manifest, "report"))
+        if actual != set(expected):
+            raise ValueError("report output inventory does not match exact outputs")
+
     def _verify_terminal_result_contract(self, manifest: Mapping[str, object]) -> None:
         """Bind the conventional JSON result to its marker even if declaration is removed."""
 
@@ -1283,9 +1420,16 @@ class RunStore:
             }
             self._validate_selected_output_policy(stage, policy_paths)
             prerequisite_hashes = {
-                prerequisite: self._verify_stage_selected_outputs(
-                    prerequisite,
-                    tuple(str(path) for path in prerequisite_output_allowlist[prerequisite]),
+                prerequisite: (
+                    self._verify_stage_marker_only(prerequisite)
+                    if stage == _REPORT_SELECTED_STAGE
+                    else self._verify_stage_selected_outputs(
+                        prerequisite,
+                        tuple(
+                            str(path)
+                            for path in prerequisite_output_allowlist[prerequisite]
+                        ),
+                    )
                 )
                 for prerequisite in STAGE_PREREQUISITES[stage]
             }
@@ -1317,6 +1461,11 @@ class RunStore:
             inputs = manifest.get("input_hashes")
             if not isinstance(inputs, dict):
                 raise ValueError(f"stage {stage!r} has invalid input hashes")
+            report_expected_inputs = (
+                self._expected_report_inputs_and_verify_lineage()
+                if stage == _REPORT_SELECTED_STAGE
+                else None
+            )
             selected_paths = {
                 path for paths in normalized_allowlist.values() for path in paths
             }
@@ -1349,10 +1498,11 @@ class RunStore:
                 if stage == _BENCHMARK_SELECTED_STAGE
                 else frozenset()
             )
-            if (
-                stage == _REPORT_SELECTED_STAGE
-                and not selected_paths <= set(inputs)
-            ) or (
+            report_inputs_invalid = False
+            if stage == _REPORT_SELECTED_STAGE:
+                assert report_expected_inputs is not None
+                report_inputs_invalid = set(inputs) != set(report_expected_inputs)
+            if report_inputs_invalid or (
                 stage != _REPORT_SELECTED_STAGE and set(inputs) != expected_inputs
             ):
                 raise ValueError("selected-output stage inputs do not match the fixed contract")
@@ -1369,6 +1519,8 @@ class RunStore:
                 target = self._validated_target(relative)
                 if not target.is_file() or target.is_symlink() or sha256_file(target) != expected:
                     raise ValueError(f"stage output checksum mismatch: {relative}")
+            if stage == _REPORT_SELECTED_STAGE:
+                self._verify_report_output_inventory(manifest)
             self._verify_terminal_result_contract(manifest)
             return sha256_file(marker_path)
         return self._verify_stage(stage, accepted_statuses=accepted_statuses)
@@ -1391,6 +1543,11 @@ class RunStore:
         if not (valid_task7 or valid_report):
             raise ValueError("selected stage output verification violates a fixed contract")
         return self._verify_stage_selected_outputs(stage, paths)
+
+    def report_input_inventory(self) -> tuple[str, ...]:
+        """Return the fixed, lineage-verified report input inventory."""
+
+        return tuple(sorted(self._expected_report_inputs_and_verify_lineage()))
 
     def verify_terminal_diagnostic_stage(self, stage: str) -> str:
         """Verify an INVALID marker-only diagnostic without reading unrelated data."""
@@ -1438,6 +1595,8 @@ class RunStore:
             target = self._validated_target(relative)
             if not target.is_file() or target.is_symlink() or sha256_file(target) != expected:
                 raise ValueError(f"stage output checksum mismatch: {relative}")
+        if stage == _REPORT_SELECTED_STAGE:
+            self._verify_report_output_inventory(manifest)
         self._verify_terminal_result_contract(manifest)
         return sha256_file(marker_path)
 
@@ -1455,6 +1614,7 @@ class RunStore:
         prerequisite_output_allowlist: Mapping[str, Iterable[str | Path]] | None = None,
         commit_guard: CommitGuard | None = None,
         private_write_guard: CommitGuard | None = None,
+        preverified_input_hashes: Mapping[str, str] | None = None,
         config_hash: str | None = None,
         now: Now = None,
     ) -> StageTransaction:
@@ -1497,6 +1657,11 @@ class RunStore:
             raise ValueError(
                 "prerequisite output allowlist requires selected_outputs verification"
             )
+        if preverified_input_hashes is not None and not (
+            stage == _REPORT_SELECTED_STAGE
+            and prerequisite_verification == "selected_outputs"
+        ):
+            raise ValueError("preverified input hashes are limited to the report stage")
         if commit_guard is not None:
             commit_guard()
         with self._publication_lock():
@@ -1525,8 +1690,11 @@ class RunStore:
                     self._validated_target(path).relative_to(self.root).as_posix()
                     for path in prerequisite_output_allowlist[prerequisite]
                 )
-                prerequisite_hashes[prerequisite] = self._verify_stage_selected_outputs(
-                    prerequisite, paths
+                prerequisite_hashes[prerequisite] = (
+                    self._verify_stage_marker_only(prerequisite)
+                    if stage == _REPORT_SELECTED_STAGE
+                    and preverified_input_hashes is not None
+                    else self._verify_stage_selected_outputs(prerequisite, paths)
                 )
                 normalized_allowlist[prerequisite] = sorted(paths)
             else:
@@ -1539,11 +1707,19 @@ class RunStore:
             for paths in normalized_allowlist.values()
             for path in paths
         }
-        for input_path in input_paths:
+        normalized_requested_inputs = tuple(
+            self._validated_target(path).relative_to(self.root).as_posix()
+            for path in input_paths
+        )
+        if preverified_input_hashes is not None:
+            if len(normalized_requested_inputs) != len(set(normalized_requested_inputs)):
+                raise ValueError("report input paths contain duplicates")
+            if set(normalized_requested_inputs) != set(preverified_input_hashes):
+                raise ValueError("captured report inputs do not match requested inputs")
+        for relative in normalized_requested_inputs:
             if commit_guard is not None:
                 commit_guard()
-            target = self._validated_target(input_path)
-            relative = target.relative_to(self.root).as_posix()
+            target = self._validated_target(relative)
             if (
                 prerequisite_verification == "selected_outputs"
                 and relative not in selected_paths
@@ -1559,9 +1735,15 @@ class RunStore:
                 raise ValueError(
                     "selected-output stage inputs must be explicitly allowlisted"
                 )
-            if not target.is_file():
-                raise FileNotFoundError(f"stage input is not a file: {relative}")
-            inputs[relative] = sha256_file(target)
+            if preverified_input_hashes is None:
+                if not target.is_file():
+                    raise FileNotFoundError(f"stage input is not a file: {relative}")
+                inputs[relative] = sha256_file(target)
+            else:
+                captured = preverified_input_hashes.get(relative)
+                if not isinstance(captured, str):
+                    raise ValueError("captured report input checksum is invalid")
+                inputs[relative] = captured
             if (
                 prerequisite_verification == "selected_outputs"
                 and stage == _REPORT_SELECTED_STAGE
@@ -1580,7 +1762,7 @@ class RunStore:
             )
             if (
                 stage == _REPORT_SELECTED_STAGE
-                and not selected_paths <= set(inputs)
+                and set(inputs) != self._expected_report_inputs_and_verify_lineage()
             ) or (
                 stage != _REPORT_SELECTED_STAGE and set(inputs) != expected_inputs
             ):
@@ -1627,6 +1809,7 @@ class RunStore:
             terminal_status=terminal_status,
             commit_guard=commit_guard,
             private_write_guard=private_write_guard,
+            rehash_inputs_on_commit=preverified_input_hashes is None,
             clock=_clock(now),
         )
 
@@ -1646,6 +1829,7 @@ class StageTransaction:
         terminal_status: Literal["SUCCESS", "BLOCKED", "INVALID"],
         commit_guard: CommitGuard | None,
         private_write_guard: CommitGuard | None,
+        rehash_inputs_on_commit: bool,
         clock: Clock,
     ) -> None:
         if terminal_status not in _TERMINAL_STATUSES:
@@ -1659,6 +1843,7 @@ class StageTransaction:
         self._terminal_status = terminal_status
         self._commit_guard = commit_guard
         self._private_write_guard = private_write_guard
+        self._rehash_inputs_on_commit = rehash_inputs_on_commit
         self._clock = clock
         self._started_at: datetime | None = None
         self._temporary_root: Path | None = None
@@ -1806,14 +1991,15 @@ class StageTransaction:
                 )
                 if self._commit_guard is not None:
                     self._commit_guard()
-                for relative_path, expected in self._input_hashes.items():
-                    if self._commit_guard is not None:
-                        self._commit_guard()
-                    target = self._store._validated_target(relative_path)
-                    if not target.is_file() or sha256_file(target) != expected:
-                        raise ValueError(f"stage input changed: {relative_path}")
-                    if self._commit_guard is not None:
-                        self._commit_guard()
+                if self._rehash_inputs_on_commit:
+                    for relative_path, expected in self._input_hashes.items():
+                        if self._commit_guard is not None:
+                            self._commit_guard()
+                        target = self._store._validated_target(relative_path)
+                        if not target.is_file() or sha256_file(target) != expected:
+                            raise ValueError(f"stage input changed: {relative_path}")
+                        if self._commit_guard is not None:
+                            self._commit_guard()
                 for raw_path, expected in self._external_input_hashes.items():
                     if self._commit_guard is not None:
                         self._commit_guard()

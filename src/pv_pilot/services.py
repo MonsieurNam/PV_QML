@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import pickle
 import stat
 import time
@@ -617,6 +618,88 @@ class DefaultPilotServices:
             raise ValueError(f"stage output checksum mismatch: {relative_path}")
         return target
 
+    @classmethod
+    def _declared_stage_artifact_sha256(
+        cls, store: RunStore, stage: str, relative_path: str
+    ) -> str:
+        marker = cls._read_object(store.root / stage / "stage_manifest.json")
+        if (
+            marker.get("schema_version") != "1.0"
+            or marker.get("stage") != stage
+            or marker.get("status") != "SUCCESS"
+            or marker.get("config_hash") != store.config_hash
+        ):
+            raise ValueError(f"{stage} has an invalid SUCCESS marker")
+        outputs = marker.get("outputs")
+        if not isinstance(outputs, list):
+            raise ValueError(f"{stage} has an invalid output inventory")
+        matches = [
+            record.get("sha256")
+            for record in outputs
+            if isinstance(record, dict) and record.get("path") == relative_path
+        ]
+        if len(matches) != 1 or not isinstance(matches[0], str):
+            raise ValueError(f"{stage} output inventory is missing {relative_path}")
+        return matches[0]
+
+    @staticmethod
+    def _capture_report_artifact(
+        store: RunStore,
+        relative_path: str,
+        expected_sha256: str,
+        guard: _ResourceGuard,
+        live_bytes: int,
+    ) -> tuple[bytes, int]:
+        """Capture a trusted regular file once and bind parsing to those bytes."""
+
+        raw_path = store.root / relative_path
+        path = raw_path.resolve(strict=False)
+        if not path.is_relative_to(store.root) or raw_path.is_symlink():
+            raise ValueError(f"report input is unsafe: {relative_path}")
+        before = raw_path.lstat()
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValueError(f"report input is not a regular single-link file: {relative_path}")
+        guard.checkpoint(live_bytes + before.st_size)
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(raw_path, flags)
+        chunks: list[bytes] = []
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_size != before.st_size
+                or (before.st_ino and opened.st_ino != before.st_ino)
+            ):
+                raise ValueError(f"report input changed while opening: {relative_path}")
+            captured = 0
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                captured += len(chunk)
+                guard.checkpoint(live_bytes + captured)
+            after = os.fstat(descriptor)
+            if after.st_size != opened.st_size or after.st_mtime_ns != opened.st_mtime_ns:
+                raise ValueError(f"report input changed while captured: {relative_path}")
+        finally:
+            os.close(descriptor)
+        payload = b"".join(chunks)
+        digest = hashlib.sha256(payload).hexdigest()
+        if digest != expected_sha256:
+            raise ValueError(f"report captured checksum mismatch: {relative_path}")
+        return payload, live_bytes + len(payload)
+
+    @staticmethod
+    def _object_from_captured(payload: bytes, label: str) -> dict[str, Any]:
+        try:
+            value: object = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"captured JSON artifact is invalid: {label}") from error
+        if not isinstance(value, dict):
+            raise ValueError(f"captured JSON artifact must be an object: {label}")
+        return value
+
     @staticmethod
     def _publish_benchmark_invalid(
         *,
@@ -1108,8 +1191,15 @@ class DefaultPilotServices:
                     "peak_rss_bytes_observed": guard.peak_rss_bytes,
                     "resource_status": resource_status,
                     "schema_version": "1.0",
+                    "stage": "validate-data",
                     "status": status.value,
                     "timebox_seconds": config.resources.max_wall_clock_seconds,
+                    "wall_clock_seconds": elapsed,
+                    "peak_rss_bytes": guard.peak_rss_bytes,
+                    "peak_declared_bytes": guard.peak_declared_bytes,
+                    "max_wall_clock_seconds": config.resources.max_wall_clock_seconds,
+                    "max_memory_bytes": guard.memory_bytes,
+                    "cpu_only": True,
                 }
                 transaction.write_json("cleaning_ledger.json", ledger)
                 guard.checkpoint(len(canonical_bytes) + len(exclusion_bytes))
@@ -1152,9 +1242,16 @@ class DefaultPilotServices:
             "peak_rss_bytes_observed": guard.peak_rss_bytes,
             "resource_status": resource_status,
             "schema_version": FEATURE_SCHEMA_VERSION,
+            "stage": "build-splits",
             "scientific_decision": "NOT_EVALUATED",
             "status": status.value,
             "timebox_seconds": guard.wall_seconds,
+            "wall_clock_seconds": time.perf_counter() - guard.started,
+            "peak_rss_bytes": guard.peak_rss_bytes,
+            "peak_declared_bytes": guard.peak_declared_bytes,
+            "max_wall_clock_seconds": guard.wall_seconds,
+            "max_memory_bytes": guard.memory_bytes,
+            "cpu_only": True,
         }
 
     def _publish_split_invalid(
@@ -1732,6 +1829,9 @@ class DefaultPilotServices:
             "serialization_roundtrip_verified": True,
             "serialization_probe": "first_three_train_rows",
             "scientific_decision": "NOT_EVALUATED",
+            "selection_freeze_sha256": training.selection_manifest[
+                "selection_freeze_sha256"
+            ],
         }
         total_bytes = (
             declared
@@ -2883,12 +2983,6 @@ class DefaultPilotServices:
             memory_bytes=int(config.resources.max_memory_gb * 1024**3),
         )
         try:
-            # This recursively verifies the benchmark and its audited prerequisite
-            # policy.  On real service artifacts that policy deliberately never opens
-            # the original raw input or the physical split holdout.
-            store.verify_selected_stage_outputs(
-                "benchmark", self._report_benchmark_allowlist()["benchmark"]
-            )
             required: dict[str, tuple[str, ...]] = {
                 "validate-data": (
                     "validate-data/data_card.json",
@@ -2911,6 +3005,7 @@ class DefaultPilotServices:
                     "train-baselines/stage_result.json",
                 ),
                 "build-photonic-features": (
+                    "build-photonic-features/development_photonic_features.parquet",
                     "build-photonic-features/state_spaces.json",
                     "build-photonic-features/circuit_manifest.json",
                     "build-photonic-features/feature_manifest.json",
@@ -2927,51 +3022,68 @@ class DefaultPilotServices:
                     "benchmark/stage_result.json",
                 ),
             }
-            declared_paths: dict[str, Path] = {}
-            for stage, paths in required.items():
-                for relative in paths:
-                    guard.checkpoint()
-                    declared_paths[relative] = self._read_declared_stage_artifact(
-                        store, stage, relative
-                    )
-            circuit_manifest = self._read_object(
-                declared_paths["build-photonic-features/circuit_manifest.json"]
+            inventory = store.report_input_inventory()
+            required_fixed = {path for paths in required.values() for path in paths}
+            if not required_fixed <= set(inventory):
+                raise ReportContractError("report fixed input inventory is incomplete")
+            captured: dict[str, bytes] = {}
+            input_hashes: dict[str, str] = {}
+            total_file_bytes = 0
+            for relative in inventory:
+                guard.checkpoint(total_file_bytes)
+                stage = relative.split("/", 1)[0]
+                expected = self._declared_stage_artifact_sha256(store, stage, relative)
+                payload, total_file_bytes = self._capture_report_artifact(
+                    store, relative, expected, guard, total_file_bytes
+                )
+                captured[relative] = payload
+                input_hashes[relative] = hashlib.sha256(payload).hexdigest()
+
+            def captured_object(relative: str) -> dict[str, Any]:
+                return self._object_from_captured(captured[relative], relative)
+
+            circuit_manifest = captured_object(
+                "build-photonic-features/circuit_manifest.json"
             )
             raw_circuits = circuit_manifest.get("circuits")
             if not isinstance(raw_circuits, list):
                 raise ReportContractError("circuit manifest has no circuit inventory")
+            declared_circuits: set[str] = set()
             for item in raw_circuits:
                 if not isinstance(item, dict) or not isinstance(item.get("path"), str):
                     raise ReportContractError("circuit inventory contains an invalid path")
                 path = str(item["path"])
-                circuit_path = self._read_declared_stage_artifact(
-                    store, "build-photonic-features", path
-                )
-                if sha256_file(circuit_path) != item.get("npz_sha256"):
-                    raise ReportContractError("circuit NPZ checksum does not match its inventory")
-                declared_paths[path] = circuit_path
-
-            total_file_bytes = sum(path.stat().st_size for path in declared_paths.values())
-            guard.checkpoint(total_file_bytes)
-            selection_manifest = self._read_object(
-                declared_paths["benchmark/selection_manifest.json"]
+                if (
+                    path in declared_circuits
+                    or path not in captured
+                    or input_hashes[path] != item.get("npz_sha256")
+                ):
+                    raise ReportContractError(
+                        "circuit NPZ checksum/path does not match the exact inventory"
+                    )
+                declared_circuits.add(path)
+            captured_circuits = {
+                path
+                for path in captured
+                if path.startswith("build-photonic-features/circuits/")
+            }
+            if declared_circuits != captured_circuits:
+                raise ReportContractError("circuit manifest inventory is missing or extra")
+            selection_manifest = captured_object("benchmark/selection_manifest.json")
+            baseline_selection = captured_object(
+                "train-baselines/selection_manifest.json"
             )
-            baseline_selection = self._read_object(
-                declared_paths["train-baselines/selection_manifest.json"]
+            baseline_model_manifest = captured_object(
+                "train-baselines/models/manifest.json"
             )
-            split_feature_manifest = self._read_object(
-                declared_paths["build-splits/feature_manifest.json"]
+            benchmark_model_manifest = captured_object("benchmark/models/manifest.json")
+            split_feature_manifest = captured_object("build-splits/feature_manifest.json")
+            photonic_feature_manifest = captured_object(
+                "build-photonic-features/feature_manifest.json"
             )
-            photonic_feature_manifest = self._read_object(
-                declared_paths["build-photonic-features/feature_manifest.json"]
-            )
-            state_spaces = self._read_object(
-                declared_paths["build-photonic-features/state_spaces.json"]
-            )
-            benchmark_diagnostics = self._read_object(
-                declared_paths["benchmark/diagnostics.json"]
-            )
-            data_card = self._read_object(declared_paths["validate-data/data_card.json"])
+            state_spaces = captured_object("build-photonic-features/state_spaces.json")
+            benchmark_diagnostics = captured_object("benchmark/diagnostics.json")
+            data_card = captured_object("validate-data/data_card.json")
             if (
                 data_card.get("provenance") != config.protocol.provenance.value
                 or bool(data_card.get("synthetic"))
@@ -2987,15 +3099,15 @@ class DefaultPilotServices:
                 "benchmark": "benchmark/resource_ledger.json",
             }
             resource_ledgers = {
-                stage: self._read_object(declared_paths[path])
+                stage: captured_object(path)
                 for stage, path in ledger_paths.items()
             }
-            exact = pd.read_parquet(declared_paths["benchmark/exact_predictions.parquet"])
+            exact = pd.read_parquet(io.BytesIO(captured["benchmark/exact_predictions.parquet"]))
             baselines = pd.read_parquet(
-                declared_paths["train-baselines/predictions.parquet"]
+                io.BytesIO(captured["train-baselines/predictions.parquet"])
             )
             finite = pd.read_parquet(
-                declared_paths["benchmark/finite_shot_predictions.parquet"]
+                io.BytesIO(captured["benchmark/finite_shot_predictions.parquet"])
             )
             declared = total_file_bytes + sum(
                 int(frame.memory_usage(index=True, deep=True).sum())
@@ -3029,10 +3141,6 @@ class DefaultPilotServices:
                     )
                 },
             }
-            input_hashes = {
-                relative: sha256_file(path)
-                for relative, path in sorted(declared_paths.items())
-            }
             products = build_report_products(
                 config=config,
                 exact_predictions=exact,
@@ -3042,6 +3150,7 @@ class DefaultPilotServices:
                 circuit_manifest=circuit_manifest,
                 state_spaces=state_spaces,
                 benchmark_diagnostics=benchmark_diagnostics,
+                benchmark_model_manifest=benchmark_model_manifest,
                 resource_ledgers=resource_ledgers,
                 provenance=provenance,
                 input_hashes=input_hashes,
@@ -3056,6 +3165,7 @@ class DefaultPilotServices:
                     "prediction_fit_phase": "train_plus_validation_refit",
                 },
                 baseline_selection=baseline_selection,
+                baseline_model_manifest=baseline_model_manifest,
                 resource_checkpoint=guard.checkpoint,
             )
             report_manifest_bytes = self._benchmark_json_bytes(products.report_manifest)
@@ -3136,7 +3246,7 @@ class DefaultPilotServices:
         try:
             with store.stage(
                 "report",
-                input_paths=tuple(sorted(declared_paths)),
+                input_paths=tuple(sorted(captured)),
                 terminal_status=terminal_status,
                 prerequisite_verification="selected_outputs",
                 prerequisite_output_allowlist=self._report_benchmark_allowlist(),
@@ -3148,6 +3258,7 @@ class DefaultPilotServices:
                 },
                 commit_guard=publication_checkpoint,
                 private_write_guard=publication_checkpoint,
+                preverified_input_hashes=input_hashes,
             ) as transaction:
                 transaction.write_bytes("report.md", markdown_bytes)
                 transaction.write_bytes(
