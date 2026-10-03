@@ -2022,9 +2022,15 @@ class StageTransaction:
             self._private_write_guard()
         source = Path(source_path)
         resolved = source.resolve(strict=False)
+        source_parent_before = source.parent.lstat()
         if (
             not resolved.is_relative_to(self._store.root)
             or source.is_symlink()
+            or source.is_junction()
+            or source.parent.is_symlink()
+            or source.parent.is_junction()
+            or not stat.S_ISDIR(source_parent_before.st_mode)
+            or source_parent_before.st_nlink != 1
             or len(expected_sha256) != 64
             or any(character not in "0123456789abcdef" for character in expected_sha256)
             or expected_size < 0
@@ -2065,11 +2071,19 @@ class StageTransaction:
                 destination.flush()
                 os.fsync(destination.fileno())
             after = os.fstat(descriptor)
+            source_parent_after = source.parent.lstat()
             if (
                 copied != expected_size
                 or after.st_size != opened.st_size
                 or after.st_mtime_ns != opened.st_mtime_ns
                 or digest.hexdigest() != expected_sha256
+                or source.parent.is_symlink()
+                or source.parent.is_junction()
+                or source_parent_after.st_dev != source_parent_before.st_dev
+                or (
+                    source_parent_before.st_ino
+                    and source_parent_after.st_ino != source_parent_before.st_ino
+                )
             ):
                 raise ValueError("worker output checksum or size mismatch")
         except BaseException:

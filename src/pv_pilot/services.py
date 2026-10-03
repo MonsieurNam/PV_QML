@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import io
 import json
@@ -62,6 +63,11 @@ from .splits import (
 )
 
 _ReportProcessExecutor = baseline_models.DeadlineProcessFitExecutor
+_REPORT_STATUS_DECISIONS = {
+    StageStatus.BLOCKED: frozenset({"not_evaluated"}),
+    StageStatus.SUCCESS: frozenset({"go", "stop", "inconclusive"}),
+    StageStatus.INVALID: frozenset({"not_evaluated"}),
+}
 
 
 class _ResourceLimitExceeded(RuntimeError):
@@ -3001,14 +3007,31 @@ class DefaultPilotServices:
 
     @staticmethod
     def _write_report_worker_snapshot(path: Path, payload: bytes) -> None:
-        if path.exists() or path.is_symlink() or path.parent.is_symlink():
+        parent_before = path.parent.lstat()
+        if (
+            path.exists()
+            or path.is_symlink()
+            or path.is_junction()
+            or path.parent.is_symlink()
+            or path.parent.is_junction()
+            or not stat.S_ISDIR(parent_before.st_mode)
+            or parent_before.st_nlink != 1
+        ):
             raise ReportContractError("report worker snapshot path is unsafe")
         with path.open("xb") as stream:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
         written = path.lstat()
-        if not stat.S_ISREG(written.st_mode) or written.st_nlink != 1:
+        parent_after = path.parent.lstat()
+        if (
+            not stat.S_ISREG(written.st_mode)
+            or written.st_nlink != 1
+            or path.parent.is_symlink()
+            or path.parent.is_junction()
+            or parent_after.st_dev != parent_before.st_dev
+            or (parent_before.st_ino and parent_after.st_ino != parent_before.st_ino)
+        ):
             raise ReportContractError("report worker snapshot is not a regular file")
 
     @staticmethod
@@ -3021,6 +3044,7 @@ class DefaultPilotServices:
                 continue
             if (
                 candidate.is_symlink()
+                or candidate.is_junction()
                 or not stat.S_ISDIR(candidate_stat.st_mode)
                 or candidate.resolve(strict=False).parent != root
             ):
@@ -3030,6 +3054,77 @@ class DefaultPilotServices:
             if pid_text.isdigit() and psutil.pid_exists(int(pid_text)):
                 continue
             shutil.rmtree(candidate)
+
+    @staticmethod
+    def _validated_report_decision_evidence(
+        *,
+        captured_claims: Mapping[str, bytes],
+        worker_status: StageStatus,
+        worker_decision: str,
+        worker_conclusion: str,
+    ) -> tuple[StageStatus, str, str]:
+        def object_from(name: str) -> dict[str, Any]:
+            try:
+                value: object = json.loads(captured_claims[name].decode("utf-8"))
+            except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ReportContractError(
+                    f"report decision evidence is invalid: {name}"
+                ) from error
+            if not isinstance(value, dict):
+                raise ReportContractError(
+                    f"report decision evidence must be an object: {name}"
+                )
+            return value
+
+        decision = object_from("decision.json")
+        scores = object_from("scores.json")
+        manifest = object_from("report_manifest.json")
+        manifest_scores = manifest.get("scores")
+        if not isinstance(manifest_scores, dict) or manifest_scores != scores:
+            raise ReportContractError("report decision evidence is inconsistent")
+        try:
+            csv_text = captured_claims["scores.csv"].decode("utf-8")
+            rows = list(csv.DictReader(io.StringIO(csv_text)))
+            markdown = captured_claims["report.md"].decode("utf-8")
+        except (KeyError, UnicodeDecodeError, csv.Error) as error:
+            raise ReportContractError("report decision evidence is invalid") from error
+        if len(rows) != 1:
+            raise ReportContractError("report decision evidence CSV is invalid")
+        row = rows[0]
+        raw_status = decision.get("stage_status")
+        raw_decision = decision.get("scientific_decision")
+        raw_conclusion = decision.get("conclusion")
+        try:
+            stage_status = StageStatus(str(raw_status))
+        except ValueError as error:
+            raise ReportContractError("report decision evidence status is invalid") from error
+        if (
+            stage_status not in _REPORT_STATUS_DECISIONS
+            or raw_decision not in _REPORT_STATUS_DECISIONS[stage_status]
+            or (
+                stage_status is StageStatus.INVALID
+                and raw_conclusion != "resource_gate_failed"
+            )
+            or not isinstance(raw_conclusion, str)
+            or not raw_conclusion
+            or scores.get("stage_status") != stage_status.value
+            or scores.get("decision") != raw_decision
+            or scores.get("conclusion") != raw_conclusion
+            or manifest.get("scientific_decision") != raw_decision
+            or manifest.get("conclusion") != raw_conclusion
+            or row.get("stage_status") != stage_status.value
+            or row.get("decision") != raw_decision
+            or row.get("conclusion") != raw_conclusion
+            or markdown.count(
+                f"**Status:** {stage_status.value.upper()} / {str(raw_decision).upper()}"
+            )
+            != 1
+            or worker_status is not stage_status
+            or worker_decision != raw_decision
+            or worker_conclusion != raw_conclusion
+        ):
+            raise ReportContractError("report decision evidence is inconsistent")
+        return stage_status, str(raw_decision), raw_conclusion
 
     @staticmethod
     def _validate_report_worker_outputs(
@@ -3047,6 +3142,20 @@ class DefaultPilotServices:
     ]:
         if not isinstance(worker_result, dict) or worker_result.get("schema_version") != "1.0":
             raise ReportContractError("report worker result is invalid")
+        try:
+            worker_manifest_size = len(
+                json.dumps(
+                    worker_result,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            )
+        except (TypeError, ValueError) as error:
+            raise ReportContractError("report worker result is not bounded JSON") from error
+        if worker_manifest_size > 1024 * 1024:
+            raise ReportContractError("report worker result exceeds its size limit")
         worker_status = worker_result.get("status")
         if worker_status == "contract_error":
             message = worker_result.get("message")
@@ -3085,9 +3194,26 @@ class DefaultPilotServices:
         if not isinstance(raw_outputs, dict) or set(raw_outputs) != expected_names:
             raise ReportContractError("report worker output inventory is invalid")
         schemas = report_parquet_schemas()
+        claim_names = {
+            "decision.json",
+            "scores.json",
+            "report_manifest.json",
+            "scores.csv",
+            "report.md",
+        }
+        captured_claims: dict[str, bytes] = {}
+        captured_claim_bytes = 0
         verified: dict[str, tuple[Path, str, int]] = {}
         output_bytes = 0
         root = output_root.resolve(strict=True)
+        root_before = output_root.lstat()
+        if (
+            output_root.is_symlink()
+            or output_root.is_junction()
+            or not stat.S_ISDIR(root_before.st_mode)
+            or root_before.st_nlink != 1
+        ):
+            raise ReportContractError("report worker output directory is unsafe")
         for name in sorted(expected_names):
             record = raw_outputs[name]
             if not isinstance(record, dict) or set(record) != {"sha256", "size"}:
@@ -3112,6 +3238,9 @@ class DefaultPilotServices:
                 ) from error
             if (
                 path.is_symlink()
+                or path.is_junction()
+                or output_root.is_symlink()
+                or output_root.is_junction()
                 or path.resolve(strict=False).parent != root
                 or not stat.S_ISREG(before.st_mode)
                 or before.st_nlink != 1
@@ -3123,6 +3252,7 @@ class DefaultPilotServices:
             flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
             descriptor = os.open(path, flags)
             digest = hashlib.sha256()
+            claim_buffer = bytearray() if name in claim_names else None
             try:
                 opened = os.fstat(descriptor)
                 if (
@@ -3147,6 +3277,12 @@ class DefaultPilotServices:
                     if not chunk:
                         break
                     digest.update(chunk)
+                    if claim_buffer is not None:
+                        claim_buffer.extend(chunk)
+                        if len(claim_buffer) > 8 * 1024 * 1024:
+                            raise ReportContractError(
+                                f"report decision evidence exceeds its size limit: {name}"
+                            )
                 after = os.fstat(descriptor)
                 if after.st_size != opened.st_size or after.st_mtime_ns != opened.st_mtime_ns:
                     raise ReportContractError(f"report worker output changed: {name}")
@@ -3159,7 +3295,32 @@ class DefaultPilotServices:
             actual_digest = digest.hexdigest()
             if actual_digest != declared_digest:
                 raise ReportContractError(f"report worker output checksum is invalid: {name}")
+            if claim_buffer is not None:
+                guard.checkpoint(
+                    live_bytes
+                    + output_bytes
+                    + captured_claim_bytes
+                    + 2 * len(claim_buffer)
+                )
+                captured_claims[name] = bytes(claim_buffer)
+                captured_claim_bytes += len(claim_buffer)
             verified[name] = (path, actual_digest, declared_size)
+            root_after = output_root.lstat()
+            if (
+                output_root.is_symlink()
+                or output_root.is_junction()
+                or root_after.st_dev != root_before.st_dev
+                or (root_before.st_ino and root_after.st_ino != root_before.st_ino)
+            ):
+                raise ReportContractError("report worker output directory changed")
+        stage_status, decision, conclusion = (
+            DefaultPilotServices._validated_report_decision_evidence(
+                captured_claims=captured_claims,
+                worker_status=stage_status,
+                worker_decision=decision,
+                worker_conclusion=conclusion,
+            )
+        )
         return stage_status, decision, conclusion, verified, output_bytes
 
     @staticmethod
@@ -3194,6 +3355,12 @@ class DefaultPilotServices:
             "conclusion": "resource_gate_failed",
             "gate": gate,
         }
+        if (
+            diagnostic["scientific_decision"]
+            not in _REPORT_STATUS_DECISIONS[StageStatus.INVALID]
+            or diagnostic["conclusion"] != "resource_gate_failed"
+        ):
+            raise ReportContractError("invalid report decision evidence is inconsistent")
         ledger = {
             "schema_version": "1.0",
             "stage": "report",
@@ -3424,7 +3591,11 @@ class DefaultPilotServices:
                     prefix=f".report-worker-{os.getpid()}-", dir=staging_parent
                 )
             )
-            if worker_root.resolve().parent != staging_parent or worker_root.is_symlink():
+            if (
+                worker_root.resolve().parent != staging_parent
+                or worker_root.is_symlink()
+                or worker_root.is_junction()
+            ):
                 raise ReportContractError("report worker staging escaped the run directory")
             input_root = worker_root / "inputs"
             output_root = worker_root / "outputs"

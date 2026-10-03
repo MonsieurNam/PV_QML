@@ -4,7 +4,10 @@ import hashlib
 import io
 import json
 import math
+import os
 import shutil
+import subprocess
+import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -919,6 +922,134 @@ def test_report_rejects_malformed_worker_inventory_and_cleans_staging(
     assert list(store.root.glob(".report-worker-*")) == []
 
 
+def test_report_rejects_mutated_worker_decision_scalars_after_real_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _make_completed_run(tmp_path)
+
+    class ScalarMutatingExecutor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def run(
+            self,
+            _operation: str,
+            function: Callable[..., dict[str, Any]],
+            request: dict[str, Any],
+            **_kwargs: object,
+        ) -> dict[str, Any]:
+            result = function(request)
+            result["stage_status"] = "success"
+            result["scientific_decision"] = "go"
+            result["conclusion"] = "mutated_after_worker"
+            return result
+
+    monkeypatch.setattr(service_module, "_ReportProcessExecutor", ScalarMutatingExecutor)
+
+    with pytest.raises(ValueError, match="decision evidence"):
+        DefaultPilotServices().report(store.root)
+
+    assert not (store.root / "report/stage_manifest.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("name", "mutation"),
+    [
+        ("decision.json", {"scientific_decision": "go"}),
+        ("scores.json", {"decision": "go"}),
+        ("report_manifest.json", {"scientific_decision": "go"}),
+    ],
+)
+def test_report_rejects_cross_json_decision_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    mutation: dict[str, str],
+) -> None:
+    store = _make_completed_run(tmp_path)
+
+    class JsonMutatingExecutor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def run(
+            self,
+            _operation: str,
+            function: Callable[..., dict[str, Any]],
+            request: dict[str, Any],
+            **_kwargs: object,
+        ) -> dict[str, Any]:
+            result = function(request)
+            path = Path(request["output_root"]) / name
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value.update(mutation)
+            payload = json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+            path.write_bytes(payload)
+            result["outputs"][name] = {
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size": len(payload),
+            }
+            return result
+
+    monkeypatch.setattr(service_module, "_ReportProcessExecutor", JsonMutatingExecutor)
+
+    with pytest.raises(ValueError, match="decision evidence"):
+        DefaultPilotServices().report(store.root)
+
+    assert not (store.root / "report/stage_manifest.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("name", "replacement"),
+    [
+        ("scores.csv", ("blocked", "success")),
+        (
+            "report.md",
+            ("**Status:** BLOCKED / NOT_EVALUATED", "**Status:** SUCCESS / GO"),
+        ),
+    ],
+)
+def test_report_rejects_cross_text_decision_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    replacement: tuple[str, str],
+) -> None:
+    store = _make_completed_run(tmp_path)
+
+    class TextMutatingExecutor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def run(
+            self,
+            _operation: str,
+            function: Callable[..., dict[str, Any]],
+            request: dict[str, Any],
+            **_kwargs: object,
+        ) -> dict[str, Any]:
+            result = function(request)
+            path = Path(request["output_root"]) / name
+            payload = path.read_text(encoding="utf-8").replace(*replacement).encode()
+            path.write_bytes(payload)
+            result["outputs"][name] = {
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size": len(payload),
+            }
+            return result
+
+    monkeypatch.setattr(service_module, "_ReportProcessExecutor", TextMutatingExecutor)
+
+    with pytest.raises(ValueError, match="decision evidence"):
+        DefaultPilotServices().report(store.root)
+
+
 def test_report_rejects_worker_output_tamper_before_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1073,16 +1204,36 @@ def test_report_worker_rejects_input_or_output_outside_private_staging(
     assert "directory is unsafe" in result["message"]
 
 
-def test_report_worker_rejects_symlinked_staging_root(tmp_path: Path) -> None:
+def test_report_worker_rejects_linked_staging_root_without_platform_skip(
+    tmp_path: Path,
+) -> None:
     staging = tmp_path / "staging"
     staging.mkdir()
     (staging / "inputs").mkdir()
     (staging / "outputs").mkdir()
     link = tmp_path / "staging-link"
-    try:
+    if sys.platform == "win32":
+        escaped_link = str(link).replace("'", "''")
+        escaped_target = str(staging).replace("'", "''")
+        command = (
+            f"New-Item -ItemType Junction -Path '{escaped_link}' "
+            f"-Target '{escaped_target}' -ErrorAction Stop | Out-Null"
+        )
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                command,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert link.is_junction()
+    else:
         link.symlink_to(staging, target_is_directory=True)
-    except OSError:
-        pytest.skip("directory symlinks are unavailable on this Windows host")
 
     result = report_worker_module.run_report_worker(
         {
@@ -1094,6 +1245,41 @@ def test_report_worker_rejects_symlinked_staging_root(tmp_path: Path) -> None:
 
     assert result["status"] == "contract_error"
     assert "staging root is unsafe" in result["message"]
+
+
+def test_report_worker_decodes_exact_hashed_snapshot_bytes_despite_path_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "snapshot.parquet"
+    first = pa.table({"sample_id": ["aaaa", "cccc"]})
+    second = pa.table({"sample_id": ["bbbb", "dddd"]})
+    first_buffer = io.BytesIO()
+    second_buffer = io.BytesIO()
+    pq.write_table(first, first_buffer, compression=None, use_dictionary=False)
+    pq.write_table(second, second_buffer, compression=None, use_dictionary=False)
+    first_bytes = first_buffer.getvalue()
+    second_bytes = second_buffer.getvalue()
+    assert len(first_bytes) == len(second_bytes)
+    path.write_bytes(first_bytes)
+    original_stat = path.stat()
+    real_decode = pd.read_parquet
+    observed_sources: list[object] = []
+
+    def swap_before_decode(source: object, *args: object, **kwargs: object) -> pd.DataFrame:
+        observed_sources.append(source)
+        path.write_bytes(second_bytes)
+        os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        return real_decode(source, *args, **kwargs)
+
+    monkeypatch.setattr(pd, "read_parquet", swap_before_decode)
+
+    decoded = report_worker_module._read_parquet_once(
+        path, hashlib.sha256(first_bytes).hexdigest()
+    )
+
+    assert isinstance(observed_sources[0], io.BytesIO)
+    assert decoded["sample_id"].tolist() == ["aaaa", "cccc"]
+    assert pd.read_parquet(path)["sample_id"].tolist() == ["bbbb", "dddd"]
 
 
 def test_report_evaluation_checkpoint_counts_source_frames_with_captured_inputs(

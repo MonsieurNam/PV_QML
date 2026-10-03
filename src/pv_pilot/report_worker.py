@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import stat
 from collections.abc import Mapping
@@ -33,6 +34,17 @@ _OUTPUT_ATTRIBUTES = {
 }
 
 
+def _is_link_like(path: Path) -> bool:
+    return path.is_symlink() or path.is_junction()
+
+
+def _directory_identity(path: Path) -> tuple[int, int]:
+    value = path.lstat()
+    if _is_link_like(path) or not stat.S_ISDIR(value.st_mode) or value.st_nlink != 1:
+        raise ReportContractError(f"report worker directory is unsafe: {path.name}")
+    return value.st_dev, value.st_ino
+
+
 def _ignore_resource_checkpoint(_declared_bytes: int = 0) -> None:
     return None
 
@@ -44,7 +56,7 @@ def _validated_directory(raw: object, *, parent: Path, name: str) -> Path:
     resolved = path.resolve(strict=False)
     before = path.lstat()
     if (
-        path.is_symlink()
+        _is_link_like(path)
         or not stat.S_ISDIR(before.st_mode)
         or before.st_nlink != 1
         or resolved.parent != parent
@@ -55,8 +67,9 @@ def _validated_directory(raw: object, *, parent: Path, name: str) -> Path:
 
 
 def _read_parquet_once(path: Path, expected_sha256: str | None = None) -> pd.DataFrame:
+    parent_identity = _directory_identity(path.parent)
     before = path.lstat()
-    if path.is_symlink() or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+    if _is_link_like(path) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
         raise ReportContractError(f"report worker input is unsafe: {path.name}")
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
@@ -70,35 +83,47 @@ def _read_parquet_once(path: Path, expected_sha256: str | None = None) -> pd.Dat
         ):
             raise ReportContractError(f"report worker input changed: {path.name}")
         digest = hashlib.sha256()
+        captured = io.BytesIO()
         while True:
             chunk = os.read(descriptor, 1024 * 1024)
             if not chunk:
                 break
             digest.update(chunk)
+            captured.write(chunk)
         if expected_sha256 is not None and digest.hexdigest() != expected_sha256:
             raise ReportContractError(
                 f"report worker snapshot checksum is invalid: {path.name}"
             )
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        with os.fdopen(os.dup(descriptor), "rb") as stream:
-            frame = pd.read_parquet(stream)
         after = os.fstat(descriptor)
-        if after.st_size != opened.st_size or after.st_mtime_ns != opened.st_mtime_ns:
+        if (
+            after.st_size != opened.st_size
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or _directory_identity(path.parent) != parent_identity
+        ):
             raise ReportContractError(f"report worker input changed: {path.name}")
+        captured.seek(0)
+        frame = pd.read_parquet(captured)
+        if _directory_identity(path.parent) != parent_identity:
+            raise ReportContractError(f"report worker input directory changed: {path.name}")
         return frame
     finally:
         os.close(descriptor)
 
 
 def _write_output(path: Path, payload: bytes) -> dict[str, object]:
-    if path.parent.is_symlink() or path.exists() or path.is_symlink():
+    parent_identity = _directory_identity(path.parent)
+    if path.exists() or _is_link_like(path):
         raise ReportContractError(f"report worker output path is unsafe: {path.name}")
     with path.open("xb") as stream:
         stream.write(payload)
         stream.flush()
         os.fsync(stream.fileno())
     written = path.lstat()
-    if not stat.S_ISREG(written.st_mode) or written.st_nlink != 1:
+    if (
+        not stat.S_ISREG(written.st_mode)
+        or written.st_nlink != 1
+        or _directory_identity(path.parent) != parent_identity
+    ):
         raise ReportContractError(f"report worker output is unsafe: {path.name}")
     return {
         "sha256": hashlib.sha256(payload).hexdigest(),
@@ -114,22 +139,25 @@ def run_report_worker(request: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(staging_raw, str):
             raise ReportContractError("report worker staging root is invalid")
         staging_path = Path(staging_raw)
-        if staging_path.is_symlink():
+        if _is_link_like(staging_path):
             raise ReportContractError("report worker staging root is unsafe")
         staging = staging_path.resolve(strict=True)
         staging_stat = staging.lstat()
         if (
-            staging.is_symlink()
+            _is_link_like(staging)
             or not stat.S_ISDIR(staging_stat.st_mode)
             or staging_stat.st_nlink != 1
         ):
             raise ReportContractError("report worker staging root is unsafe")
+        staging_identity = _directory_identity(staging)
         input_root = _validated_directory(
             request.get("input_root"), parent=staging, name="inputs"
         )
         output_root = _validated_directory(
             request.get("output_root"), parent=staging, name="outputs"
         )
+        input_identity = _directory_identity(input_root)
+        output_identity = _directory_identity(output_root)
         snapshot_sha256 = request.get("snapshot_sha256")
         if (
             not isinstance(snapshot_sha256, dict)
@@ -178,6 +206,12 @@ def run_report_worker(request: Mapping[str, Any]) -> dict[str, Any]:
             if not isinstance(payload, bytes):
                 raise ReportContractError(f"report worker payload is invalid: {name}")
             outputs[name] = _write_output(output_root / name, payload)
+        if (
+            _directory_identity(staging) != staging_identity
+            or _directory_identity(input_root) != input_identity
+            or _directory_identity(output_root) != output_identity
+        ):
+            raise ReportContractError("report worker staging directory changed")
         bundle = products.evaluation.score_bundle
         return {
             "schema_version": "1.0",
