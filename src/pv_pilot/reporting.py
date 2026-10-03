@@ -441,6 +441,16 @@ def _bootstrap_schema() -> pa.Schema:
     )
 
 
+def report_parquet_schemas() -> dict[str, pa.Schema]:
+    """Return the fixed schemas for worker-produced report Parquet artifacts."""
+
+    return {
+        "timestamp_scores.parquet": _timestamp_schema(),
+        "evaluated_predictions.parquet": _audit_schema(),
+        "bootstrap_replicates.parquet": _bootstrap_schema(),
+    }
+
+
 def _parquet_bytes(frame: pd.DataFrame, schema: pa.Schema) -> bytes:
     normalized = frame.copy()
     for field in schema:
@@ -976,5 +986,6 @@ __all__ = [
     "ReportProducts",
     "build_report_products",
     "expected_primary_configuration",
+    "report_parquet_schemas",
     "resource_gate_evidence",
 ]

@@ -7,9 +7,9 @@ import io
 import json
 import os
 import pickle
+import shutil
 import stat
-import struct
-import sys
+import tempfile
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping
@@ -43,7 +43,8 @@ from .data import (
 from .data import dataframe_parquet_bytes as dataframe_parquet_bytes
 from .domain import DetailEntry, StageResult, StageStatus, deterministic_data
 from .evaluation import EvaluationContractError
-from .reporting import ReportContractError, build_report_products
+from .report_worker import run_report_worker
+from .reporting import ReportContractError, report_parquet_schemas
 from .seeds import SeedManager
 from .splits import (
     COMBINED_MEMBERSHIP_POLICY,
@@ -59,6 +60,8 @@ from .splits import (
     feature_schema_sha256,
     split_exclusion_dataframe_parquet_bytes,
 )
+
+_ReportProcessExecutor = baseline_models.DeadlineProcessFitExecutor
 
 
 class _ResourceLimitExceeded(RuntimeError):
@@ -711,69 +714,6 @@ class DefaultPilotServices:
         if not isinstance(value, dict):
             raise ValueError(f"captured JSON artifact must be an object: {label}")
         return value
-
-    @staticmethod
-    def _parquet_decode_upper_bound(
-        payload: bytes, expected_schema: pa.Schema, label: str
-    ) -> int:
-        """Bound pandas materialization from Parquet metadata without decoding pages."""
-
-        try:
-            parquet_file = pq.ParquetFile(io.BytesIO(payload))
-        except (OSError, pa.ArrowException) as error:
-            raise ValueError(f"captured Parquet artifact is invalid: {label}") from error
-        actual_schema = parquet_file.schema_arrow.remove_metadata()
-        expected = expected_schema.remove_metadata()
-        if not actual_schema.equals(expected, check_metadata=False):
-            raise ValueError(f"captured Parquet schema is invalid: {label}")
-        metadata = parquet_file.metadata
-        if metadata.num_rows < 0 or metadata.num_row_groups < 0:
-            raise ValueError(f"captured Parquet metadata is invalid: {label}")
-
-        object_slot = struct.calcsize("P")
-        object_overhead = object_slot + sys.getsizeof("")
-        estimated = metadata.num_rows * 8 + 256
-        for row_group_index in range(metadata.num_row_groups):
-            row_group = metadata.row_group(row_group_index)
-            if row_group.num_columns != len(expected):
-                raise ValueError(f"captured Parquet column inventory is invalid: {label}")
-            for column_index, field in enumerate(expected):
-                column = row_group.column(column_index)
-                values = int(column.num_values)
-                uncompressed = int(column.total_uncompressed_size)
-                if values < 0 or uncompressed < 0:
-                    raise ValueError(f"captured Parquet column metadata is invalid: {label}")
-                field_type = field.type
-                if pa.types.is_string(field_type) or pa.types.is_large_string(field_type) or (
-                    pa.types.is_binary(field_type) or pa.types.is_large_binary(field_type)
-                ):
-                    encodings = {str(encoding).upper() for encoding in column.encodings}
-                    dictionary_encoded = bool(
-                        encodings & {"RLE_DICTIONARY", "PLAIN_DICTIONARY"}
-                    )
-                    # A dictionary payload can legally contain one very large value
-                    # referenced by every row. The decoded pandas object column must
-                    # therefore budget that value once per logical value, not once per
-                    # dictionary entry.
-                    value_bytes = (
-                        uncompressed * max(values, 1)
-                        if dictionary_encoded
-                        else uncompressed
-                    )
-                    estimated += value_bytes + values * object_overhead
-                elif pa.types.is_boolean(field_type):
-                    estimated += values
-                elif (
-                    pa.types.is_integer(field_type)
-                    or pa.types.is_floating(field_type)
-                    or pa.types.is_temporal(field_type)
-                ):
-                    bit_width = int(getattr(field_type, "bit_width", 64))
-                    estimated += values * max(1, bit_width // 8)
-                else:
-                    raise ValueError(f"captured Parquet type is unsupported: {label}")
-                estimated += (values + 7) // 8
-        return int(estimated)
 
     @classmethod
     def _capture_report_provenance(
@@ -3060,6 +3000,169 @@ class DefaultPilotServices:
         return result
 
     @staticmethod
+    def _write_report_worker_snapshot(path: Path, payload: bytes) -> None:
+        if path.exists() or path.is_symlink() or path.parent.is_symlink():
+            raise ReportContractError("report worker snapshot path is unsafe")
+        with path.open("xb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        written = path.lstat()
+        if not stat.S_ISREG(written.st_mode) or written.st_nlink != 1:
+            raise ReportContractError("report worker snapshot is not a regular file")
+
+    @staticmethod
+    def _cleanup_abandoned_report_workers(store: RunStore) -> None:
+        root = store.root.resolve()
+        for candidate in store.root.glob(".report-worker-*"):
+            try:
+                candidate_stat = candidate.lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                candidate.is_symlink()
+                or not stat.S_ISDIR(candidate_stat.st_mode)
+                or candidate.resolve(strict=False).parent != root
+            ):
+                raise ReportContractError("abandoned report worker path is unsafe")
+            suffix = candidate.name.removeprefix(".report-worker-")
+            pid_text = suffix.split("-", 1)[0]
+            if pid_text.isdigit() and psutil.pid_exists(int(pid_text)):
+                continue
+            shutil.rmtree(candidate)
+
+    @staticmethod
+    def _validate_report_worker_outputs(
+        *,
+        output_root: Path,
+        worker_result: object,
+        guard: _ResourceGuard,
+        live_bytes: int,
+    ) -> tuple[
+        StageStatus,
+        str,
+        str,
+        dict[str, tuple[Path, str, int]],
+        int,
+    ]:
+        if not isinstance(worker_result, dict) or worker_result.get("schema_version") != "1.0":
+            raise ReportContractError("report worker result is invalid")
+        worker_status = worker_result.get("status")
+        if worker_status == "contract_error":
+            message = worker_result.get("message")
+            if not isinstance(message, str) or not message or len(message) > 1000:
+                raise ReportContractError("report worker contract error is malformed")
+            raise ReportContractError(message)
+        if worker_status != "success":
+            raise ReportContractError("report worker status is invalid")
+        try:
+            stage_status = StageStatus(str(worker_result.get("stage_status")))
+        except ValueError as error:
+            raise ReportContractError("report worker stage status is invalid") from error
+        if stage_status not in {StageStatus.SUCCESS, StageStatus.BLOCKED}:
+            raise ReportContractError("report worker stage status is not publishable")
+        decision = worker_result.get("scientific_decision")
+        conclusion = worker_result.get("conclusion")
+        if (
+            not isinstance(decision, str)
+            or decision not in {"go", "stop", "inconclusive", "not_evaluated"}
+            or not isinstance(conclusion, str)
+            or not conclusion
+            or len(conclusion) > 1000
+        ):
+            raise ReportContractError("report worker decision evidence is invalid")
+        expected_names = {
+            "report.md",
+            "timestamp_scores.parquet",
+            "evaluated_predictions.parquet",
+            "bootstrap_replicates.parquet",
+            "scores.json",
+            "scores.csv",
+            "decision.json",
+            "report_manifest.json",
+        }
+        raw_outputs = worker_result.get("outputs")
+        if not isinstance(raw_outputs, dict) or set(raw_outputs) != expected_names:
+            raise ReportContractError("report worker output inventory is invalid")
+        schemas = report_parquet_schemas()
+        verified: dict[str, tuple[Path, str, int]] = {}
+        output_bytes = 0
+        root = output_root.resolve(strict=True)
+        for name in sorted(expected_names):
+            record = raw_outputs[name]
+            if not isinstance(record, dict) or set(record) != {"sha256", "size"}:
+                raise ReportContractError(f"report worker output record is invalid: {name}")
+            declared_digest = record.get("sha256")
+            declared_size = record.get("size")
+            if (
+                not isinstance(declared_digest, str)
+                or len(declared_digest) != 64
+                or any(character not in "0123456789abcdef" for character in declared_digest)
+                or isinstance(declared_size, bool)
+                or not isinstance(declared_size, int)
+                or declared_size < 0
+            ):
+                raise ReportContractError(f"report worker output metadata is invalid: {name}")
+            path = output_root / name
+            try:
+                before = path.lstat()
+            except OSError as error:
+                raise ReportContractError(
+                    f"report worker output is missing or inaccessible: {name}"
+                ) from error
+            if (
+                path.is_symlink()
+                or path.resolve(strict=False).parent != root
+                or not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_size != declared_size
+            ):
+                raise ReportContractError(f"report worker output is unsafe: {name}")
+            output_bytes += declared_size
+            guard.checkpoint(live_bytes + output_bytes)
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
+            digest = hashlib.sha256()
+            try:
+                opened = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_nlink != 1
+                    or opened.st_size != declared_size
+                    or (before.st_ino and opened.st_ino != before.st_ino)
+                ):
+                    raise ReportContractError(f"report worker output changed: {name}")
+                if name in schemas:
+                    with os.fdopen(os.dup(descriptor), "rb") as stream:
+                        actual_schema = pq.ParquetFile(stream).schema_arrow.remove_metadata()
+                    if not actual_schema.equals(
+                        schemas[name].remove_metadata(), check_metadata=False
+                    ):
+                        raise ReportContractError(
+                            f"report worker Parquet schema is invalid: {name}"
+                        )
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                while True:
+                    chunk = os.read(descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                after = os.fstat(descriptor)
+                if after.st_size != opened.st_size or after.st_mtime_ns != opened.st_mtime_ns:
+                    raise ReportContractError(f"report worker output changed: {name}")
+            except (OSError, pa.ArrowException) as error:
+                raise ReportContractError(
+                    f"report worker output cannot be verified: {name}"
+                ) from error
+            finally:
+                os.close(descriptor)
+            actual_digest = digest.hexdigest()
+            if actual_digest != declared_digest:
+                raise ReportContractError(f"report worker output checksum is invalid: {name}")
+            verified[name] = (path, actual_digest, declared_size)
+        return stage_status, decision, conclusion, verified, output_bytes
+
+    @staticmethod
     def _publish_report_invalid(
         *,
         store: RunStore,
@@ -3143,6 +3246,10 @@ class DefaultPilotServices:
 
         started = time.perf_counter()
         store = RunStore.open(run_dir)
+        try:
+            self._cleanup_abandoned_report_workers(store)
+        except (OSError, ReportContractError) as error:
+            raise ValueError(f"report worker staging is invalid: {error}") from error
         existing = self._existing_report_result(store)
         if existing is not None:
             return existing
@@ -3152,6 +3259,7 @@ class DefaultPilotServices:
             wall_seconds=config.resources.max_wall_clock_seconds,
             memory_bytes=int(config.resources.max_memory_gb * 1024**3),
         )
+        worker_root: Path | None = None
         try:
             (
                 config,
@@ -3288,40 +3396,6 @@ class DefaultPilotServices:
                 stage: captured_object(path)
                 for stage, path in ledger_paths.items()
             }
-            declared = total_file_bytes
-
-            def decode_parquet(
-                relative: str, expected_schema: pa.Schema
-            ) -> pd.DataFrame:
-                nonlocal declared
-                payload = captured[relative]
-                decode_upper_bound = self._parquet_decode_upper_bound(
-                    payload, expected_schema, relative
-                )
-                guard.checkpoint(declared + decode_upper_bound)
-                frame = pd.read_parquet(io.BytesIO(payload))
-                actual_bytes = int(frame.memory_usage(index=True, deep=True).sum())
-                if actual_bytes > decode_upper_bound:
-                    raise ReportContractError(
-                        f"Parquet decode exceeded its metadata bound: {relative}"
-                    )
-                declared += actual_bytes
-                guard.checkpoint(declared)
-                return frame
-
-            exact = decode_parquet(
-                "benchmark/exact_predictions.parquet",
-                photonic_benchmark.exact_prediction_arrow_schema(),
-            )
-            baselines = decode_parquet(
-                "train-baselines/predictions.parquet",
-                baseline_models.prediction_arrow_schema(),
-            )
-            finite = decode_parquet(
-                "benchmark/finite_shot_predictions.parquet",
-                photonic_benchmark.finite_shot_prediction_arrow_schema(),
-            )
-            guard.checkpoint(declared)
             environment_manifest = captured_object("environment_manifest.json")
             provenance = {
                 "run_id": store.root.name,
@@ -3344,50 +3418,146 @@ class DefaultPilotServices:
                     )
                 },
             }
-            products = build_report_products(
-                config=config,
-                exact_predictions=exact,
-                baseline_predictions=baselines,
-                finite_shot_predictions=finite,
-                selection_manifest=selection_manifest,
-                circuit_manifest=circuit_manifest,
-                state_spaces=state_spaces,
-                benchmark_diagnostics=benchmark_diagnostics,
-                benchmark_model_manifest=benchmark_model_manifest,
-                resource_ledgers=resource_ledgers,
-                provenance=provenance,
-                input_hashes=input_hashes,
-                versions={
-                    "protocol": config.protocol.version,
-                    "canonical_data_schema": data_card.get("canonical_schema_version"),
-                    "split_feature_schema": split_feature_manifest.get("schema_version"),
-                    "photonic_feature_schema": photonic_feature_manifest.get(
-                        "schema_version"
-                    ),
-                    "benchmark_schema": selection_manifest.get("schema_version"),
-                    "prediction_fit_phase": "train_plus_validation_refit",
-                },
-                baseline_selection=baseline_selection,
-                baseline_model_manifest=baseline_model_manifest,
-                initial_live_bytes=total_file_bytes,
-                resource_checkpoint=guard.checkpoint,
+            staging_parent = store.root.resolve()
+            worker_root = Path(
+                tempfile.mkdtemp(
+                    prefix=f".report-worker-{os.getpid()}-", dir=staging_parent
+                )
             )
-            report_manifest_bytes = products.report_manifest_json
-            markdown_bytes = products.report_markdown
-            guard.checkpoint(products.declared_live_bytes)
+            if worker_root.resolve().parent != staging_parent or worker_root.is_symlink():
+                raise ReportContractError("report worker staging escaped the run directory")
+            input_root = worker_root / "inputs"
+            output_root = worker_root / "outputs"
+            control_root = worker_root / "control"
+            input_root.mkdir()
+            output_root.mkdir()
+            control_root.mkdir()
+            snapshots = {
+                "exact_predictions.parquet": captured[
+                    "benchmark/exact_predictions.parquet"
+                ],
+                "baseline_predictions.parquet": captured[
+                    "train-baselines/predictions.parquet"
+                ],
+                "finite_shot_predictions.parquet": captured[
+                    "benchmark/finite_shot_predictions.parquet"
+                ],
+            }
+            for name, payload in snapshots.items():
+                guard.checkpoint(total_file_bytes)
+                self._write_report_worker_snapshot(input_root / name, payload)
+            versions = {
+                "protocol": config.protocol.version,
+                "canonical_data_schema": data_card.get("canonical_schema_version"),
+                "split_feature_schema": split_feature_manifest.get("schema_version"),
+                "photonic_feature_schema": photonic_feature_manifest.get(
+                    "schema_version"
+                ),
+                "benchmark_schema": selection_manifest.get("schema_version"),
+                "prediction_fit_phase": "train_plus_validation_refit",
+            }
+            worker_request = {
+                "staging_root": str(worker_root),
+                "input_root": str(input_root),
+                "output_root": str(output_root),
+                "snapshot_sha256": {
+                    "exact_predictions.parquet": input_hashes[
+                        "benchmark/exact_predictions.parquet"
+                    ],
+                    "baseline_predictions.parquet": input_hashes[
+                        "train-baselines/predictions.parquet"
+                    ],
+                    "finite_shot_predictions.parquet": input_hashes[
+                        "benchmark/finite_shot_predictions.parquet"
+                    ],
+                },
+                "config": config.model_dump(mode="json"),
+                "selection_manifest": selection_manifest,
+                "circuit_manifest": circuit_manifest,
+                "state_spaces": state_spaces,
+                "benchmark_diagnostics": benchmark_diagnostics,
+                "benchmark_model_manifest": benchmark_model_manifest,
+                "resource_ledgers": resource_ledgers,
+                "provenance": provenance,
+                "input_hashes": input_hashes,
+                "versions": versions,
+                "baseline_selection": baseline_selection,
+                "baseline_model_manifest": baseline_model_manifest,
+            }
+            executor = _ReportProcessExecutor(
+                deadline_monotonic=time.monotonic()
+                + max(
+                    0.0,
+                    guard.wall_seconds - (time.perf_counter() - guard.started),
+                ),
+                resource_checkpoint=guard.checkpoint,
+                private_directory=control_root,
+                max_memory_bytes=guard.memory_bytes,
+                telemetry_callback=guard.record_fit_rss,
+            )
+            worker_result = executor.run(
+                "report-decode-evaluate-serialize",
+                run_report_worker,
+                worker_request,
+                declared_bytes=total_file_bytes,
+            )
+            (
+                report_status,
+                report_decision,
+                report_conclusion,
+                worker_outputs,
+                worker_output_bytes,
+            ) = self._validate_report_worker_outputs(
+                output_root=output_root,
+                worker_result=worker_result,
+                guard=guard,
+                live_bytes=total_file_bytes,
+            )
+            publication_live_bytes = total_file_bytes + worker_output_bytes
+            guard.checkpoint(publication_live_bytes)
         except _ResourceLimitExceeded as error:
+            if worker_root is not None:
+                shutil.rmtree(worker_root, ignore_errors=True)
             return self._publish_report_invalid(
                 store=store,
                 guard=guard,
                 gate=f"resource_{error.gate}",
                 message="report generation exceeded a configured resource cap",
             )
+        except baseline_models.FitMemoryExceeded:
+            if worker_root is not None:
+                shutil.rmtree(worker_root, ignore_errors=True)
+            return self._publish_report_invalid(
+                store=store,
+                guard=guard,
+                gate="report_worker_memory_rss",
+                message="report worker exceeded the configured aggregate RSS cap",
+            )
+        except baseline_models.FitDeadlineExceeded:
+            if worker_root is not None:
+                shutil.rmtree(worker_root, ignore_errors=True)
+            return self._publish_report_invalid(
+                store=store,
+                guard=guard,
+                gate="report_worker_wall_clock",
+                message="report worker exceeded the configured wall-clock cap",
+            )
+        except RuntimeError as error:
+            if worker_root is not None:
+                shutil.rmtree(worker_root, ignore_errors=True)
+            return self._publish_report_invalid(
+                store=store,
+                guard=guard,
+                gate="report_worker_failed",
+                message=f"report worker failed: {str(error)[:500]}",
+            )
         except (EvaluationContractError, ReportContractError) as error:
+            if worker_root is not None:
+                shutil.rmtree(worker_root, ignore_errors=True)
             raise ValueError(f"report artifact contract is invalid: {error}") from error
 
-        bundle = products.evaluation.score_bundle
         terminal_status = cast(
-            Literal["SUCCESS", "BLOCKED", "INVALID"], bundle.stage_status.value.upper()
+            Literal["SUCCESS", "BLOCKED", "INVALID"], report_status.value.upper()
         )
         artifacts = (
             Path("report/report.md"),
@@ -3402,23 +3572,23 @@ class DefaultPilotServices:
         )
         result = StageResult(
             stage="report",
-            status=bundle.stage_status,
+            status=report_status,
             message=(
                 "pilot report produced; scientific decision is not evaluated"
-                if bundle.stage_status is StageStatus.BLOCKED
-                else f"pilot report produced: {bundle.decision.value}"
+                if report_status is StageStatus.BLOCKED
+                else f"pilot report produced: {report_decision}"
             ),
             artifacts=artifacts,
             details=(
-                DetailEntry(key="scientific_decision", value=bundle.decision.value),
-                DetailEntry(key="conclusion", value=bundle.conclusion),
+                DetailEntry(key="scientific_decision", value=report_decision),
+                DetailEntry(key="conclusion", value=report_conclusion),
             ),
         )
         guard.sample_without_enforcement()
         ledger = {
             "schema_version": "1.0",
             "stage": "report",
-            "status": bundle.stage_status.value,
+            "status": report_status.value,
             "resource_status": "WITHIN_LIMIT",
             "wall_clock_seconds": time.perf_counter() - started,
             "peak_rss_bytes": guard.peak_rss_bytes,
@@ -3432,7 +3602,7 @@ class DefaultPilotServices:
         }
 
         def publication_checkpoint() -> None:
-            guard.checkpoint(products.declared_live_bytes)
+            guard.checkpoint(publication_live_bytes)
 
         try:
             with store.stage(
@@ -3442,40 +3612,37 @@ class DefaultPilotServices:
                 prerequisite_verification="selected_outputs",
                 prerequisite_output_allowlist=self._report_benchmark_allowlist(),
                 details={
-                    "result_status": bundle.stage_status.value,
-                    "scientific_decision": bundle.decision.value,
-                    "conclusion": bundle.conclusion,
+                    "result_status": report_status.value,
+                    "scientific_decision": report_decision,
+                    "conclusion": report_conclusion,
                     "read_only_consumer": True,
                 },
                 commit_guard=publication_checkpoint,
                 private_write_guard=publication_checkpoint,
                 preverified_input_hashes=input_hashes,
             ) as transaction:
-                transaction.write_bytes("report.md", markdown_bytes)
-                transaction.write_bytes(
-                    "timestamp_scores.parquet", products.timestamp_scores_parquet
-                )
-                transaction.write_bytes(
-                    "evaluated_predictions.parquet",
-                    products.evaluated_predictions_parquet,
-                )
-                transaction.write_bytes(
-                    "bootstrap_replicates.parquet",
-                    products.bootstrap_replicates_parquet,
-                )
-                transaction.write_bytes("scores.json", products.scores_json)
-                transaction.write_bytes("scores.csv", products.scores_csv)
-                transaction.write_bytes("decision.json", products.decision_json)
-                transaction.write_bytes("report_manifest.json", report_manifest_bytes)
+                for name in sorted(worker_outputs):
+                    source, digest, size = worker_outputs[name]
+                    transaction.write_file(
+                        name,
+                        source,
+                        expected_sha256=digest,
+                        expected_size=size,
+                    )
                 transaction.write_json("resource_ledger.json", ledger)
                 transaction.write_json("stage_result.json", deterministic_data(result))
         except _ResourceLimitExceeded as error:
+            if worker_root is not None:
+                shutil.rmtree(worker_root, ignore_errors=True)
             return self._publish_report_invalid(
                 store=store,
                 guard=guard,
                 gate=f"resource_{error.gate}",
                 message="report publication exceeded a configured resource cap",
             )
+        finally:
+            if worker_root is not None:
+                shutil.rmtree(worker_root, ignore_errors=True)
         return result
 
     def run_pilot(

@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import math
 import shutil
+import time
 from collections.abc import Callable
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
 import pandas as pd
-import psutil
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import yaml
 
@@ -19,6 +21,7 @@ import pv_pilot.artifacts as artifacts_module
 import pv_pilot.baselines as baseline_module
 import pv_pilot.benchmark as benchmark_module
 import pv_pilot.photonics as photonics_module
+import pv_pilot.report_worker as report_worker_module
 import pv_pilot.reporting as reporting_module
 import pv_pilot.services as service_module
 from pv_pilot.artifacts import RunStore, StageTransaction, sha256_file
@@ -42,6 +45,20 @@ class _E2EConstantEstimator:
 
     def predict(self, values: np.ndarray) -> np.ndarray:
         return np.full(len(values), self.value)
+
+
+def _isolated_report_parquet_checks(unique_path: str, empty_path: str) -> dict[str, int]:
+    unique = report_worker_module._read_parquet_once(Path(unique_path))
+    empty_payload = reporting_module._parquet_bytes(
+        pd.DataFrame(),
+        reporting_module.report_parquet_schemas()["bootstrap_replicates.parquet"],
+    )
+    Path(empty_path).write_bytes(empty_payload)
+    return {"rows": len(unique), "empty_size": len(empty_payload)}
+
+
+def _crash_report_worker(_request: object) -> object:
+    raise RuntimeError("injected spawned worker crash")
 
 
 def _freeze(payload: object) -> str:
@@ -492,6 +509,7 @@ def test_report_is_read_only_blocked_for_synthetic_and_resumable(
         photonics_module, "build_development_photonic_features", forbidden
     )
     monkeypatch.setattr(benchmark_module, "select_photonic_models", forbidden)
+    monkeypatch.setattr(reporting_module, "_parquet_bytes", forbidden)
     monkeypatch.setattr(DefaultPilotServices, "train_baselines", forbidden)
     monkeypatch.setattr(DefaultPilotServices, "build_photonic_features", forbidden)
     monkeypatch.setattr(DefaultPilotServices, "benchmark", forbidden)
@@ -600,16 +618,27 @@ def test_interrupted_report_publication_never_creates_terminal_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _make_completed_run(tmp_path)
-    original = StageTransaction.write_bytes
+    original = StageTransaction.write_file
 
     def interrupt(
-        self: StageTransaction, relative_path: str | Path, data: bytes
+        self: StageTransaction,
+        relative_path: str | Path,
+        source_path: str | Path,
+        *,
+        expected_sha256: str,
+        expected_size: int,
     ) -> Path:
         if self.stage == "report" and str(relative_path) == "scores.json":
             raise RuntimeError("injected report crash")
-        return original(self, relative_path, data)
+        return original(
+            self,
+            relative_path,
+            source_path,
+            expected_sha256=expected_sha256,
+            expected_size=expected_size,
+        )
 
-    monkeypatch.setattr(StageTransaction, "write_bytes", interrupt)
+    monkeypatch.setattr(StageTransaction, "write_file", interrupt)
     with pytest.raises(RuntimeError, match="injected report crash"):
         DefaultPilotServices().report(store.root)
     assert not (store.root / "report/stage_manifest.json").exists()
@@ -636,50 +665,82 @@ def test_report_resource_expiry_publishes_durable_invalid(
     assert resumed.status is StageStatus.INVALID
 
 
-def test_report_low_memory_stops_before_next_parquet_serializer(
+def test_report_worker_memory_limit_publishes_invalid_without_partial_outputs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _make_completed_run(tmp_path)
-    serializer_calls: list[str] = []
-    guards: list[service_module._ResourceGuard] = []
-    real_serializer = reporting_module._parquet_bytes
-    real_guard = service_module._ResourceGuard
 
-    def tracked_serializer(frame: pd.DataFrame, schema: Any) -> bytes:
-        serializer_calls.append(str(getattr(schema, "names", "unknown")))
-        payload = real_serializer(frame, schema)
-        if len(serializer_calls) == 1:
-            guards[0].memory_bytes = 1
-        return payload
+    class MemoryExecutor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
 
-    def tracked_guard(**kwargs: Any) -> service_module._ResourceGuard:
-        guard = real_guard(**kwargs)
-        guards.append(guard)
-        return guard
+        def run(self, *_args: object, **_kwargs: object) -> object:
+            raise baseline_module.FitMemoryExceeded("injected worker RSS cap")
 
-    monkeypatch.setattr(reporting_module, "_parquet_bytes", tracked_serializer)
-    monkeypatch.setattr(service_module, "_ResourceGuard", tracked_guard)
+    monkeypatch.setattr(
+        service_module, "_ReportProcessExecutor", MemoryExecutor, raising=False
+    )
 
     result = DefaultPilotServices().report(store.root)
 
     assert result.status is StageStatus.INVALID
-    assert len(serializer_calls) == 1
     assert not (store.root / "report/timestamp_scores.parquet").exists()
     marker = json.loads((store.root / "report/stage_manifest.json").read_text(encoding="utf-8"))
     assert marker["status"] == "INVALID"
-    assert marker["details"]["resource_gate"] == "resource_memory_rss"
+    assert marker["details"]["resource_gate"] == "report_worker_memory_rss"
     assert DefaultPilotServices().report(store.root).status is StageStatus.INVALID
 
 
-def test_report_rejects_dictionary_compression_expansion_before_pandas_decode(
+def test_stage_transaction_streams_verified_worker_output_without_loading_it(
+    tmp_path: Path,
+) -> None:
+    store = _make_completed_run(tmp_path)
+    worker_root = store.root / ".worker-test"
+    worker_root.mkdir()
+    source = worker_root / "scores.json"
+    payload = b'{"scientific_decision":"not_evaluated"}'
+    source.write_bytes(payload)
+
+    with store.stage(
+        "report",
+        terminal_status="INVALID",
+        prerequisite_verification="marker_only",
+    ) as transaction:
+        transaction.write_file(
+            "scores.json",
+            source,
+            expected_sha256=hashlib.sha256(payload).hexdigest(),
+            expected_size=len(payload),
+        )
+
+    assert (store.root / "report/scores.json").read_bytes() == payload
+
+
+def test_report_parent_never_decodes_untrusted_parquet_and_worker_limit_is_durable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _make_completed_run(tmp_path)
     relative = "benchmark/exact_predictions.parquet"
     path = store.root / relative
-    frame = pd.read_parquet(path)
-    frame["sample_id"] = "x" * 1_000_000
-    malicious = parquet_bytes(frame, benchmark_module.exact_prediction_arrow_schema())
+    frame = pd.read_parquet(path).head(100).copy()
+    frame["sample_id"] = [
+        "x" * 1_000_000 + f"-{index:04d}" for index in range(len(frame))
+    ]
+    table = pa.Table.from_pandas(
+        frame,
+        schema=benchmark_module.exact_prediction_arrow_schema(),
+        preserve_index=False,
+        safe=True,
+    ).replace_schema_metadata(None)
+    sink = io.BytesIO()
+    pq.write_table(
+        table,
+        sink,
+        compression="zstd",
+        use_dictionary=False,
+        column_encoding={"sample_id": "DELTA_BYTE_ARRAY"},
+    )
+    malicious = sink.getvalue()
     assert len(malicious) < 5 * 1024**2
     path.write_bytes(malicious)
     marker_path = store.root / "benchmark/stage_manifest.json"
@@ -690,41 +751,349 @@ def test_report_rejects_dictionary_compression_expansion_before_pandas_decode(
     marker_path.write_text(
         json.dumps(marker, sort_keys=True, separators=(",", ":")), encoding="utf-8"
     )
-    del frame, malicious
+    del frame, table, sink, malicious
 
-    real_guard = service_module._ResourceGuard
-    guards: list[service_module._ResourceGuard] = []
     decode_calls: list[object] = []
-    real_decode = pd.read_parquet
-
-    def intermediate_guard(**kwargs: Any) -> service_module._ResourceGuard:
-        kwargs["memory_bytes"] = 64 * 1024**2
-        guard = real_guard(**kwargs)
-        guards.append(guard)
-        return guard
+    executor_calls: list[str] = []
 
     def forbidden_decode(*args: object, **kwargs: object) -> pd.DataFrame:
         decode_calls.append((args, kwargs))
-        return real_decode(*args, **kwargs)
+        raise AssertionError("parent process entered pandas Parquet decode")
 
-    monkeypatch.setattr(service_module, "_ResourceGuard", intermediate_guard)
-    monkeypatch.setattr(
-        psutil,
-        "Process",
-        lambda: SimpleNamespace(memory_info=lambda: SimpleNamespace(rss=0)),
-    )
+    class CappedExecutor(baseline_module.DeadlineProcessFitExecutor):
+        def __init__(self, **kwargs: Any) -> None:
+            kwargs["max_memory_bytes"] = 64 * 1024**2
+            super().__init__(**kwargs)
+
+        def run(
+            self,
+            operation: str,
+            function: Callable[..., Any],
+            *args: Any,
+            declared_bytes: int = 0,
+            **kwargs: Any,
+        ) -> Any:
+            executor_calls.append(operation)
+            return super().run(
+                operation,
+                function,
+                *args,
+                declared_bytes=declared_bytes,
+                **kwargs,
+            )
+
     monkeypatch.setattr(pd, "read_parquet", forbidden_decode)
+    monkeypatch.setattr(
+        service_module, "_ReportProcessExecutor", CappedExecutor, raising=False
+    )
 
     result = DefaultPilotServices().report(store.root)
 
     assert result.status is StageStatus.INVALID
     assert decode_calls == []
-    assert guards[0].peak_declared_bytes > guards[0].memory_bytes
+    assert executor_calls == ["report-decode-evaluate-serialize"]
     marker = json.loads((store.root / "report/stage_manifest.json").read_text(encoding="utf-8"))
     assert marker["status"] == "INVALID"
-    assert marker["details"]["resource_gate"] == "resource_dataframe_or_output_bytes"
+    assert marker["details"]["resource_gate"] == "report_worker_memory_rss"
     assert not (store.root / "report/timestamp_scores.parquet").exists()
     assert DefaultPilotServices().report(store.root).status is StageStatus.INVALID
+
+
+def test_isolated_worker_accepts_realistic_dictionary_ids_and_contains_empty_serialization(
+    tmp_path: Path,
+) -> None:
+    unique_path = tmp_path / "unique.parquet"
+    empty_path = tmp_path / "empty.parquet"
+    identifiers = [f"sample-{index:06d}" for index in range(100_000)]
+    table = pa.table({"sample_id": identifiers})
+    pq.write_table(table, unique_path, compression="zstd")
+
+    def ignore_checkpoint(_declared: int = 0) -> None:
+        return None
+
+    executor = baseline_module.DeadlineProcessFitExecutor(
+        deadline_monotonic=time.monotonic() + 120,
+        resource_checkpoint=ignore_checkpoint,
+        private_directory=tmp_path / "control",
+        max_memory_bytes=8 * 1024**3,
+    )
+
+    result = executor.run(
+        "report-realistic-parquet",
+        _isolated_report_parquet_checks,
+        str(unique_path),
+        str(empty_path),
+    )
+
+    assert result["rows"] == 100_000
+    assert result["empty_size"] == empty_path.stat().st_size
+    assert result["empty_size"] > int(pd.DataFrame().memory_usage(deep=True).sum())
+
+
+def test_report_worker_hard_deadline_is_durable_and_cleans_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _make_completed_run(tmp_path)
+
+    class ShortDeadlineExecutor(baseline_module.DeadlineProcessFitExecutor):
+        def __init__(self, **kwargs: Any) -> None:
+            kwargs["deadline_monotonic"] = time.monotonic() + 0.01
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(service_module, "_ReportProcessExecutor", ShortDeadlineExecutor)
+
+    result = DefaultPilotServices().report(store.root)
+
+    assert result.status is StageStatus.INVALID
+    marker = json.loads((store.root / "report/stage_manifest.json").read_text())
+    assert marker["details"]["resource_gate"] == "report_worker_wall_clock"
+    assert list(store.root.glob(".report-worker-*")) == []
+    assert DefaultPilotServices().report(store.root).status is StageStatus.INVALID
+
+
+def test_report_worker_spawn_crash_is_durable_and_cleans_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _make_completed_run(tmp_path)
+
+    monkeypatch.setattr(service_module, "run_report_worker", _crash_report_worker)
+
+    result = DefaultPilotServices().report(store.root)
+
+    assert result.status is StageStatus.INVALID
+    marker = json.loads((store.root / "report/stage_manifest.json").read_text())
+    assert marker["details"]["resource_gate"] == "report_worker_failed"
+    assert list(store.root.glob(".report-worker-*")) == []
+    assert DefaultPilotServices().report(store.root).status is StageStatus.INVALID
+
+
+def test_report_resume_removes_abandoned_worker_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _make_completed_run(tmp_path)
+    stale = store.root / ".report-worker-abandoned"
+    stale.mkdir()
+    (stale / "partial.bin").write_bytes(b"partial")
+
+    class MemoryExecutor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def run(self, *_args: object, **_kwargs: object) -> object:
+            raise baseline_module.FitMemoryExceeded("stop after staging cleanup")
+
+    monkeypatch.setattr(service_module, "_ReportProcessExecutor", MemoryExecutor)
+
+    assert DefaultPilotServices().report(store.root).status is StageStatus.INVALID
+    assert not stale.exists()
+    assert list(store.root.glob(".report-worker-*")) == []
+
+
+def test_report_rejects_malformed_worker_inventory_and_cleans_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _make_completed_run(tmp_path)
+
+    class MalformedExecutor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def run(self, *_args: object, **_kwargs: object) -> object:
+            return {
+                "schema_version": "1.0",
+                "status": "success",
+                "stage_status": "blocked",
+                "scientific_decision": "not_evaluated",
+                "conclusion": "not_evaluated",
+                "outputs": {},
+            }
+
+    monkeypatch.setattr(service_module, "_ReportProcessExecutor", MalformedExecutor)
+
+    with pytest.raises(ValueError, match="output inventory"):
+        DefaultPilotServices().report(store.root)
+
+    assert not (store.root / "report/stage_manifest.json").exists()
+    assert list(store.root.glob(".report-worker-*")) == []
+
+
+def test_report_rejects_worker_output_tamper_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _make_completed_run(tmp_path)
+
+    class TamperingExecutor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def run(
+            self,
+            _operation: str,
+            function: Callable[..., object],
+            request: dict[str, Any],
+            **_kwargs: object,
+        ) -> object:
+            result = function(request)
+            with (Path(request["output_root"]) / "scores.json").open("ab") as stream:
+                stream.write(b"tamper")
+            return result
+
+    monkeypatch.setattr(service_module, "_ReportProcessExecutor", TamperingExecutor)
+
+    with pytest.raises(ValueError, match=r"size|checksum|unsafe"):
+        DefaultPilotServices().report(store.root)
+
+    assert not (store.root / "report/stage_manifest.json").exists()
+    assert list(store.root.glob(".report-worker-*")) == []
+
+
+def test_report_worker_binds_snapshot_bytes_to_captured_input_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _make_completed_run(tmp_path)
+
+    class SnapshotTamperingExecutor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def run(
+            self,
+            _operation: str,
+            function: Callable[..., object],
+            request: dict[str, Any],
+            **_kwargs: object,
+        ) -> object:
+            path = Path(request["input_root"]) / "exact_predictions.parquet"
+            frame = pd.read_parquet(path)
+            frame.loc[:, list(Q_COLUMNS)] = 4.75
+            path.write_bytes(
+                parquet_bytes(frame, benchmark_module.exact_prediction_arrow_schema())
+            )
+            return function(request)
+
+    monkeypatch.setattr(
+        service_module, "_ReportProcessExecutor", SnapshotTamperingExecutor
+    )
+
+    with pytest.raises(ValueError, match="snapshot checksum"):
+        DefaultPilotServices().report(store.root)
+
+    assert not (store.root / "report/stage_manifest.json").exists()
+    assert list(store.root.glob(".report-worker-*")) == []
+
+
+def test_report_rejects_declared_but_missing_worker_output_and_cleans_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _make_completed_run(tmp_path)
+
+    class MissingOutputExecutor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def run(
+            self,
+            _operation: str,
+            function: Callable[..., object],
+            request: dict[str, Any],
+            **_kwargs: object,
+        ) -> object:
+            result = function(request)
+            (Path(request["output_root"]) / "scores.json").unlink()
+            return result
+
+    monkeypatch.setattr(service_module, "_ReportProcessExecutor", MissingOutputExecutor)
+
+    with pytest.raises(ValueError, match=r"missing|unsafe|verify"):
+        DefaultPilotServices().report(store.root)
+
+    assert not (store.root / "report/stage_manifest.json").exists()
+    assert list(store.root.glob(".report-worker-*")) == []
+
+
+def test_report_rejects_worker_output_swap_after_validation_before_stream_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _make_completed_run(tmp_path)
+    original = StageTransaction.write_file
+    swapped = False
+
+    def swap_then_copy(
+        self: StageTransaction,
+        relative_path: str | Path,
+        source_path: str | Path,
+        *,
+        expected_sha256: str,
+        expected_size: int,
+    ) -> Path:
+        nonlocal swapped
+        if self.stage == "report" and str(relative_path) == "scores.json":
+            Path(source_path).write_bytes(b"post-validation swap")
+            swapped = True
+        return original(
+            self,
+            relative_path,
+            source_path,
+            expected_sha256=expected_sha256,
+            expected_size=expected_size,
+        )
+
+    monkeypatch.setattr(StageTransaction, "write_file", swap_then_copy)
+
+    with pytest.raises(ValueError, match=r"size|checksum|changed|regular"):
+        DefaultPilotServices().report(store.root)
+
+    assert swapped is True
+    assert not (store.root / "report/stage_manifest.json").exists()
+    assert not (store.root / "report").exists()
+    assert list(store.root.glob(".report-worker-*")) == []
+
+
+def test_report_worker_rejects_input_or_output_outside_private_staging(
+    tmp_path: Path,
+) -> None:
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    inputs = staging / "inputs"
+    inputs.mkdir()
+    outside = tmp_path / "outputs"
+    outside.mkdir()
+
+    result = report_worker_module.run_report_worker(
+        {
+            "staging_root": str(staging),
+            "input_root": str(inputs),
+            "output_root": str(outside),
+        }
+    )
+
+    assert result["status"] == "contract_error"
+    assert "directory is unsafe" in result["message"]
+
+
+def test_report_worker_rejects_symlinked_staging_root(tmp_path: Path) -> None:
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "inputs").mkdir()
+    (staging / "outputs").mkdir()
+    link = tmp_path / "staging-link"
+    try:
+        link.symlink_to(staging, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this Windows host")
+
+    result = report_worker_module.run_report_worker(
+        {
+            "staging_root": str(link),
+            "input_root": str(staging / "inputs"),
+            "output_root": str(staging / "outputs"),
+        }
+    )
+
+    assert result["status"] == "contract_error"
+    assert "staging root is unsafe" in result["message"]
 
 
 def test_report_evaluation_checkpoint_counts_source_frames_with_captured_inputs(
@@ -746,42 +1115,77 @@ def test_report_evaluation_checkpoint_counts_source_frames_with_captured_inputs(
     old_underestimate = captured_bytes + sentinel
     true_combined = old_underestimate + source_frame_bytes
     cap_between = old_underestimate + source_frame_bytes // 2
-    guards: list[service_module._ResourceGuard] = []
-    real_guard = service_module._ResourceGuard
     attempted: list[int] = []
-
-    def tracked_guard(**kwargs: Any) -> service_module._ResourceGuard:
-        guard = real_guard(**kwargs)
-        guards.append(guard)
-        return guard
 
     def fail_at_evaluation(
         *_args: object,
         resource_checkpoint: Callable[[int], None],
         **_kwargs: object,
     ) -> object:
-        guards[0].memory_bytes = cap_between
-        try:
-            resource_checkpoint(sentinel)
-        finally:
-            attempted.append(guards[0].peak_declared_bytes)
+        resource_checkpoint(sentinel)
         raise AssertionError("combined evaluation checkpoint did not enforce its cap")
 
-    monkeypatch.setattr(service_module, "_ResourceGuard", tracked_guard)
-    monkeypatch.setattr(
-        psutil,
-        "Process",
-        lambda: SimpleNamespace(memory_info=lambda: SimpleNamespace(rss=0)),
-    )
     monkeypatch.setattr(reporting_module, "evaluate_predictions", fail_at_evaluation)
+    checkpoints: list[int] = []
 
-    result = DefaultPilotServices().report(store.root)
+    def checkpoint(declared: int) -> None:
+        checkpoints.append(declared)
+        if declared > cap_between:
+            attempted.append(declared)
+            raise service_module._ResourceLimitExceeded("dataframe_or_output_bytes")
 
-    assert result.status is StageStatus.INVALID
+    config = DefaultPilotServices._run_config(store)
+    exact = pd.read_parquet(store.root / "benchmark/exact_predictions.parquet")
+    baseline = pd.read_parquet(store.root / "train-baselines/predictions.parquet")
+    finite = pd.read_parquet(store.root / "benchmark/finite_shot_predictions.parquet")
+    def read_json(relative: str) -> dict[str, Any]:
+        value: object = json.loads((store.root / relative).read_text(encoding="utf-8"))
+        assert isinstance(value, dict)
+        return value
+    input_hashes = {
+        relative: sha256_file(store.root / relative) for relative in inventory
+    }
+
+    with pytest.raises(service_module._ResourceLimitExceeded):
+        reporting_module.build_report_products(
+            config=config,
+            exact_predictions=exact,
+            baseline_predictions=baseline,
+            finite_shot_predictions=finite,
+            selection_manifest=read_json("benchmark/selection_manifest.json"),
+            circuit_manifest=read_json(
+                "build-photonic-features/circuit_manifest.json"
+            ),
+            state_spaces=read_json("build-photonic-features/state_spaces.json"),
+            benchmark_diagnostics=read_json("benchmark/diagnostics.json"),
+            benchmark_model_manifest=read_json("benchmark/models/manifest.json"),
+            resource_ledgers={
+                "validate-data": read_json("validate-data/cleaning_ledger.json"),
+                "build-splits": read_json("build-splits/resource_ledger.json"),
+                "train-baselines": read_json(
+                    "train-baselines/resource_ledger.json"
+                ),
+                "build-photonic-features": read_json(
+                    "build-photonic-features/resource_ledger.json"
+                ),
+                "benchmark": read_json("benchmark/resource_ledger.json"),
+            },
+            provenance={},
+            input_hashes=input_hashes,
+            versions={},
+            baseline_selection=read_json(
+                "train-baselines/selection_manifest.json"
+            ),
+            baseline_model_manifest=read_json(
+                "train-baselines/models/manifest.json"
+            ),
+            initial_live_bytes=captured_bytes,
+            resource_checkpoint=checkpoint,
+        )
+
     assert attempted == [true_combined]
     assert old_underestimate < cap_between < attempted[0]
-    marker = json.loads((store.root / "report/stage_manifest.json").read_text(encoding="utf-8"))
-    assert marker["details"]["resource_gate"] == "resource_dataframe_or_output_bytes"
+    assert checkpoints[-1] == true_combined
 
 
 def test_run_pilot_stops_on_first_non_success_and_resumes_in_exact_order(
