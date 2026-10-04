@@ -3218,7 +3218,7 @@ class DefaultPilotServices:
         StageStatus,
         str,
         str,
-        dict[str, tuple[int, str, int, tuple[int, int]]],
+        dict[str, tuple[bytes, str, int]],
         int,
     ]:
         if not isinstance(worker_result, dict) or worker_result.get("schema_version") != "1.0":
@@ -3284,9 +3284,7 @@ class DefaultPilotServices:
             "scores.csv",
             "report.md",
         }
-        captured_claims: dict[str, bytes] = {}
-        captured_claim_bytes = 0
-        verified: dict[str, tuple[int, str, int, tuple[int, int]]] = {}
+        records: dict[str, tuple[int, str, int, tuple[int, int], int]] = {}
         output_bytes = 0
         for name in sorted(expected_names):
             record = raw_outputs[name]
@@ -3317,39 +3315,74 @@ class DefaultPilotServices:
             ):
                 raise ReportContractError(f"report worker output is unsafe: {name}")
             output_bytes += declared_size
-            guard.checkpoint(live_bytes + output_bytes)
+            records[name] = (
+                descriptor,
+                declared_digest,
+                declared_size,
+                (before.st_dev, before.st_ino),
+                before.st_mtime_ns,
+            )
+        capture_overhead = 4096 * len(expected_names)
+        guard.checkpoint(live_bytes + 2 * output_bytes + capture_overhead)
+
+        captured_claims: dict[str, bytes] = {}
+        verified: dict[str, tuple[bytes, str, int]] = {}
+        captured_bytes = 0
+        for name in sorted(expected_names):
+            descriptor, declared_digest, declared_size, identity, initial_mtime_ns = (
+                records[name]
+            )
+            buffer = bytearray(declared_size)
+            offset = 0
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            while offset < declared_size:
+                chunk_size = min(1024 * 1024, declared_size - offset)
+                guard.checkpoint(
+                    live_bytes
+                    + captured_bytes
+                    + declared_size
+                    + chunk_size
+                    + capture_overhead
+                )
+                chunk = os.read(descriptor, chunk_size)
+                if not chunk:
+                    raise ReportContractError(
+                        f"report worker output ended during capture: {name}"
+                    )
+                buffer[offset : offset + len(chunk)] = chunk
+                offset += len(chunk)
+            if os.read(descriptor, 1):
+                raise ReportContractError(
+                    f"report worker output exceeded its declared size: {name}"
+                )
+            after_capture = os.fstat(descriptor)
+            if (
+                after_capture.st_size != declared_size
+                or after_capture.st_mtime_ns != initial_mtime_ns
+                or (after_capture.st_dev, after_capture.st_ino) != identity
+            ):
+                raise ReportContractError(f"report worker output changed: {name}")
+            guard.checkpoint(
+                live_bytes + captured_bytes + 2 * declared_size + capture_overhead
+            )
+            payload = bytes(buffer)
+            del buffer
+            captured_bytes += declared_size
+            guard.checkpoint(live_bytes + captured_bytes + capture_overhead)
             digest = hashlib.sha256()
-            claim_buffer = bytearray() if name in claim_names else None
             try:
-                os.lseek(descriptor, 0, os.SEEK_SET)
+                digest.update(payload)
                 if name in schemas:
-                    with os.fdopen(os.dup(descriptor), "rb") as stream:
-                        actual_schema = pq.ParquetFile(stream).schema_arrow.remove_metadata()
+                    actual_schema = (
+                        pq.ParquetFile(pa.BufferReader(payload))
+                        .schema_arrow.remove_metadata()
+                    )
                     if not actual_schema.equals(
                         schemas[name].remove_metadata(), check_metadata=False
                     ):
                         raise ReportContractError(
                             f"report worker Parquet schema is invalid: {name}"
                         )
-                    os.lseek(descriptor, 0, os.SEEK_SET)
-                while True:
-                    chunk = os.read(descriptor, 1024 * 1024)
-                    if not chunk:
-                        break
-                    digest.update(chunk)
-                    if claim_buffer is not None:
-                        claim_buffer.extend(chunk)
-                        if len(claim_buffer) > 8 * 1024 * 1024:
-                            raise ReportContractError(
-                                f"report decision evidence exceeds its size limit: {name}"
-                            )
-                after = os.fstat(descriptor)
-                if (
-                    after.st_size != before.st_size
-                    or after.st_mtime_ns != before.st_mtime_ns
-                    or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
-                ):
-                    raise ReportContractError(f"report worker output changed: {name}")
             except (OSError, pa.ArrowException) as error:
                 raise ReportContractError(
                     f"report worker output cannot be verified: {name}"
@@ -3357,21 +3390,13 @@ class DefaultPilotServices:
             actual_digest = digest.hexdigest()
             if actual_digest != declared_digest:
                 raise ReportContractError(f"report worker output checksum is invalid: {name}")
-            if claim_buffer is not None:
-                guard.checkpoint(
-                    live_bytes
-                    + output_bytes
-                    + captured_claim_bytes
-                    + 2 * len(claim_buffer)
-                )
-                captured_claims[name] = bytes(claim_buffer)
-                captured_claim_bytes += len(claim_buffer)
-            verified[name] = (
-                descriptor,
-                actual_digest,
-                declared_size,
-                (before.st_dev, before.st_ino),
-            )
+            if name in claim_names:
+                if declared_size > 8 * 1024 * 1024:
+                    raise ReportContractError(
+                        f"report decision evidence exceeds its size limit: {name}"
+                    )
+                captured_claims[name] = payload
+            verified[name] = (payload, actual_digest, declared_size)
         stage_status, decision, conclusion = (
             DefaultPilotServices._validated_report_decision_evidence(
                 captured_claims=captured_claims,
@@ -3714,55 +3739,59 @@ class DefaultPilotServices:
                 "benchmark_schema": selection_manifest.get("schema_version"),
                 "prediction_fit_phase": "train_plus_validation_refit",
             }
-            input_transfers = {
-                name: duplicate_descriptor_for_worker(descriptor, writable=False)
-                for name, descriptor in input_descriptors.items()
-            }
-            output_transfers = {
-                name: duplicate_descriptor_for_worker(descriptor, writable=True)
-                for name, descriptor in output_descriptors.items()
-            }
-            worker_transfers.extend(input_transfers.values())
-            worker_transfers.extend(output_transfers.values())
-            worker_request = {
-                "input_handles": input_transfers,
-                "output_handles": output_transfers,
-                "snapshot_sha256": {
-                    "exact_predictions.parquet": input_hashes[
-                        "benchmark/exact_predictions.parquet"
-                    ],
-                    "baseline_predictions.parquet": input_hashes[
-                        "train-baselines/predictions.parquet"
-                    ],
-                    "finite_shot_predictions.parquet": input_hashes[
-                        "benchmark/finite_shot_predictions.parquet"
-                    ],
-                },
-                "config": config.model_dump(mode="json"),
-                "selection_manifest": selection_manifest,
-                "circuit_manifest": circuit_manifest,
-                "state_spaces": state_spaces,
-                "benchmark_diagnostics": benchmark_diagnostics,
-                "benchmark_model_manifest": benchmark_model_manifest,
-                "resource_ledgers": resource_ledgers,
-                "provenance": provenance,
-                "input_hashes": input_hashes,
-                "versions": versions,
-                "baseline_selection": baseline_selection,
-                "baseline_model_manifest": baseline_model_manifest,
-            }
-            executor = _ReportProcessExecutor(
-                deadline_monotonic=time.monotonic()
-                + max(
-                    0.0,
-                    guard.wall_seconds - (time.perf_counter() - guard.started),
-                ),
-                resource_checkpoint=guard.checkpoint,
-                private_directory=control_root,
-                max_memory_bytes=guard.memory_bytes,
-                telemetry_callback=guard.record_fit_rss,
-            )
+            input_transfers: dict[str, object] = {}
+            output_transfers: dict[str, object] = {}
             try:
+                for name, descriptor in input_descriptors.items():
+                    transfer = duplicate_descriptor_for_worker(
+                        descriptor, writable=False
+                    )
+                    worker_transfers.append(transfer)
+                    input_transfers[name] = transfer
+                for name, descriptor in output_descriptors.items():
+                    transfer = duplicate_descriptor_for_worker(
+                        descriptor, writable=True
+                    )
+                    worker_transfers.append(transfer)
+                    output_transfers[name] = transfer
+                worker_request = {
+                    "input_handles": input_transfers,
+                    "output_handles": output_transfers,
+                    "snapshot_sha256": {
+                        "exact_predictions.parquet": input_hashes[
+                            "benchmark/exact_predictions.parquet"
+                        ],
+                        "baseline_predictions.parquet": input_hashes[
+                            "train-baselines/predictions.parquet"
+                        ],
+                        "finite_shot_predictions.parquet": input_hashes[
+                            "benchmark/finite_shot_predictions.parquet"
+                        ],
+                    },
+                    "config": config.model_dump(mode="json"),
+                    "selection_manifest": selection_manifest,
+                    "circuit_manifest": circuit_manifest,
+                    "state_spaces": state_spaces,
+                    "benchmark_diagnostics": benchmark_diagnostics,
+                    "benchmark_model_manifest": benchmark_model_manifest,
+                    "resource_ledgers": resource_ledgers,
+                    "provenance": provenance,
+                    "input_hashes": input_hashes,
+                    "versions": versions,
+                    "baseline_selection": baseline_selection,
+                    "baseline_model_manifest": baseline_model_manifest,
+                }
+                executor = _ReportProcessExecutor(
+                    deadline_monotonic=time.monotonic()
+                    + max(
+                        0.0,
+                        guard.wall_seconds - (time.perf_counter() - guard.started),
+                    ),
+                    resource_checkpoint=guard.checkpoint,
+                    private_directory=control_root,
+                    max_memory_bytes=guard.memory_bytes,
+                    telemetry_callback=guard.record_fit_rss,
+                )
                 worker_result = executor.run(
                     "report-decode-evaluate-serialize",
                     run_report_worker,
@@ -3795,6 +3824,8 @@ class DefaultPilotServices:
                     else None
                 ),
             )
+            self._close_report_worker_files(worker_descriptors)
+            worker_descriptors.clear()
             publication_live_bytes = total_file_bytes + worker_output_bytes
             guard.checkpoint(publication_live_bytes)
         except _ResourceLimitExceeded as error:
@@ -3914,14 +3945,8 @@ class DefaultPilotServices:
                 preverified_input_hashes=input_hashes,
             ) as transaction:
                 for name in sorted(worker_outputs):
-                    descriptor, digest, size, identity = worker_outputs[name]
-                    transaction.write_handle(
-                        name,
-                        descriptor,
-                        expected_sha256=digest,
-                        expected_size=size,
-                        expected_identity=identity,
-                    )
+                    payload, _digest, _size = worker_outputs[name]
+                    transaction.write_bytes(name, payload)
                 transaction.write_json("resource_ledger.json", ledger)
                 transaction.write_json("stage_result.json", deterministic_data(result))
         except _ResourceLimitExceeded as error:

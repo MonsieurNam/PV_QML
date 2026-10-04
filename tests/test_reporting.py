@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import io
 import json
@@ -15,6 +16,7 @@ from typing import Any, cast
 
 import numpy as np
 import pandas as pd
+import psutil
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -68,6 +70,40 @@ def _create_directory_link(link: Path, target: Path) -> None:
 
 def _remove_directory_link(link: Path) -> None:
     os.rmdir(link)
+
+
+def _process_handle_count() -> int:
+    process = psutil.Process()
+    return int(process.num_handles() if sys.platform == "win32" else process.num_fds())
+
+
+def _assert_process_handles_restored(baseline: int) -> None:
+    deadline = time.monotonic() + 5.0
+    current = _process_handle_count()
+    while current != baseline and time.monotonic() < deadline:
+        gc.collect()
+        time.sleep(0.01)
+        current = _process_handle_count()
+    assert current == baseline
+
+
+def _process_handle_baseline() -> int:
+    deadline = time.monotonic() + 5.0
+    stable_count = 0
+    previous: int | None = None
+    while time.monotonic() < deadline:
+        gc.collect()
+        current = _process_handle_count()
+        if current == previous:
+            stable_count += 1
+            if stable_count >= 10:
+                return current
+        else:
+            previous = current
+            stable_count = 0
+        time.sleep(0.01)
+    assert previous is not None
+    return previous
 
 
 class _E2EConstantEstimator:
@@ -537,10 +573,23 @@ def _make_completed_run(tmp_path: Path) -> RunStore:
     return store
 
 
+@pytest.fixture(scope="module")
+def _warmed_report_worker(tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Pay the one-time multiprocessing handle cost before leak assertions."""
+
+    store = _make_completed_run(tmp_path_factory.mktemp("report-worker-warmup"))
+    assert DefaultPilotServices().report(store.root).status is StageStatus.BLOCKED
+    gc.collect()
+
+
 def test_report_is_read_only_blocked_for_synthetic_and_resumable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _warmed_report_worker: None,
 ) -> None:
+    del _warmed_report_worker
     store = _make_completed_run(tmp_path)
+    baseline_handles = _process_handle_baseline()
 
     def forbidden(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("report attempted training, feature extraction, or benchmarking")
@@ -556,6 +605,7 @@ def test_report_is_read_only_blocked_for_synthetic_and_resumable(
     monkeypatch.setattr(DefaultPilotServices, "benchmark", forbidden)
 
     result = DefaultPilotServices().report(store.root)
+    _assert_process_handles_restored(baseline_handles)
 
     assert result.status is StageStatus.BLOCKED
     assert dict((item.key, item.value) for item in result.details)["scientific_decision"] == (
@@ -659,29 +709,22 @@ def test_interrupted_report_publication_never_creates_terminal_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _make_completed_run(tmp_path)
-    original = StageTransaction.write_handle
+    original = StageTransaction.write_bytes
 
     def interrupt(
         self: StageTransaction,
         relative_path: str | Path,
-        source_descriptor: int,
-        *,
-        expected_sha256: str,
-        expected_size: int,
-        expected_identity: tuple[int, int],
+        data: bytes,
     ) -> Path:
         if self.stage == "report" and str(relative_path) == "scores.json":
             raise RuntimeError("injected report crash")
         return original(
             self,
             relative_path,
-            source_descriptor,
-            expected_sha256=expected_sha256,
-            expected_size=expected_size,
-            expected_identity=expected_identity,
+            data,
         )
 
-    monkeypatch.setattr(StageTransaction, "write_handle", interrupt)
+    monkeypatch.setattr(StageTransaction, "write_bytes", interrupt)
     with pytest.raises(RuntimeError, match="injected report crash"):
         DefaultPilotServices().report(store.root)
     assert not (store.root / "report/stage_manifest.json").exists()
@@ -876,8 +919,11 @@ def test_isolated_worker_accepts_realistic_dictionary_ids_and_contains_empty_ser
 def test_report_worker_hard_deadline_is_durable_and_cleans_staging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    _warmed_report_worker: None,
 ) -> None:
+    del _warmed_report_worker
     store = _make_completed_run(tmp_path)
+    baseline_handles = _process_handle_baseline()
 
     class ShortDeadlineExecutor(baseline_module.DeadlineProcessFitExecutor):
         def __init__(self, **kwargs: Any) -> None:
@@ -887,6 +933,7 @@ def test_report_worker_hard_deadline_is_durable_and_cleans_staging(
     monkeypatch.setattr(service_module, "_ReportProcessExecutor", ShortDeadlineExecutor)
 
     result = DefaultPilotServices().report(store.root)
+    _assert_process_handles_restored(baseline_handles)
 
     assert result.status is StageStatus.INVALID
     marker = json.loads((store.root / "report/stage_manifest.json").read_text())
@@ -898,12 +945,18 @@ def test_report_worker_hard_deadline_is_durable_and_cleans_staging(
 def test_report_worker_spawn_crash_is_durable_and_cleans_staging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    _warmed_report_worker: None,
 ) -> None:
-    store = _make_completed_run(tmp_path)
-
+    del _warmed_report_worker
     monkeypatch.setattr(service_module, "run_report_worker", _crash_report_worker)
+    warm_store = _make_completed_run(tmp_path.parent / "crash-warmup")
+    assert DefaultPilotServices().report(warm_store.root).status is StageStatus.INVALID
+
+    store = _make_completed_run(tmp_path)
+    baseline_handles = _process_handle_baseline()
 
     result = DefaultPilotServices().report(store.root)
+    _assert_process_handles_restored(baseline_handles)
 
     assert result.status is StageStatus.INVALID
     marker = json.loads((store.root / "report/stage_manifest.json").read_text())
@@ -1284,45 +1337,33 @@ def test_report_rejects_declared_but_missing_worker_output_and_cleans_staging(
     assert list(store.root.glob(".report-worker-*")) == []
 
 
-def test_report_rejects_worker_output_swap_after_validation_before_stream_copy(
+def test_report_worker_output_mutation_after_capture_does_not_change_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _make_completed_run(tmp_path)
-    original = StageTransaction.write_handle
+    original = StageTransaction.write_bytes
     swapped = False
 
     def swap_then_copy(
         self: StageTransaction,
         relative_path: str | Path,
-        source_descriptor: int,
-        *,
-        expected_sha256: str,
-        expected_size: int,
-        expected_identity: tuple[int, int],
+        data: bytes,
     ) -> Path:
         nonlocal swapped
         if self.stage == "report" and str(relative_path) == "scores.json":
-            os.ftruncate(source_descriptor, 0)
-            os.lseek(source_descriptor, 0, os.SEEK_SET)
-            os.write(source_descriptor, b"post-validation swap")
+            path = next(store.root.glob(".report-worker-*")) / "outputs/scores.json"
+            path.write_bytes(b"post-capture mutation")
             swapped = True
-        return original(
-            self,
-            relative_path,
-            source_descriptor,
-            expected_sha256=expected_sha256,
-            expected_size=expected_size,
-            expected_identity=expected_identity,
-        )
+        return original(self, relative_path, data)
 
-    monkeypatch.setattr(StageTransaction, "write_handle", swap_then_copy)
+    monkeypatch.setattr(StageTransaction, "write_bytes", swap_then_copy)
 
-    with pytest.raises(ValueError, match=r"size|checksum|changed|regular"):
-        DefaultPilotServices().report(store.root)
+    result = DefaultPilotServices().report(store.root)
 
+    assert result.status is StageStatus.BLOCKED
     assert swapped is True
-    assert not (store.root / "report/stage_manifest.json").exists()
-    assert not (store.root / "report").exists()
+    scores = json.loads((store.root / "report/scores.json").read_text())
+    assert scores["stage_status"] == "blocked"
     assert list(store.root.glob(".report-worker-*")) == []
 
 
@@ -1330,30 +1371,25 @@ def test_report_path_schema_swap_cannot_change_validated_open_output_handle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _make_completed_run(tmp_path)
-    original = StageTransaction.write_handle
+    original = StageTransaction.write_bytes
     swapped = False
 
     def replace_name_then_stream_handle(
         self: StageTransaction,
         relative_path: str | Path,
-        source_descriptor: int,
-        *,
-        expected_sha256: str,
-        expected_size: int,
-        expected_identity: tuple[int, int],
+        data: bytes,
     ) -> Path:
         nonlocal swapped
         if self.stage == "report" and str(relative_path) == "timestamp_scores.parquet":
             root = next(store.root.glob(".report-worker-*"))
             named_path = root / "outputs/timestamp_scores.parquet"
-            with os.fdopen(os.dup(source_descriptor), "rb") as stream:
-                table = pq.read_table(stream)
+            table = pq.read_table(pa.BufferReader(data))
             names = ["sample_ix" if name == "sample_id" else name for name in table.column_names]
             outside = tmp_path / "schema-swap-outside"
             outside.mkdir()
             replacement = outside / "timestamp_scores.parquet"
             pq.write_table(table.rename_columns(names), replacement, compression="zstd")
-            assert replacement.stat().st_size == expected_size
+            assert replacement.stat().st_size == len(data)
             alias = tmp_path / "output-name"
             _create_directory_link(alias, named_path.parent)
             before = (alias / named_path.name).stat()
@@ -1365,17 +1401,10 @@ def test_report_path_schema_swap_cannot_change_validated_open_output_handle(
             _create_directory_link(alias, named_path.parent)
             _remove_directory_link(alias)
             swapped = True
-        return original(
-            self,
-            relative_path,
-            source_descriptor,
-            expected_sha256=expected_sha256,
-            expected_size=expected_size,
-            expected_identity=expected_identity,
-        )
+        return original(self, relative_path, data)
 
     monkeypatch.setattr(
-        StageTransaction, "write_handle", replace_name_then_stream_handle
+        StageTransaction, "write_bytes", replace_name_then_stream_handle
     )
 
     result = DefaultPilotServices().report(store.root)
@@ -1389,6 +1418,177 @@ def test_report_path_schema_swap_cannot_change_validated_open_output_handle(
         ].remove_metadata(),
         check_metadata=False,
     )
+
+
+def test_report_captures_output_once_before_schema_hash_and_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _make_completed_run(tmp_path)
+    real_parquet_file = pq.ParquetFile
+    parquet_parse_count = 0
+    mutated = False
+
+    def mutate_timestamp_during_its_schema_parse(
+        source: object, *args: object, **kwargs: object
+    ) -> pq.ParquetFile:
+        nonlocal parquet_parse_count, mutated
+        parquet_parse_count += 1
+        if parquet_parse_count == 3:
+            root = next(store.root.glob(".report-worker-*"))
+            path = root / "outputs/timestamp_scores.parquet"
+            original_stat = path.stat()
+            original = path.read_bytes()
+            table = real_parquet_file(pa.BufferReader(original)).read()
+            names = [
+                "sample_ix" if name == "sample_id" else name
+                for name in table.column_names
+            ]
+            buffer = io.BytesIO()
+            pq.write_table(table.rename_columns(names), buffer, compression="zstd")
+            alternate = buffer.getvalue()
+            assert len(alternate) == len(original)
+            path.write_bytes(alternate)
+            os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            mutated = True
+        return real_parquet_file(source, *args, **kwargs)
+
+    monkeypatch.setattr(pq, "ParquetFile", mutate_timestamp_during_its_schema_parse)
+
+    result = DefaultPilotServices().report(store.root)
+
+    assert result.status is StageStatus.BLOCKED
+    assert mutated is True
+    published = store.root / "report/timestamp_scores.parquet"
+    assert pq.ParquetFile(published).schema_arrow.remove_metadata().equals(
+        reporting_module.report_parquet_schemas()[
+            "timestamp_scores.parquet"
+        ].remove_metadata(),
+        check_metadata=False,
+    )
+    marker = json.loads((store.root / "report/stage_manifest.json").read_text())
+    declared = next(
+        item["sha256"]
+        for item in marker["outputs"]
+        if item["path"] == "report/timestamp_scores.parquet"
+    )
+    assert declared == sha256_file(published)
+
+
+def test_report_closes_incremental_transfers_when_second_duplicate_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _make_completed_run(tmp_path)
+    baseline = _process_handle_baseline()
+    real_duplicate = report_worker_module.duplicate_descriptor_for_worker
+    calls = 0
+
+    def fail_second(descriptor: int, *, writable: bool) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected transfer construction failure")
+        return real_duplicate(descriptor, writable=writable)
+
+    monkeypatch.setattr(
+        service_module, "duplicate_descriptor_for_worker", fail_second
+    )
+
+    result = DefaultPilotServices().report(store.root)
+
+    assert result.status is StageStatus.INVALID
+    _assert_process_handles_restored(baseline)
+    assert list(store.root.glob(".report-worker-*")) == []
+
+
+def test_report_closes_all_transfers_when_worker_handle_conversion_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _make_completed_run(tmp_path)
+    baseline = _process_handle_baseline()
+
+    class DirectExecutor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def run(
+            self,
+            _operation: str,
+            function: Callable[..., object],
+            request: dict[str, Any],
+            **_kwargs: object,
+        ) -> object:
+            return function(request)
+
+    def fail_conversion(_transfer: object, *, writable: bool) -> int:
+        del writable
+        raise OSError("injected handle conversion failure")
+
+    monkeypatch.setattr(service_module, "_ReportProcessExecutor", DirectExecutor)
+    monkeypatch.setattr(
+        report_worker_module, "_detach_descriptor", fail_conversion
+    )
+
+    with pytest.raises(ValueError, match="handle conversion failure"):
+        DefaultPilotServices().report(store.root)
+
+    _assert_process_handles_restored(baseline)
+    assert list(store.root.glob(".report-worker-*")) == []
+
+
+def test_report_output_snapshot_precheck_is_durable_before_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _make_completed_run(tmp_path)
+    allocation_calls: list[int] = []
+    cap_bytes = 160 * 1024
+    base_config = DefaultPilotServices._run_config(store)
+    tight_config = base_config.model_copy(
+        update={
+            "resources": base_config.resources.model_copy(
+                update={"max_memory_gb": cap_bytes / 1024**3}
+            )
+        }
+    )
+
+    class DirectExecutor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def run(
+            self,
+            _operation: str,
+            function: Callable[..., object],
+            request: dict[str, Any],
+            **_kwargs: object,
+        ) -> object:
+            return function(request)
+
+    class ZeroRssProcess:
+        def memory_info(self) -> object:
+            return type("MemoryInfo", (), {"rss": 0})()
+
+    def forbidden_allocation(size: int = 0) -> bytearray:
+        allocation_calls.append(size)
+        return bytearray(size)
+
+    monkeypatch.setattr(service_module, "_ReportProcessExecutor", DirectExecutor)
+    monkeypatch.setattr(psutil, "Process", ZeroRssProcess)
+    monkeypatch.setattr(
+        DefaultPilotServices,
+        "_run_config",
+        classmethod(lambda _cls, _store: tight_config),
+    )
+    monkeypatch.setattr(
+        service_module, "bytearray", forbidden_allocation, raising=False
+    )
+
+    result = DefaultPilotServices().report(store.root)
+
+    assert result.status is StageStatus.INVALID
+    assert allocation_calls == []
+    marker = json.loads((store.root / "report/stage_manifest.json").read_text())
+    assert marker["details"]["resource_gate"] == "resource_dataframe_or_output_bytes"
+    assert not (store.root / "report/timestamp_scores.parquet").exists()
 
 
 def test_report_worker_rejects_path_only_input_output_contract(
