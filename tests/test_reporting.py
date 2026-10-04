@@ -39,7 +39,14 @@ from pv_pilot.baselines import (
 )
 from pv_pilot.benchmark import finite_shot_prediction_arrow_schema, parquet_bytes
 from pv_pilot.config import load_config
-from pv_pilot.domain import ScientificDecision, StageResult, StageStatus, deterministic_data
+from pv_pilot.domain import (
+    CompletionKind,
+    DetailEntry,
+    ScientificDecision,
+    StageResult,
+    StageStatus,
+    deterministic_data,
+)
 from pv_pilot.services import DefaultPilotServices
 
 Q_COLUMNS = ("q05", "q10", "q25", "q50", "q75", "q90", "q95")
@@ -799,6 +806,7 @@ def test_report_resource_expiry_publishes_durable_invalid(
     result = DefaultPilotServices().report(store.root)
 
     assert result.status is StageStatus.INVALID
+    assert result.completion_kind is None
     marker = json.loads((store.root / "report/stage_manifest.json").read_text(encoding="utf-8"))
     assert marker["status"] == "INVALID"
     assert marker["details"]["resource_gate"] == "resource_wall_clock"
@@ -1912,6 +1920,58 @@ def test_run_pilot_config_initializes_once_runs_all_stages_and_returns_run_path(
     assert str(run_dir) in (result.message or "")
 
 
+def test_run_pilot_does_not_mark_real_report_block_as_synthetic_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    (project / "configs").mkdir()
+    (project / "data").mkdir()
+    payload = yaml.safe_load(Path("configs/pilot.synthetic.yaml").read_text(encoding="utf-8"))
+    payload["protocol"]["provenance"] = "real"
+    payload["paths"] = {"input_data": "../data/input.csv", "artifact_dir": "../artifacts"}
+    config_path = project / "configs/pilot.yaml"
+    config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    (project / "data/input.csv").write_text("site_id,timestamp\n", encoding="utf-8")
+    store = RunStore.create(load_config(config_path, project_root=project))
+    service = DefaultPilotServices()
+
+    def stage(name: str, status: StageStatus = StageStatus.SUCCESS) -> Any:
+        def invoke(_run_dir: Path) -> StageResult:
+            details = (
+                (
+                    DetailEntry(key="scientific_decision", value="not_evaluated"),
+                    DetailEntry(key="conclusion", value="not_evaluated"),
+                )
+                if name == "report"
+                else ()
+            )
+            return StageResult(stage=name, status=status, details=details)
+
+        return invoke
+
+    monkeypatch.setattr(service, "validate_data", stage("validate-data"))
+    monkeypatch.setattr(service, "build_splits", stage("build-splits"))
+    monkeypatch.setattr(service, "train_baselines", stage("train-baselines"))
+    monkeypatch.setattr(service, "build_photonic_features", stage("build-photonic-features"))
+    monkeypatch.setattr(service, "benchmark", stage("benchmark"))
+    real_report = stage("report", StageStatus.BLOCKED)
+
+    def forged_report(path: Path) -> StageResult:
+        return real_report(path).model_copy(
+            update={
+                "completion_kind": CompletionKind.SYNTHETIC_SOFTWARE_ACCEPTANCE
+            }
+        )
+
+    monkeypatch.setattr(service, "report", forged_report)
+
+    result = service.run_pilot(config=None, run_dir=store.root)
+
+    assert result.status is StageStatus.BLOCKED
+    assert result.completion_kind is None
+
+
 def test_stage_by_stage_report_and_run_pilot_resume_are_byte_equivalent(
     tmp_path: Path,
 ) -> None:
@@ -1932,6 +1992,7 @@ def test_stage_by_stage_report_and_run_pilot_resume_are_byte_equivalent(
         if path.is_file() and not path.name.startswith(".run.lock")
     }
     assert resumed.status is StageStatus.BLOCKED
+    assert resumed.completion_kind is CompletionKind.SYNTHETIC_SOFTWARE_ACCEPTANCE
     assert before == after
 
 

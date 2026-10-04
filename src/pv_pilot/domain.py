@@ -46,6 +46,12 @@ class StageStatus(StrEnum):
     FAILED = "failed"
 
 
+class CompletionKind(StrEnum):
+    """Explicit evidence for nonstandard successful CLI completion."""
+
+    SYNTHETIC_SOFTWARE_ACCEPTANCE = "synthetic_software_acceptance"
+
+
 class DataProvenance(StrEnum):
     """Whether observations are measured or generated."""
 
@@ -167,6 +173,7 @@ class StageResult(VersionedRecord):
     stage: str = Field(min_length=1)
     status: StageStatus
     message: str | None = None
+    completion_kind: CompletionKind | None = None
     artifacts: tuple[PortablePath, ...] = ()
     details: tuple[DetailEntry, ...] = ()
 
@@ -492,6 +499,7 @@ __all__ = [
     "BootstrapInterval",
     "CanonicalRow",
     "CircuitSeedScore",
+    "CompletionKind",
     "DataProvenance",
     "DaylightSource",
     "DetailEntry",

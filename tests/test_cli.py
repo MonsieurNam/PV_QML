@@ -7,7 +7,7 @@ from typer.testing import CliRunner
 
 import pv_pilot.cli as cli
 from pv_pilot.cli import app
-from pv_pilot.domain import DetailEntry, StageResult, StageStatus
+from pv_pilot.domain import CompletionKind, DetailEntry, StageResult, StageStatus
 
 runner = CliRunner()
 
@@ -171,6 +171,7 @@ def test_run_pilot_treats_expected_synthetic_report_block_as_success(
                 stage="report",
                 status=StageStatus.BLOCKED,
                 message="software validation complete",
+                completion_kind=CompletionKind.SYNTHETIC_SOFTWARE_ACCEPTANCE,
                 details=(
                     DetailEntry(key="scientific_decision", value="not_evaluated"),
                     DetailEntry(key="conclusion", value="not_evaluated"),
@@ -183,6 +184,31 @@ def test_run_pilot_treats_expected_synthetic_report_block_as_success(
 
     assert result.exit_code == 0
     assert "BLOCKED: software validation complete" in result.output
+
+
+def test_run_pilot_rejects_unmarked_not_evaluated_report_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnmarkedBlockedServices(RecordingServices):
+        def run_pilot(
+            self, *, config: Path | None, run_dir: Path | None
+        ) -> StageResult:
+            self.calls.append(("run-pilot", (config, run_dir)))
+            return StageResult(
+                stage="report",
+                status=StageStatus.BLOCKED,
+                message="not eligible",
+                details=(
+                    DetailEntry(key="scientific_decision", value="not_evaluated"),
+                    DetailEntry(key="conclusion", value="not_evaluated"),
+                ),
+            )
+
+    monkeypatch.setattr(cli, "services", UnmarkedBlockedServices())
+
+    result = runner.invoke(app, ["run-pilot", "--config", "pilot.yaml"])
+
+    assert result.exit_code == 2
 
 
 def test_run_pilot_keeps_upstream_blocked_stage_nonzero(

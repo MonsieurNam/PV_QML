@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from pv_pilot.domain import (
     CanonicalRow,
+    CompletionKind,
     DataProvenance,
     DaylightSource,
     DetailEntry,
@@ -52,6 +53,21 @@ def test_domain_records_are_versioned_frozen_and_serializable() -> None:
     assert row.model_dump_json()
     with pytest.raises(ValidationError):
         result.status = StageStatus.FAILED
+
+
+def test_stage_result_completion_kind_is_typed_and_backwards_compatible() -> None:
+    legacy = StageResult.model_validate_json(
+        '{"schema_version":"1.0","stage":"report","status":"blocked"}'
+    )
+    marked = legacy.model_copy(
+        update={"completion_kind": CompletionKind.SYNTHETIC_SOFTWARE_ACCEPTANCE}
+    )
+
+    assert legacy.completion_kind is None
+    assert marked.model_dump(mode="json")["completion_kind"] == (
+        "synthetic_software_acceptance"
+    )
+    assert StageResult.model_validate_json(marked.model_dump_json()) == marked
 
 
 def test_domain_records_reject_unknown_fields() -> None:

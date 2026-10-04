@@ -8,7 +8,7 @@ from typing import Annotated, Protocol
 
 import typer
 
-from .domain import StageResult, StageStatus
+from .domain import CompletionKind, StageResult, StageStatus
 from .services import DefaultPilotServices
 
 app = typer.Typer(no_args_is_help=True, help="Photonic photovoltaic pilot runner.")
@@ -55,6 +55,7 @@ def _run_service(
         allow_completed_scientific_block
         and result.stage == "report"
         and result.status is StageStatus.BLOCKED
+        and result.completion_kind is CompletionKind.SYNTHETIC_SOFTWARE_ACCEPTANCE
         and details.get("scientific_decision") == "not_evaluated"
         and details.get("conclusion") == "not_evaluated"
     )

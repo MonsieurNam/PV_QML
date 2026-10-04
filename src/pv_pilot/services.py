@@ -44,7 +44,14 @@ from .data import (
     empty_exclusion_frame,
 )
 from .data import dataframe_parquet_bytes as dataframe_parquet_bytes
-from .domain import DetailEntry, StageResult, StageStatus, deterministic_data
+from .domain import (
+    CompletionKind,
+    DataProvenance,
+    DetailEntry,
+    StageResult,
+    StageStatus,
+    deterministic_data,
+)
 from .evaluation import EvaluationContractError
 from .report_worker import (
     close_descriptor_transfer,
@@ -3984,6 +3991,7 @@ class DefaultPilotServices:
             self.report,
         )
         final: StageResult | None = None
+        successful_stages: list[str] = []
 
         def with_run_path(result: StageResult) -> StageResult:
             message = result.message or result.stage
@@ -3999,9 +4007,34 @@ class DefaultPilotServices:
             )
 
         for stage in stages:
-            final = stage(active_run)
+            final = stage(active_run).model_copy(update={"completion_kind": None})
             if final.status is not StageStatus.SUCCESS:
+                details = {item.key: item.value for item in final.details}
+                expected_synthetic_terminal = (
+                    final.stage == "report"
+                    and final.status is StageStatus.BLOCKED
+                    and tuple(successful_stages)
+                    == (
+                        "validate-data",
+                        "build-splits",
+                        "train-baselines",
+                        "build-photonic-features",
+                        "benchmark",
+                    )
+                    and details.get("scientific_decision") == "not_evaluated"
+                    and details.get("conclusion") == "not_evaluated"
+                )
+                if expected_synthetic_terminal:
+                    store = RunStore.open(active_run)
+                    run_config = self._run_config(store)
+                    if run_config.protocol.provenance is DataProvenance.SYNTHETIC:
+                        final = final.model_copy(
+                            update={
+                                "completion_kind": CompletionKind.SYNTHETIC_SOFTWARE_ACCEPTANCE
+                            }
+                        )
                 return with_run_path(final)
+            successful_stages.append(final.stage)
         if final is None:
             raise RuntimeError("pipeline has no stages")
         return with_run_path(final)
