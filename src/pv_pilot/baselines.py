@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from importlib.metadata import version
 from multiprocessing.process import BaseProcess
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import numpy as np
 import pandas as pd
@@ -537,6 +537,23 @@ def _fit_quantile_estimator(
     return estimator
 
 
+def _fit_quantile_head_bundle(
+    features: FloatArray,
+    target: FloatArray,
+    quantiles: tuple[float, ...],
+    alpha: float,
+) -> QuantileHeads:
+    """Fit every locked linear quantile head inside one isolation boundary."""
+
+    return QuantileHeads(
+        quantiles=quantiles,
+        estimators=tuple(
+            _fit_quantile_estimator(features, target, quantile, alpha)
+            for quantile in quantiles
+        ),
+    )
+
+
 def _fit_linear_heads(
     features: FloatArray,
     target: FloatArray,
@@ -544,19 +561,15 @@ def _fit_linear_heads(
     alpha: float,
     executor: FitExecutor,
 ) -> QuantileHeads:
-    estimators: list[Predictor] = []
-    for quantile in quantiles:
-        estimator = executor.run(
-            f"quantile-regressor:q={quantile}:alpha={alpha}",
-            _fit_quantile_estimator,
-            features,
-            target,
-            quantile,
-            alpha,
-            declared_bytes=features.nbytes + target.nbytes,
-        )
-        estimators.append(estimator)
-    return QuantileHeads(quantiles=quantiles, estimators=tuple(estimators))
+    return cast(QuantileHeads, executor.run(
+        f"quantile-regressor-batch:alpha={alpha}",
+        _fit_quantile_head_bundle,
+        features,
+        target,
+        quantiles,
+        alpha,
+        declared_bytes=features.nbytes + target.nbytes,
+    ))
 
 
 def _fit_xgboost_estimator(
@@ -577,6 +590,34 @@ def _fit_xgboost_estimator(
     return estimator
 
 
+def _fit_xgboost_head_bundle(
+    features: FloatArray,
+    target: FloatArray,
+    quantiles: tuple[float, ...],
+    max_depth: int,
+    learning_rate: float,
+    seeds: tuple[int, ...],
+) -> QuantileHeads:
+    """Fit all XGBoost quantile heads in one monitored worker process."""
+
+    if len(seeds) != len(quantiles):
+        raise BaselineContractError("XGBoost head seeds do not match quantiles")
+    return QuantileHeads(
+        quantiles=quantiles,
+        estimators=tuple(
+            _fit_xgboost_estimator(
+                features,
+                target,
+                quantile,
+                max_depth,
+                learning_rate,
+                seed,
+            )
+            for quantile, seed in zip(quantiles, seeds, strict=True)
+        ),
+    )
+
+
 def _fit_xgboost_heads(
     features: FloatArray,
     target: FloatArray,
@@ -587,55 +628,135 @@ def _fit_xgboost_heads(
     seed_manager: SeedManager,
     executor: FitExecutor,
 ) -> QuantileHeads:
-    estimators: list[Predictor] = []
-    for quantile in quantiles:
-        seed = seed_manager.seed(
+    seeds = tuple(
+        seed_manager.seed(
             SeedComponent.XGBOOST,
             max_depth,
             format(learning_rate, ".17g"),
             format(quantile, ".17g"),
         )
-        estimator = executor.run(
-            f"xgboost:q={quantile}:depth={max_depth}:lr={learning_rate}",
-            _fit_xgboost_estimator,
-            features,
-            target,
-            quantile,
-            max_depth,
-            learning_rate,
-            seed,
-            declared_bytes=features.nbytes + target.nbytes,
-        )
-        estimators.append(estimator)
-    return QuantileHeads(quantiles=quantiles, estimators=tuple(estimators))
+        for quantile in quantiles
+    )
+    return cast(QuantileHeads, executor.run(
+        f"xgboost-batch:depth={max_depth}:lr={learning_rate}",
+        _fit_xgboost_head_bundle,
+        features,
+        target,
+        quantiles,
+        max_depth,
+        learning_rate,
+        seeds,
+        declared_bytes=features.nbytes + target.nbytes,
+    ))
 
 
 def _predict_estimator(estimator: Predictor, features: FloatArray) -> NDArray[Any]:
     return np.asarray(estimator.predict(features), dtype=np.float64)
 
 
+def _predict_quantile_head_bundle(
+    heads: QuantileHeads, features: FloatArray
+) -> FloatArray:
+    return heads.predict(features)
+
+
 def _predict_heads(
     heads: QuantileHeads, features: FloatArray, executor: FitExecutor
 ) -> FloatArray:
-    columns = [
-        np.asarray(
-            executor.run(
-                f"predict:q={quantile}",
-                _predict_estimator,
-                estimator,
-                features,
-                declared_bytes=features.nbytes,
-            ),
-            dtype=np.float64,
-        )
-        for quantile, estimator in zip(
-            heads.quantiles, heads.estimators, strict=True
-        )
-    ]
-    result = np.column_stack(columns)
+    result = np.asarray(
+        executor.run(
+            "quantile-predict-batch",
+            _predict_quantile_head_bundle,
+            heads,
+            features,
+            declared_bytes=features.nbytes,
+        ),
+        dtype=np.float64,
+    )
     if result.shape != (len(features), len(heads.quantiles)) or not np.isfinite(result).all():
         raise BaselineContractError("quantile estimator returned invalid predictions")
     return np.asarray(result, dtype=np.float64)
+
+
+def _fit_and_predict_linear_heads_worker(
+    train_features: FloatArray,
+    target: FloatArray,
+    prediction_features: FloatArray,
+    quantiles: tuple[float, ...],
+    alpha: float,
+) -> tuple[QuantileHeads, FloatArray]:
+    direct = DirectFitExecutor(lambda _declared: None)
+    heads = _fit_linear_heads(
+        train_features,
+        target,
+        quantiles,
+        alpha,
+        direct,
+    )
+    return heads, _predict_heads(heads, prediction_features, direct)
+
+
+def _fit_and_predict_linear_heads(
+    train_features: FloatArray,
+    target: FloatArray,
+    prediction_features: FloatArray,
+    quantiles: tuple[float, ...],
+    alpha: float,
+    executor: FitExecutor,
+    *,
+    operation: str,
+) -> tuple[QuantileHeads, FloatArray]:
+    """Fit and score one candidate in one monitored isolation boundary."""
+
+    result = executor.run(
+        operation,
+        _fit_and_predict_linear_heads_worker,
+        train_features,
+        target,
+        prediction_features,
+        quantiles,
+        alpha,
+        declared_bytes=(
+            train_features.nbytes + target.nbytes + prediction_features.nbytes
+        ),
+    )
+    heads, predictions = result
+    return heads, np.asarray(predictions, dtype=np.float64)
+
+
+def _transform_and_fit_linear_heads_worker(
+    scaler: StandardScaler,
+    features: FloatArray,
+    target: FloatArray,
+    quantiles: tuple[float, ...],
+    alpha: float,
+) -> QuantileHeads:
+    transformed = np.asarray(scaler.transform(features), dtype=np.float64)
+    return _fit_quantile_head_bundle(transformed, target, quantiles, alpha)
+
+
+def _transform_and_fit_linear_heads(
+    scaler: StandardScaler,
+    features: FloatArray,
+    target: FloatArray,
+    quantiles: tuple[float, ...],
+    alpha: float,
+    executor: FitExecutor,
+    *,
+    operation: str,
+) -> QuantileHeads:
+    """Apply a frozen scaler and refit all heads in one monitored worker."""
+
+    return cast(QuantileHeads, executor.run(
+        operation,
+        _transform_and_fit_linear_heads_worker,
+        scaler,
+        features,
+        target,
+        quantiles,
+        alpha,
+        declared_bytes=features.nbytes + target.nbytes,
+    ))
 
 
 def _apply_transform(transformer: Any, features: FloatArray) -> FloatArray:
@@ -921,12 +1042,18 @@ def train_baseline_models(
         )
         selected_state[("raw", modes)] = (raw_scaler, train_raw, validation_raw)
         for alpha in config.models.quantile_alpha_grid:
-            heads = _fit_linear_heads(
-                train_raw, target_train, quantiles, alpha, executor
+            _heads, raw_prediction = _fit_and_predict_linear_heads(
+                train_raw,
+                target_train,
+                validation_raw,
+                quantiles,
+                alpha,
+                executor,
+                operation=f"raw:m={modes}:alpha={alpha}:candidate-batch",
             )
             score, diagnostics = _mean_validation_wis(
                 target_validation,
-                _predict_heads(heads, validation_raw, executor),
+                raw_prediction,
                 capacity_validation,
                 quantiles,
             )
@@ -965,12 +1092,20 @@ def train_baseline_models(
             )
             selected_state[("rff", modes, gamma)] = transform
             for alpha in config.models.quantile_alpha_grid:
-                heads = _fit_linear_heads(
-                    transform.train, target_train, quantiles, alpha, executor
+                _heads, raw_prediction = _fit_and_predict_linear_heads(
+                    transform.train,
+                    target_train,
+                    transform.other,
+                    quantiles,
+                    alpha,
+                    executor,
+                    operation=(
+                        f"rff:m={modes}:gamma={gamma}:alpha={alpha}:candidate-batch"
+                    ),
                 )
                 score, diagnostics = _mean_validation_wis(
                     target_validation,
-                    _predict_heads(heads, transform.other, executor),
+                    raw_prediction,
                     capacity_validation,
                     quantiles,
                 )

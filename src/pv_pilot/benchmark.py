@@ -23,7 +23,6 @@ from .baselines import (
     DirectFitExecutor,
     FitExecutor,
     QuantileHeads,
-    _apply_transform,
     _fit_linear_heads,
     _fit_standard_transform,
     _predict_heads,
@@ -53,6 +52,15 @@ class PhotonicBenchmarkContractError(ValueError):
     """An input violates the frozen G3 photonic benchmark contract."""
 
 
+def _scale_and_predict_heads_worker(
+    scaler: StandardScaler,
+    heads: QuantileHeads,
+    values: FloatArray,
+) -> FloatArray:
+    scaled = np.asarray(scaler.transform(values), dtype=np.float64)
+    return heads.predict(scaled)
+
+
 @dataclass(frozen=True, slots=True)
 class PhotonicSeedModel:
     """One independently trained circuit-seed readout."""
@@ -69,17 +77,17 @@ class PhotonicSeedModel:
 
     def raw_predict(self, probabilities: NDArray[Any], executor: FitExecutor) -> FloatArray:
         values = _finite_matrix(probabilities, "photonic probabilities")
-        scaled = np.asarray(
+        return np.asarray(
             executor.run(
-                f"photonic:{self.control}:seed={self.circuit_seed}:scale",
-                _apply_transform,
+                f"photonic:{self.control}:seed={self.circuit_seed}:predict-batch",
+                _scale_and_predict_heads_worker,
                 self.scaler,
+                self.heads,
                 values,
                 declared_bytes=values.nbytes,
             ),
             dtype=np.float64,
         )
-        return _predict_heads(self.heads, scaled, executor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -454,6 +462,47 @@ def _score_seed_origins(
     return records
 
 
+def _fit_scaled_candidate_worker(
+    train_values: FloatArray,
+    target: FloatArray,
+    validation_values: FloatArray,
+    quantiles: tuple[float, ...],
+    alpha: float,
+) -> tuple[StandardScaler, QuantileHeads, FloatArray]:
+    """Scale, fit, and score one candidate in a single spawned worker."""
+
+    scaler, train_scaled, validation_scaled = _fit_standard_transform(
+        train_values, validation_values
+    )
+    direct = DirectFitExecutor(lambda _declared: None)
+    heads = _fit_linear_heads(
+        train_scaled,
+        target,
+        quantiles,
+        alpha,
+        direct,
+    )
+    raw = _predict_heads(heads, validation_scaled, direct)
+    return scaler, heads, raw
+
+
+def _transform_and_fit_candidate_worker(
+    scaler: StandardScaler,
+    values: FloatArray,
+    target: FloatArray,
+    quantiles: tuple[float, ...],
+    alpha: float,
+) -> QuantileHeads:
+    scaled = np.asarray(scaler.transform(values), dtype=np.float64)
+    return _fit_linear_heads(
+        scaled,
+        target,
+        quantiles,
+        alpha,
+        DirectFitExecutor(lambda _declared: None),
+    )
+
+
 def _fit_and_score_candidate(
     work: pd.DataFrame,
     *,
@@ -476,21 +525,21 @@ def _fit_and_score_candidate(
     validation = subset.loc[subset["split"] == "validation"]
     train_values = _probability_matrix(train)
     validation_values = _probability_matrix(validation)
-    scaler, train_scaled, validation_scaled = executor.run(
-        f"photonic:{control}:m={modes}:c={phase_scale}:seed={circuit_seed}:scale",
-        _fit_standard_transform,
+    scaler, _heads, raw = executor.run(
+        "photonic-candidate-batch:"
+        f"{control}:m={modes}:c={phase_scale}:seed={circuit_seed}:alpha={alpha}",
+        _fit_scaled_candidate_worker,
         train_values,
-        validation_values,
-        declared_bytes=train_values.nbytes + validation_values.nbytes,
-    )
-    heads = _fit_linear_heads(
-        train_scaled,
         train["target_ac_power_kw"].to_numpy(dtype=np.float64),
+        validation_values,
         quantiles,
         alpha,
-        executor,
+        declared_bytes=(
+            train_values.nbytes
+            + validation_values.nbytes
+            + train["target_ac_power_kw"].to_numpy(dtype=np.float64).nbytes
+        ),
     )
-    raw = _predict_heads(heads, validation_scaled, executor)
     key = _candidate_key(modes, phase_scale, alpha)
     scores = _score_seed_origins(
         validation,
@@ -651,22 +700,18 @@ def select_photonic_models(
             scaler = scaler_cache[
                 (control, int(selected["modes"]), float(selected["phase_scale"]), seed)
             ]
-            scaled = np.asarray(
-                executor.run(
-                    f"photonic:{control}:seed={seed}:refit-scale",
-                    _apply_transform,
-                    scaler,
-                    values,
-                    declared_bytes=values.nbytes,
-                ),
-                dtype=np.float64,
-            )
-            heads = _fit_linear_heads(
-                scaled,
+            heads = executor.run(
+                f"photonic:{control}:seed={seed}:refit-batch",
+                _transform_and_fit_candidate_worker,
+                scaler,
+                values,
                 subset["target_ac_power_kw"].to_numpy(dtype=np.float64),
                 quantiles,
                 alpha,
-                executor,
+                declared_bytes=(
+                    values.nbytes
+                    + subset["target_ac_power_kw"].to_numpy(dtype=np.float64).nbytes
+                ),
             )
             models[(control, seed)] = PhotonicSeedModel(
                 control=control,

@@ -9,10 +9,11 @@ Install the pinned environment and run the quality gates with
 [uv](https://docs.astral.sh/uv/):
 
 ```powershell
-uv sync
+uv sync --frozen
 uv run ruff check .
-uv run mypy
-uv run pytest
+uv run mypy src
+uv run pytest --cov=src/pv_pilot --cov-fail-under=85
+uv run pytest tests/test_compat.py -q
 ```
 
 The implemented G0-G3 surface initializes immutable run directories and validates CSV or
@@ -59,6 +60,27 @@ The same immutable sequence can be started or resumed with one command:
 uv run pv-pilot run-pilot --config configs/pilot.synthetic.yaml
 uv run pv-pilot run-pilot --run-dir <printed-run-directory>
 ```
+
+The checked-in acceptance configuration uses a compact, deterministic 45-day fixture with
+15 train, 10 validation, and 20 holdout samples after leakage-safe feature construction. It
+still executes the complete frozen model grids, five circuit seeds, seven quantile heads,
+Perceval SLOS distributions, and 2,000-replicate bootstrap protocol. Quantile heads belonging
+to one candidate are executed as a single resource-monitored worker batch so Windows process
+startup does not dominate the scientific computation.
+
+Run and verify the complete software acceptance path with:
+
+```powershell
+uv run pv-pilot run-pilot --config configs/pilot.synthetic.yaml
+uv run python scripts/verify_acceptance_run.py --config configs/pilot.synthetic.yaml
+```
+
+For this synthetic protocol the terminal report is deliberately `BLOCKED/not_evaluated`.
+`run-pilot` returns exit code 0 only for that completed synthetic safeguard. An upstream
+`BLOCKED`, any `INVALID` or `FAILED` stage, malformed evidence, or a resource-cap violation
+remains a nonzero failure. The verifier is read-only: it checks immutable stage inventories,
+CPU-only resource ledgers, the finite-shot limitation, and the absence of a scientific decision
+without training or recomputing features.
 
 The report reads only finalized artifacts; it does not retrain models, rebuild photonic
 features, rerun the benchmark, or reopen the configured raw input and physical split holdout.

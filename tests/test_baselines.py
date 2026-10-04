@@ -18,6 +18,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import yaml
+from sklearn.preprocessing import StandardScaler
 
 from pv_pilot.artifacts import RunStore, sha256_file
 from pv_pilot.baselines import (
@@ -60,6 +61,29 @@ class ConstantEstimator:
 
 def _raise_fit_error() -> None:
     raise ValueError("expected child failure")
+
+
+class RecordingDirectExecutor(DirectFitExecutor):
+    def __init__(self) -> None:
+        super().__init__(lambda _declared: None)
+        self.operations: list[str] = []
+
+    def run(
+        self,
+        operation: str,
+        function: Callable[..., Any],
+        *args: Any,
+        declared_bytes: int = 0,
+        **kwargs: Any,
+    ) -> Any:
+        self.operations.append(operation)
+        return super().run(
+            operation,
+            function,
+            *args,
+            declared_bytes=declared_bytes,
+            **kwargs,
+        )
 
 
 @pytest.fixture
@@ -498,6 +522,152 @@ def test_real_xgboost_quantile_objective_smoke() -> None:
     assert params["reg_lambda"] == 1.0
 
 
+def test_linear_quantile_heads_fit_and_predict_in_two_isolated_batches() -> None:
+    import pv_pilot.baselines as module
+
+    features = np.arange(24, dtype=np.float64).reshape(12, 2) / 10.0
+    target = np.linspace(0.0, 4.0, len(features), dtype=np.float64)
+    executor = RecordingDirectExecutor()
+
+    heads = module._fit_linear_heads(
+        features,
+        target,
+        QUANTILES,
+        0.01,
+        executor,
+    )
+    actual = module._predict_heads(heads, features, executor)
+    reference_estimators = tuple(
+        module._fit_quantile_estimator(features, target, quantile, 0.01)
+        for quantile in QUANTILES
+    )
+    expected = np.column_stack(
+        [estimator.predict(features) for estimator in reference_estimators]
+    )
+
+    assert executor.operations == [
+        "quantile-regressor-batch:alpha=0.01",
+        "quantile-predict-batch",
+    ]
+    assert np.allclose(actual, expected, atol=0.0, rtol=0.0)
+
+
+def test_xgboost_quantile_heads_fit_in_one_isolated_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pv_pilot.baselines as module
+
+    seen: list[tuple[float, int]] = []
+
+    def fake_fit(
+        features: np.ndarray,
+        target: np.ndarray,
+        quantile: float,
+        max_depth: int,
+        learning_rate: float,
+        seed: int,
+    ) -> ConstantEstimator:
+        del features, target, max_depth, learning_rate
+        seen.append((quantile, seed))
+        return ConstantEstimator(quantile)
+
+    monkeypatch.setattr(module, "_fit_xgboost_estimator", fake_fit)
+    executor = RecordingDirectExecutor()
+    heads = module._fit_xgboost_heads(
+        np.ones((8, 3), dtype=np.float64),
+        np.arange(8, dtype=np.float64),
+        QUANTILES,
+        max_depth=3,
+        learning_rate=0.03,
+        seed_manager=SeedManager(20260928),
+        executor=executor,
+    )
+
+    assert executor.operations == ["xgboost-batch:depth=3:lr=0.03"]
+    assert [quantile for quantile, _seed in seen] == list(QUANTILES)
+    assert len({seed for _quantile, seed in seen}) == len(QUANTILES)
+    assert np.array_equal(heads.predict(np.ones((2, 3))), np.tile(QUANTILES, (2, 1)))
+
+
+def test_linear_candidate_fit_and_validation_prediction_share_one_batch() -> None:
+    import pv_pilot.baselines as module
+
+    train = np.arange(24, dtype=np.float64).reshape(12, 2) / 10.0
+    validation = np.arange(8, dtype=np.float64).reshape(4, 2) / 10.0
+    target = np.linspace(0.0, 4.0, len(train), dtype=np.float64)
+    executor = RecordingDirectExecutor()
+
+    heads, actual = module._fit_and_predict_linear_heads(
+        train,
+        target,
+        validation,
+        QUANTILES,
+        0.01,
+        executor,
+        operation="candidate-a",
+    )
+    expected = heads.predict(validation)
+
+    assert executor.operations == ["candidate-a"]
+    assert np.array_equal(actual, expected)
+
+
+def test_transform_and_linear_refit_share_one_isolated_batch() -> None:
+    import pv_pilot.baselines as module
+
+    values = np.arange(30, dtype=np.float64).reshape(15, 2)
+    scaler = StandardScaler().fit(values[:8])
+    target = np.linspace(0.0, 2.0, len(values), dtype=np.float64)
+    executor = RecordingDirectExecutor()
+
+    heads = module._transform_and_fit_linear_heads(
+        scaler,
+        values,
+        target,
+        QUANTILES,
+        0.01,
+        executor,
+        operation="refit-a",
+    )
+
+    assert executor.operations == ["refit-a"]
+    assert heads.quantiles == QUANTILES
+
+
+def test_spawned_linear_candidate_batch_matches_direct_math(tmp_path: Path) -> None:
+    import pv_pilot.baselines as module
+
+    train = np.arange(36, dtype=np.float64).reshape(18, 2) / 10.0
+    validation = np.arange(10, dtype=np.float64).reshape(5, 2) / 10.0
+    target = np.linspace(0.0, 5.0, len(train), dtype=np.float64)
+    direct = module._fit_and_predict_linear_heads_worker(
+        train,
+        target,
+        validation,
+        QUANTILES,
+        0.01,
+    )[1]
+    executor = DeadlineProcessFitExecutor(
+        deadline_monotonic=time.monotonic() + 30.0,
+        resource_checkpoint=lambda _declared: None,
+        private_directory=tmp_path,
+        max_memory_bytes=2 * 1024**3,
+    )
+
+    _heads, spawned = module._fit_and_predict_linear_heads(
+        train,
+        target,
+        validation,
+        QUANTILES,
+        0.01,
+        executor,
+        operation="equivalence-batch",
+    )
+
+    assert np.array_equal(spawned, direct)
+    assert executor.peak_child_tree_rss_bytes > 0
+
+
 def test_training_selects_one_shared_configuration_and_never_uses_test_for_selection(
     fast_baseline_fits: None,
 ) -> None:
@@ -568,7 +738,9 @@ def test_resource_checkpoint_runs_through_candidate_and_refit_boundaries(
         resource_checkpoint=checkpoints.append,
     )
 
-    assert len(checkpoints) >= 250
+    # Batched seven-head fits intentionally reduce process boundaries while each
+    # candidate/refit still checkpoints before, during, and after its worker.
+    assert len(checkpoints) >= 100
     assert all(value >= 0 for value in checkpoints)
 
 

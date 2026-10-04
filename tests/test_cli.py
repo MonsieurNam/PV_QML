@@ -7,6 +7,7 @@ from typer.testing import CliRunner
 
 import pv_pilot.cli as cli
 from pv_pilot.cli import app
+from pv_pilot.domain import DetailEntry, StageResult, StageStatus
 
 runner = CliRunner()
 
@@ -112,8 +113,11 @@ class RecordingServices:
     def report(self, run_dir: Path) -> None:
         self.calls.append(("report", run_dir))
 
-    def run_pilot(self, *, config: Path | None, run_dir: Path | None) -> None:
+    def run_pilot(
+        self, *, config: Path | None, run_dir: Path | None
+    ) -> StageResult | None:
         self.calls.append(("run-pilot", (config, run_dir)))
+        return None
 
 
 def test_commands_dispatch_to_exact_services(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -153,6 +157,54 @@ def test_run_pilot_dispatches_both_branches(
     result = runner.invoke(app, ["run-pilot", *arguments])
     assert result.exit_code == 0
     assert recorder.calls == [("run-pilot", expected)]
+
+
+def test_run_pilot_treats_expected_synthetic_report_block_as_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SyntheticCompletedServices(RecordingServices):
+        def run_pilot(
+            self, *, config: Path | None, run_dir: Path | None
+        ) -> StageResult:
+            self.calls.append(("run-pilot", (config, run_dir)))
+            return StageResult(
+                stage="report",
+                status=StageStatus.BLOCKED,
+                message="software validation complete",
+                details=(
+                    DetailEntry(key="scientific_decision", value="not_evaluated"),
+                    DetailEntry(key="conclusion", value="not_evaluated"),
+                ),
+            )
+
+    monkeypatch.setattr(cli, "services", SyntheticCompletedServices())
+
+    result = runner.invoke(app, ["run-pilot", "--config", "pilot.yaml"])
+
+    assert result.exit_code == 0
+    assert "BLOCKED: software validation complete" in result.output
+
+
+def test_run_pilot_keeps_upstream_blocked_stage_nonzero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UpstreamBlockedServices(RecordingServices):
+        def run_pilot(
+            self, *, config: Path | None, run_dir: Path | None
+        ) -> StageResult:
+            self.calls.append(("run-pilot", (config, run_dir)))
+            return StageResult(
+                stage="validate-data",
+                status=StageStatus.BLOCKED,
+                message="source unavailable",
+                details=(DetailEntry(key="scientific_decision", value="not_evaluated"),),
+            )
+
+    monkeypatch.setattr(cli, "services", UpstreamBlockedServices())
+
+    result = runner.invoke(app, ["run-pilot", "--config", "pilot.yaml"])
+
+    assert result.exit_code == 2
 
 
 def test_init_run_creates_run_and_prints_path(tmp_path: Path) -> None:

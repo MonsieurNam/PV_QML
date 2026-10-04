@@ -29,6 +29,7 @@ from pv_pilot.data import (
 )
 from pv_pilot.domain import StageStatus
 from pv_pilot.services import DefaultPilotServices
+from pv_pilot.splits import build_feature_splits
 
 
 def data_config(
@@ -875,6 +876,15 @@ def test_repository_synthetic_fixture_exists_and_spans_frozen_splits() -> None:
 
     assert result.status is StageStatus.SUCCESS
     timestamps = result.canonical["interval_end_utc"]
-    assert timestamps.min() < loaded.config.split.train_end_utc
-    assert timestamps.max() >= loaded.config.split.test_end_utc
-    assert timestamps.dt.floor("D").nunique() >= 40
+    assert loaded.resolved_input_path.name == "synthetic_pv_compact.csv"
+    assert len(result.canonical) == 45 * 16
+    assert timestamps.min() == pd.Timestamp("2025-01-01T08:00:00Z")
+    assert timestamps.max() == pd.Timestamp("2025-02-14T09:15:00Z")
+    assert timestamps.dt.floor("D").nunique() == 45
+
+    split_result = build_feature_splits(result.canonical, loaded.config)
+
+    assert split_result.status is StageStatus.SUCCESS
+    counts = split_result.features.groupby("split").size().to_dict()
+    assert counts == {"train": 15, "validation": 10, "test": 20}
+    assert split_result.features["issued_at_utc"].dt.floor("D").nunique() == 45

@@ -4,7 +4,7 @@ protocol:
   approved_by: null
   approved_at: null
 paths:
-  input_data: ../tests/fixtures/synthetic_pv.csv
+  input_data: ../tests/fixtures/synthetic_pv_compact.csv
   artifact_dir: ../artifacts/pilot-synthetic
 data:
   format: csv

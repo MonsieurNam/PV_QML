@@ -39,7 +39,9 @@ class PilotServices(Protocol):
 services: PilotServices = DefaultPilotServices()
 
 
-def _run_service(action: Callable[[], StageResult | None]) -> None:
+def _run_service(
+    action: Callable[[], StageResult | None], *, allow_completed_scientific_block: bool = False
+) -> None:
     try:
         result = action()
     except (FileNotFoundError, NotImplementedError, ValueError) as error:
@@ -48,6 +50,16 @@ def _run_service(action: Callable[[], StageResult | None]) -> None:
     if result is None:
         return
     typer.echo(f"{result.status.value.upper()}: {result.message or result.stage}")
+    details = {item.key: item.value for item in result.details}
+    completed_scientific_block = (
+        allow_completed_scientific_block
+        and result.stage == "report"
+        and result.status is StageStatus.BLOCKED
+        and details.get("scientific_decision") == "not_evaluated"
+        and details.get("conclusion") == "not_evaluated"
+    )
+    if completed_scientific_block:
+        return
     if result.status in {StageStatus.BLOCKED, StageStatus.INVALID, StageStatus.FAILED}:
         raise typer.Exit(code=2)
 
@@ -114,7 +126,10 @@ def run_pilot(
 
     if (config is None) == (run_dir is None):
         raise typer.BadParameter("provide exactly one of --config or --run-dir")
-    _run_service(lambda: services.run_pilot(config=config, run_dir=run_dir))
+    _run_service(
+        lambda: services.run_pilot(config=config, run_dir=run_dir),
+        allow_completed_scientific_block=True,
+    )
 
 
 if __name__ == "__main__":

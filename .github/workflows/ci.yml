@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  acceptance:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install Python 3.12
+        run: uv python install 3.12
+      - name: Sync locked environment
+        run: uv sync --frozen
+      - name: Lint
+        run: uv run ruff check .
+      - name: Type check production package
+        run: uv run mypy src
+      - name: Verify real Perceval SLOS compatibility
+        run: uv run pytest tests/test_compat.py -q
+      - name: Test with coverage
+        run: uv run pytest --cov=src/pv_pilot --cov-fail-under=85
+      - name: Run unpatched CPU synthetic pilot
+        run: uv run pv-pilot run-pilot --config configs/pilot.synthetic.yaml
+      - name: Verify immutable acceptance artifacts
+        run: uv run python scripts/verify_acceptance_run.py --config configs/pilot.synthetic.yaml
+      - name: Upload compact acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: photonic-pv-pilot-acceptance-evidence
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            artifacts/pilot-synthetic/*/report/**
+            artifacts/pilot-synthetic/*/*/resource_ledger.json
+            artifacts/pilot-synthetic/*/validate-data/cleaning_ledger.json
+            artifacts/pilot-synthetic/*/*/stage_result.json
+            artifacts/pilot-synthetic/*/*/stage_manifest.json

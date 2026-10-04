@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import yaml
+from sklearn.preprocessing import StandardScaler
 
 from pv_pilot.artifacts import RunStore
 from pv_pilot.baselines import DirectFitExecutor, QuantileHeads
@@ -295,6 +296,102 @@ def _fast_heads(
             _ConstantEstimator(center + index / 10) for index in range(len(quantiles))
         ),
     )
+
+
+def test_photonic_candidate_scaling_fit_and_prediction_share_one_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pv_pilot.benchmark as benchmark_module
+
+    operations: list[str] = []
+
+    class RecordingExecutor(DirectFitExecutor):
+        def run(
+            self,
+            operation: str,
+            function: Any,
+            *args: Any,
+            declared_bytes: int = 0,
+            **kwargs: Any,
+        ) -> Any:
+            operations.append(operation)
+            return super().run(
+                operation,
+                function,
+                *args,
+                declared_bytes=declared_bytes,
+                **kwargs,
+            )
+
+    monkeypatch.setattr(benchmark_module, "_fit_linear_heads", _fast_heads)
+    config = _config()
+    seed = config.seeds.circuit_seeds[0]
+    rows, scaler, checksum = benchmark_module._fit_and_score_candidate(
+        _development_frame(),
+        modes=4,
+        phase_scale=math.pi / 2,
+        alpha=0.01,
+        control="indistinguishable",
+        circuit_seed=seed,
+        quantiles=tuple(config.evaluation.quantiles),
+        executor=RecordingExecutor(lambda _declared: None),
+        selection_role="primary_grid",
+    )
+
+    assert operations == [
+        "photonic-candidate-batch:"
+        f"indistinguishable:m=4:c={math.pi / 2}:seed={seed}:alpha=0.01"
+    ]
+    assert len(rows) == 2
+    assert scaler.n_features_in_ == math.comb(4 + 1, 2)
+    assert len(checksum) == 64
+
+
+def test_photonic_model_scaling_and_head_prediction_share_one_batch() -> None:
+    import pv_pilot.benchmark as benchmark_module
+
+    operations: list[str] = []
+
+    class RecordingExecutor(DirectFitExecutor):
+        def run(
+            self,
+            operation: str,
+            function: Any,
+            *args: Any,
+            declared_bytes: int = 0,
+            **kwargs: Any,
+        ) -> Any:
+            operations.append(operation)
+            return super().run(
+                operation,
+                function,
+                *args,
+                declared_bytes=declared_bytes,
+                **kwargs,
+            )
+
+    train = np.arange(30, dtype=np.float64).reshape(3, 10)
+    scaler = StandardScaler().fit(train)
+    heads = QuantileHeads(
+        quantiles=tuple(_config().evaluation.quantiles),
+        estimators=tuple(_ConstantEstimator(float(index)) for index in range(7)),
+    )
+    model = benchmark_module.PhotonicSeedModel(
+        control="indistinguishable",
+        circuit_seed=17,
+        modes=4,
+        photons=2,
+        phase_scale=math.pi / 2,
+        alpha=0.01,
+        scaler=scaler,
+        heads=heads,
+        circuit_sha256="a" * 64,
+    )
+
+    actual = model.raw_predict(train, RecordingExecutor(lambda _declared: None))
+
+    assert operations == ["photonic:indistinguishable:seed=17:predict-batch"]
+    assert np.array_equal(actual, heads.predict(scaler.transform(train)))
 
 
 def _feature_frame() -> pd.DataFrame:
