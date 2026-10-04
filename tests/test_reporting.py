@@ -42,6 +42,34 @@ from pv_pilot.services import DefaultPilotServices
 Q_COLUMNS = ("q05", "q10", "q25", "q50", "q75", "q90", "q95")
 
 
+def _create_directory_link(link: Path, target: Path) -> None:
+    if sys.platform == "win32":
+        escaped_link = str(link).replace("'", "''")
+        escaped_target = str(target).replace("'", "''")
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                (
+                    f"New-Item -ItemType Junction -Path '{escaped_link}' "
+                    f"-Target '{escaped_target}' -ErrorAction Stop | Out-Null"
+                ),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert link.is_junction()
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def _remove_directory_link(link: Path) -> None:
+    os.rmdir(link)
+
+
 class _E2EConstantEstimator:
     def __init__(self, value: float) -> None:
         self.value = value
@@ -51,7 +79,17 @@ class _E2EConstantEstimator:
 
 
 def _isolated_report_parquet_checks(unique_path: str, empty_path: str) -> dict[str, int]:
-    unique = report_worker_module._read_parquet_once(Path(unique_path))
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(unique_path, flags)
+    try:
+        transfer = report_worker_module.duplicate_descriptor_for_worker(
+            descriptor, writable=False
+        )
+        unique = report_worker_module._read_parquet_handle(
+            transfer, sha256_file(unique_path), name="unique.parquet"
+        )
+    finally:
+        os.close(descriptor)
     empty_payload = reporting_module._parquet_bytes(
         pd.DataFrame(),
         reporting_module.report_parquet_schemas()["bootstrap_replicates.parquet"],
@@ -621,27 +659,29 @@ def test_interrupted_report_publication_never_creates_terminal_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _make_completed_run(tmp_path)
-    original = StageTransaction.write_file
+    original = StageTransaction.write_handle
 
     def interrupt(
         self: StageTransaction,
         relative_path: str | Path,
-        source_path: str | Path,
+        source_descriptor: int,
         *,
         expected_sha256: str,
         expected_size: int,
+        expected_identity: tuple[int, int],
     ) -> Path:
         if self.stage == "report" and str(relative_path) == "scores.json":
             raise RuntimeError("injected report crash")
         return original(
             self,
             relative_path,
-            source_path,
+            source_descriptor,
             expected_sha256=expected_sha256,
             expected_size=expected_size,
+            expected_identity=expected_identity,
         )
 
-    monkeypatch.setattr(StageTransaction, "write_file", interrupt)
+    monkeypatch.setattr(StageTransaction, "write_handle", interrupt)
     with pytest.raises(RuntimeError, match="injected report crash"):
         DefaultPilotServices().report(store.root)
     assert not (store.root / "report/stage_manifest.json").exists()
@@ -958,6 +998,8 @@ def test_report_rejects_mutated_worker_decision_scalars_after_real_worker(
         ("decision.json", {"scientific_decision": "go"}),
         ("scores.json", {"decision": "go"}),
         ("report_manifest.json", {"scientific_decision": "go"}),
+        ("report_manifest.json", {"data_provenance": "real"}),
+        ("report_manifest.json", {"protocol_approved_by": "attacker"}),
     ],
 )
 def test_report_rejects_cross_json_decision_mismatch(
@@ -980,7 +1022,7 @@ def test_report_rejects_cross_json_decision_mismatch(
             **_kwargs: object,
         ) -> dict[str, Any]:
             result = function(request)
-            path = Path(request["output_root"]) / name
+            path = next(store.root.glob(".report-worker-*")) / "outputs" / name
             value = json.loads(path.read_text(encoding="utf-8"))
             value.update(mutation)
             payload = json.dumps(
@@ -1035,7 +1077,7 @@ def test_report_rejects_cross_text_decision_mismatch(
             **_kwargs: object,
         ) -> dict[str, Any]:
             result = function(request)
-            path = Path(request["output_root"]) / name
+            path = next(store.root.glob(".report-worker-*")) / "outputs" / name
             payload = path.read_text(encoding="utf-8").replace(*replacement).encode()
             path.write_bytes(payload)
             result["outputs"][name] = {
@@ -1045,6 +1087,102 @@ def test_report_rejects_cross_text_decision_mismatch(
             return result
 
     monkeypatch.setattr(service_module, "_ReportProcessExecutor", TextMutatingExecutor)
+
+    with pytest.raises(ValueError, match="decision evidence"):
+        DefaultPilotServices().report(store.root)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"science_eligible": True},
+        {"decision_basis": "finite_shot"},
+        {"finite_shot_used": True},
+    ],
+)
+def test_report_rejects_decision_machine_metadata_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: dict[str, object],
+) -> None:
+    store = _make_completed_run(tmp_path)
+
+    class DecisionMutatingExecutor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def run(
+            self,
+            _operation: str,
+            function: Callable[..., dict[str, Any]],
+            request: dict[str, Any],
+            **_kwargs: object,
+        ) -> dict[str, Any]:
+            result = function(request)
+            path = next(store.root.glob(".report-worker-*")) / "outputs/decision.json"
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value.update(mutation)
+            payload = json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode()
+            path.write_bytes(payload)
+            result["outputs"]["decision.json"] = {
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size": len(payload),
+            }
+            return result
+
+    monkeypatch.setattr(
+        service_module, "_ReportProcessExecutor", DecisionMutatingExecutor
+    )
+
+    with pytest.raises(ValueError, match="decision evidence"):
+        DefaultPilotServices().report(store.root)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda text: text.replace("Decision rationale: `not_evaluated`.", ""),
+        lambda text: text.replace("`not_evaluated`", "`altered`"),
+        lambda text: text + "\nDecision rationale: `not_evaluated`.\n",
+    ],
+)
+def test_report_requires_one_exact_markdown_decision_rationale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutate: Callable[[str], str],
+) -> None:
+    store = _make_completed_run(tmp_path)
+
+    class MarkdownMutatingExecutor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def run(
+            self,
+            _operation: str,
+            function: Callable[..., dict[str, Any]],
+            request: dict[str, Any],
+            **_kwargs: object,
+        ) -> dict[str, Any]:
+            result = function(request)
+            path = next(store.root.glob(".report-worker-*")) / "outputs/report.md"
+            payload = mutate(path.read_text(encoding="utf-8")).encode()
+            path.write_bytes(payload)
+            result["outputs"]["report.md"] = {
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size": len(payload),
+            }
+            return result
+
+    monkeypatch.setattr(
+        service_module, "_ReportProcessExecutor", MarkdownMutatingExecutor
+    )
 
     with pytest.raises(ValueError, match="decision evidence"):
         DefaultPilotServices().report(store.root)
@@ -1067,7 +1205,8 @@ def test_report_rejects_worker_output_tamper_before_publication(
             **_kwargs: object,
         ) -> object:
             result = function(request)
-            with (Path(request["output_root"]) / "scores.json").open("ab") as stream:
+            path = next(store.root.glob(".report-worker-*")) / "outputs/scores.json"
+            with path.open("ab") as stream:
                 stream.write(b"tamper")
             return result
 
@@ -1096,7 +1235,7 @@ def test_report_worker_binds_snapshot_bytes_to_captured_input_hash(
             request: dict[str, Any],
             **_kwargs: object,
         ) -> object:
-            path = Path(request["input_root"]) / "exact_predictions.parquet"
+            path = next(store.root.glob(".report-worker-*")) / "inputs/exact_predictions.parquet"
             frame = pd.read_parquet(path)
             frame.loc[:, list(Q_COLUMNS)] = 4.75
             path.write_bytes(
@@ -1132,7 +1271,8 @@ def test_report_rejects_declared_but_missing_worker_output_and_cleans_staging(
             **_kwargs: object,
         ) -> object:
             result = function(request)
-            (Path(request["output_root"]) / "scores.json").unlink()
+            path = next(store.root.glob(".report-worker-*")) / "outputs/scores.json"
+            path.write_bytes(b"")
             return result
 
     monkeypatch.setattr(service_module, "_ReportProcessExecutor", MissingOutputExecutor)
@@ -1148,30 +1288,34 @@ def test_report_rejects_worker_output_swap_after_validation_before_stream_copy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _make_completed_run(tmp_path)
-    original = StageTransaction.write_file
+    original = StageTransaction.write_handle
     swapped = False
 
     def swap_then_copy(
         self: StageTransaction,
         relative_path: str | Path,
-        source_path: str | Path,
+        source_descriptor: int,
         *,
         expected_sha256: str,
         expected_size: int,
+        expected_identity: tuple[int, int],
     ) -> Path:
         nonlocal swapped
         if self.stage == "report" and str(relative_path) == "scores.json":
-            Path(source_path).write_bytes(b"post-validation swap")
+            os.ftruncate(source_descriptor, 0)
+            os.lseek(source_descriptor, 0, os.SEEK_SET)
+            os.write(source_descriptor, b"post-validation swap")
             swapped = True
         return original(
             self,
             relative_path,
-            source_path,
+            source_descriptor,
             expected_sha256=expected_sha256,
             expected_size=expected_size,
+            expected_identity=expected_identity,
         )
 
-    monkeypatch.setattr(StageTransaction, "write_file", swap_then_copy)
+    monkeypatch.setattr(StageTransaction, "write_handle", swap_then_copy)
 
     with pytest.raises(ValueError, match=r"size|checksum|changed|regular"):
         DefaultPilotServices().report(store.root)
@@ -1182,7 +1326,72 @@ def test_report_rejects_worker_output_swap_after_validation_before_stream_copy(
     assert list(store.root.glob(".report-worker-*")) == []
 
 
-def test_report_worker_rejects_input_or_output_outside_private_staging(
+def test_report_path_schema_swap_cannot_change_validated_open_output_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _make_completed_run(tmp_path)
+    original = StageTransaction.write_handle
+    swapped = False
+
+    def replace_name_then_stream_handle(
+        self: StageTransaction,
+        relative_path: str | Path,
+        source_descriptor: int,
+        *,
+        expected_sha256: str,
+        expected_size: int,
+        expected_identity: tuple[int, int],
+    ) -> Path:
+        nonlocal swapped
+        if self.stage == "report" and str(relative_path) == "timestamp_scores.parquet":
+            root = next(store.root.glob(".report-worker-*"))
+            named_path = root / "outputs/timestamp_scores.parquet"
+            with os.fdopen(os.dup(source_descriptor), "rb") as stream:
+                table = pq.read_table(stream)
+            names = ["sample_ix" if name == "sample_id" else name for name in table.column_names]
+            outside = tmp_path / "schema-swap-outside"
+            outside.mkdir()
+            replacement = outside / "timestamp_scores.parquet"
+            pq.write_table(table.rename_columns(names), replacement, compression="zstd")
+            assert replacement.stat().st_size == expected_size
+            alias = tmp_path / "output-name"
+            _create_directory_link(alias, named_path.parent)
+            before = (alias / named_path.name).stat()
+            _remove_directory_link(alias)
+            _create_directory_link(alias, outside)
+            os.utime(alias / named_path.name, ns=(before.st_atime_ns, before.st_mtime_ns))
+            assert pq.ParquetFile(alias / named_path.name).schema_arrow.names != table.schema.names
+            _remove_directory_link(alias)
+            _create_directory_link(alias, named_path.parent)
+            _remove_directory_link(alias)
+            swapped = True
+        return original(
+            self,
+            relative_path,
+            source_descriptor,
+            expected_sha256=expected_sha256,
+            expected_size=expected_size,
+            expected_identity=expected_identity,
+        )
+
+    monkeypatch.setattr(
+        StageTransaction, "write_handle", replace_name_then_stream_handle
+    )
+
+    result = DefaultPilotServices().report(store.root)
+
+    assert result.status is StageStatus.BLOCKED
+    assert swapped is True
+    actual = pq.ParquetFile(store.root / "report/timestamp_scores.parquet").schema_arrow
+    assert actual.remove_metadata().equals(
+        reporting_module.report_parquet_schemas()[
+            "timestamp_scores.parquet"
+        ].remove_metadata(),
+        check_metadata=False,
+    )
+
+
+def test_report_worker_rejects_path_only_input_output_contract(
     tmp_path: Path,
 ) -> None:
     staging = tmp_path / "staging"
@@ -1201,50 +1410,58 @@ def test_report_worker_rejects_input_or_output_outside_private_staging(
     )
 
     assert result["status"] == "contract_error"
-    assert "directory is unsafe" in result["message"]
+    assert "snapshot checksum inventory" in result["message"]
 
 
-def test_report_worker_rejects_linked_staging_root_without_platform_skip(
+@pytest.mark.parametrize("replaced_name", ["root", "inputs", "outputs"])
+def test_report_worker_handles_survive_transient_junction_replacement_without_escape(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replaced_name: str,
 ) -> None:
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    (staging / "inputs").mkdir()
-    (staging / "outputs").mkdir()
-    link = tmp_path / "staging-link"
-    if sys.platform == "win32":
-        escaped_link = str(link).replace("'", "''")
-        escaped_target = str(staging).replace("'", "''")
-        command = (
-            f"New-Item -ItemType Junction -Path '{escaped_link}' "
-            f"-Target '{escaped_target}' -ErrorAction Stop | Out-Null"
-        )
-        completed = subprocess.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-Command",
-                command,
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        assert completed.returncode == 0, completed.stderr
-        assert link.is_junction()
-    else:
-        link.symlink_to(staging, target_is_directory=True)
+    store = _make_completed_run(tmp_path)
+    outside = tmp_path / f"outside-{replaced_name}"
+    outside.mkdir()
 
-    result = report_worker_module.run_report_worker(
-        {
-            "staging_root": str(link),
-            "input_root": str(staging / "inputs"),
-            "output_root": str(staging / "outputs"),
-        }
+    class JunctionReplacingExecutor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def run(
+            self,
+            _operation: str,
+            function: Callable[..., dict[str, Any]],
+            request: dict[str, Any],
+            **_kwargs: object,
+        ) -> dict[str, Any]:
+            assert "input_root" not in request
+            assert "output_root" not in request
+            assert set(request["input_handles"]) == {
+                "exact_predictions.parquet",
+                "baseline_predictions.parquet",
+                "finite_shot_predictions.parquet",
+            }
+            worker_root = next(store.root.glob(".report-worker-*"))
+            target = worker_root if replaced_name == "root" else worker_root / replaced_name
+            alias = tmp_path / f"active-{replaced_name}"
+            _create_directory_link(alias, target)
+            try:
+                _remove_directory_link(alias)
+                _create_directory_link(alias, outside)
+                return function(request)
+            finally:
+                _remove_directory_link(alias)
+                _create_directory_link(alias, target)
+                _remove_directory_link(alias)
+
+    monkeypatch.setattr(
+        service_module, "_ReportProcessExecutor", JunctionReplacingExecutor
     )
 
-    assert result["status"] == "contract_error"
-    assert "staging root is unsafe" in result["message"]
+    result = DefaultPilotServices().report(store.root)
+
+    assert result.status is StageStatus.BLOCKED
+    assert list(outside.iterdir()) == []
 
 
 def test_report_worker_decodes_exact_hashed_snapshot_bytes_despite_path_swap(
@@ -1261,6 +1478,10 @@ def test_report_worker_decodes_exact_hashed_snapshot_bytes_despite_path_swap(
     second_bytes = second_buffer.getvalue()
     assert len(first_bytes) == len(second_bytes)
     path.write_bytes(first_bytes)
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    transfer = report_worker_module.duplicate_descriptor_for_worker(
+        descriptor, writable=False
+    )
     original_stat = path.stat()
     real_decode = pd.read_parquet
     observed_sources: list[object] = []
@@ -1273,9 +1494,12 @@ def test_report_worker_decodes_exact_hashed_snapshot_bytes_despite_path_swap(
 
     monkeypatch.setattr(pd, "read_parquet", swap_before_decode)
 
-    decoded = report_worker_module._read_parquet_once(
-        path, hashlib.sha256(first_bytes).hexdigest()
-    )
+    try:
+        decoded = report_worker_module._read_parquet_handle(
+            transfer, hashlib.sha256(first_bytes).hexdigest(), name=path.name
+        )
+    finally:
+        os.close(descriptor)
 
     assert isinstance(observed_sources[0], io.BytesIO)
     assert decoded["sample_id"].tolist() == ["aaaa", "cccc"]

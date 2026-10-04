@@ -14,7 +14,9 @@ import tempfile
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -44,7 +46,11 @@ from .data import (
 from .data import dataframe_parquet_bytes as dataframe_parquet_bytes
 from .domain import DetailEntry, StageResult, StageStatus, deterministic_data
 from .evaluation import EvaluationContractError
-from .report_worker import run_report_worker
+from .report_worker import (
+    close_descriptor_transfer,
+    duplicate_descriptor_for_worker,
+    run_report_worker,
+)
 from .reporting import ReportContractError, report_parquet_schemas
 from .seeds import SeedManager
 from .splits import (
@@ -67,6 +73,13 @@ _REPORT_STATUS_DECISIONS = {
     StageStatus.BLOCKED: frozenset({"not_evaluated"}),
     StageStatus.SUCCESS: frozenset({"go", "stop", "inconclusive"}),
     StageStatus.INVALID: frozenset({"not_evaluated"}),
+}
+_REPORT_DECISION_CONCLUSIONS = {
+    (StageStatus.BLOCKED, "not_evaluated"): "not_evaluated",
+    (StageStatus.SUCCESS, "go"): "go",
+    (StageStatus.SUCCESS, "stop"): "skill_below_threshold",
+    (StageStatus.SUCCESS, "inconclusive"): "inconclusive",
+    (StageStatus.INVALID, "not_evaluated"): "resource_gate_failed",
 }
 
 
@@ -3006,7 +3019,7 @@ class DefaultPilotServices:
         return result
 
     @staticmethod
-    def _write_report_worker_snapshot(path: Path, payload: bytes) -> None:
+    def _open_report_worker_file(path: Path, payload: bytes | None = None) -> int:
         parent_before = path.parent.lstat()
         if (
             path.exists()
@@ -3018,21 +3031,56 @@ class DefaultPilotServices:
             or parent_before.st_nlink != 1
         ):
             raise ReportContractError("report worker snapshot path is unsafe")
-        with path.open("xb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        written = path.lstat()
-        parent_after = path.parent.lstat()
-        if (
-            not stat.S_ISREG(written.st_mode)
-            or written.st_nlink != 1
-            or path.parent.is_symlink()
-            or path.parent.is_junction()
-            or parent_after.st_dev != parent_before.st_dev
-            or (parent_before.st_ino and parent_after.st_ino != parent_before.st_ino)
-        ):
-            raise ReportContractError("report worker snapshot is not a regular file")
+        if os.name == "nt":
+            import _winapi
+            import msvcrt
+
+            handle = _winapi.CreateFile(
+                str(path),
+                _winapi.GENERIC_READ | _winapi.GENERIC_WRITE,
+                0x1 | 0x2 | 0x4,  # FILE_SHARE_READ | WRITE | DELETE
+                0,
+                1,  # CREATE_NEW
+                0x80,  # FILE_ATTRIBUTE_NORMAL
+                0,
+            )
+            try:
+                descriptor = msvcrt.open_osfhandle(
+                    handle, os.O_RDWR | getattr(os, "O_BINARY", 0)
+                )
+            except BaseException:
+                with suppress(OSError):
+                    _winapi.CloseHandle(handle)
+                raise
+        else:
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags, 0o600)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                raise ReportContractError("report worker file is not regular single-link")
+            if payload is not None:
+                view = memoryview(payload)
+                written = 0
+                while written < len(view):
+                    count = os.write(
+                        descriptor, view[written : written + 1024 * 1024]
+                    )
+                    if count <= 0:
+                        raise OSError("short write")
+                    written += count
+                os.fsync(descriptor)
+                os.lseek(descriptor, 0, os.SEEK_SET)
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _close_report_worker_files(descriptors: Mapping[str, int]) -> None:
+        for descriptor in descriptors.values():
+            with suppress(OSError):
+                os.close(descriptor)
 
     @staticmethod
     def _cleanup_abandoned_report_workers(store: RunStore) -> None:
@@ -3062,6 +3110,10 @@ class DefaultPilotServices:
         worker_status: StageStatus,
         worker_decision: str,
         worker_conclusion: str,
+        expected_science_eligible: bool,
+        expected_data_provenance: str,
+        expected_approved_by: str | None,
+        expected_approved_at: str | None,
     ) -> tuple[StageStatus, str, str]:
         def object_from(name: str) -> dict[str, Any]:
             try:
@@ -3098,20 +3150,43 @@ class DefaultPilotServices:
             stage_status = StageStatus(str(raw_status))
         except ValueError as error:
             raise ReportContractError("report decision evidence status is invalid") from error
+        expected_status = (
+            StageStatus.SUCCESS if expected_science_eligible else StageStatus.BLOCKED
+        )
+        expected_decisions = (
+            {"go", "stop", "inconclusive"}
+            if expected_science_eligible
+            else {"not_evaluated"}
+        )
+        rationale = f"Decision rationale: `{raw_conclusion}`."
         if (
             stage_status not in _REPORT_STATUS_DECISIONS
             or raw_decision not in _REPORT_STATUS_DECISIONS[stage_status]
+            or _REPORT_DECISION_CONCLUSIONS.get((stage_status, str(raw_decision)))
+            != raw_conclusion
+            or stage_status is not expected_status
+            or raw_decision not in expected_decisions
             or (
                 stage_status is StageStatus.INVALID
                 and raw_conclusion != "resource_gate_failed"
             )
             or not isinstance(raw_conclusion, str)
             or not raw_conclusion
+            or decision.get("schema_version") != "1.0"
+            or decision.get("science_eligible") is not expected_science_eligible
+            or scores.get("science_eligible") is not expected_science_eligible
+            or row.get("science_eligible") != str(expected_science_eligible)
+            or decision.get("decision_basis")
+            != "exact_primary_system_score_calibration_resource_gates"
+            or decision.get("finite_shot_used") is not False
             or scores.get("stage_status") != stage_status.value
             or scores.get("decision") != raw_decision
             or scores.get("conclusion") != raw_conclusion
             or manifest.get("scientific_decision") != raw_decision
             or manifest.get("conclusion") != raw_conclusion
+            or manifest.get("data_provenance") != expected_data_provenance
+            or manifest.get("protocol_approved_by") != expected_approved_by
+            or manifest.get("protocol_approved_at") != expected_approved_at
             or row.get("stage_status") != stage_status.value
             or row.get("decision") != raw_decision
             or row.get("conclusion") != raw_conclusion
@@ -3119,6 +3194,8 @@ class DefaultPilotServices:
                 f"**Status:** {stage_status.value.upper()} / {str(raw_decision).upper()}"
             )
             != 1
+            or markdown.count("Decision rationale:") != 1
+            or markdown.count(rationale) != 1
             or worker_status is not stage_status
             or worker_decision != raw_decision
             or worker_conclusion != raw_conclusion
@@ -3129,15 +3206,19 @@ class DefaultPilotServices:
     @staticmethod
     def _validate_report_worker_outputs(
         *,
-        output_root: Path,
+        output_descriptors: Mapping[str, int],
         worker_result: object,
         guard: _ResourceGuard,
         live_bytes: int,
+        expected_science_eligible: bool,
+        expected_data_provenance: str,
+        expected_approved_by: str | None,
+        expected_approved_at: str | None,
     ) -> tuple[
         StageStatus,
         str,
         str,
-        dict[str, tuple[Path, str, int]],
+        dict[str, tuple[int, str, int, tuple[int, int]]],
         int,
     ]:
         if not isinstance(worker_result, dict) or worker_result.get("schema_version") != "1.0":
@@ -3193,6 +3274,8 @@ class DefaultPilotServices:
         raw_outputs = worker_result.get("outputs")
         if not isinstance(raw_outputs, dict) or set(raw_outputs) != expected_names:
             raise ReportContractError("report worker output inventory is invalid")
+        if set(output_descriptors) != expected_names:
+            raise ReportContractError("report worker output handle inventory is invalid")
         schemas = report_parquet_schemas()
         claim_names = {
             "decision.json",
@@ -3203,17 +3286,8 @@ class DefaultPilotServices:
         }
         captured_claims: dict[str, bytes] = {}
         captured_claim_bytes = 0
-        verified: dict[str, tuple[Path, str, int]] = {}
+        verified: dict[str, tuple[int, str, int, tuple[int, int]]] = {}
         output_bytes = 0
-        root = output_root.resolve(strict=True)
-        root_before = output_root.lstat()
-        if (
-            output_root.is_symlink()
-            or output_root.is_junction()
-            or not stat.S_ISDIR(root_before.st_mode)
-            or root_before.st_nlink != 1
-        ):
-            raise ReportContractError("report worker output directory is unsafe")
         for name in sorted(expected_names):
             record = raw_outputs[name]
             if not isinstance(record, dict) or set(record) != {"sha256", "size"}:
@@ -3229,39 +3303,25 @@ class DefaultPilotServices:
                 or declared_size < 0
             ):
                 raise ReportContractError(f"report worker output metadata is invalid: {name}")
-            path = output_root / name
             try:
-                before = path.lstat()
+                descriptor = output_descriptors[name]
+                before = os.fstat(descriptor)
             except OSError as error:
                 raise ReportContractError(
                     f"report worker output is missing or inaccessible: {name}"
                 ) from error
             if (
-                path.is_symlink()
-                or path.is_junction()
-                or output_root.is_symlink()
-                or output_root.is_junction()
-                or path.resolve(strict=False).parent != root
-                or not stat.S_ISREG(before.st_mode)
+                not stat.S_ISREG(before.st_mode)
                 or before.st_nlink != 1
                 or before.st_size != declared_size
             ):
                 raise ReportContractError(f"report worker output is unsafe: {name}")
             output_bytes += declared_size
             guard.checkpoint(live_bytes + output_bytes)
-            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(path, flags)
             digest = hashlib.sha256()
             claim_buffer = bytearray() if name in claim_names else None
             try:
-                opened = os.fstat(descriptor)
-                if (
-                    not stat.S_ISREG(opened.st_mode)
-                    or opened.st_nlink != 1
-                    or opened.st_size != declared_size
-                    or (before.st_ino and opened.st_ino != before.st_ino)
-                ):
-                    raise ReportContractError(f"report worker output changed: {name}")
+                os.lseek(descriptor, 0, os.SEEK_SET)
                 if name in schemas:
                     with os.fdopen(os.dup(descriptor), "rb") as stream:
                         actual_schema = pq.ParquetFile(stream).schema_arrow.remove_metadata()
@@ -3284,14 +3344,16 @@ class DefaultPilotServices:
                                 f"report decision evidence exceeds its size limit: {name}"
                             )
                 after = os.fstat(descriptor)
-                if after.st_size != opened.st_size or after.st_mtime_ns != opened.st_mtime_ns:
+                if (
+                    after.st_size != before.st_size
+                    or after.st_mtime_ns != before.st_mtime_ns
+                    or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+                ):
                     raise ReportContractError(f"report worker output changed: {name}")
             except (OSError, pa.ArrowException) as error:
                 raise ReportContractError(
                     f"report worker output cannot be verified: {name}"
                 ) from error
-            finally:
-                os.close(descriptor)
             actual_digest = digest.hexdigest()
             if actual_digest != declared_digest:
                 raise ReportContractError(f"report worker output checksum is invalid: {name}")
@@ -3304,21 +3366,22 @@ class DefaultPilotServices:
                 )
                 captured_claims[name] = bytes(claim_buffer)
                 captured_claim_bytes += len(claim_buffer)
-            verified[name] = (path, actual_digest, declared_size)
-            root_after = output_root.lstat()
-            if (
-                output_root.is_symlink()
-                or output_root.is_junction()
-                or root_after.st_dev != root_before.st_dev
-                or (root_before.st_ino and root_after.st_ino != root_before.st_ino)
-            ):
-                raise ReportContractError("report worker output directory changed")
+            verified[name] = (
+                descriptor,
+                actual_digest,
+                declared_size,
+                (before.st_dev, before.st_ino),
+            )
         stage_status, decision, conclusion = (
             DefaultPilotServices._validated_report_decision_evidence(
                 captured_claims=captured_claims,
                 worker_status=stage_status,
                 worker_decision=decision,
                 worker_conclusion=conclusion,
+                expected_science_eligible=expected_science_eligible,
+                expected_data_provenance=expected_data_provenance,
+                expected_approved_by=expected_approved_by,
+                expected_approved_at=expected_approved_at,
             )
         )
         return stage_status, decision, conclusion, verified, output_bytes
@@ -3353,6 +3416,9 @@ class DefaultPilotServices:
             "stage_status": "invalid",
             "scientific_decision": "not_evaluated",
             "conclusion": "resource_gate_failed",
+            "science_eligible": False,
+            "decision_basis": "resource_gate",
+            "finite_shot_used": False,
             "gate": gate,
         }
         if (
@@ -3387,13 +3453,14 @@ class DefaultPilotServices:
             transaction.write_text(
                 "report.md",
                 "# Photonic PV Pilot — Report unavailable\n\n"
-                f"INVALID / NOT_EVALUATED: {message}\n",
+                f"**Status:** INVALID / NOT_EVALUATED\n\n{message}\n\n"
+                "Decision rationale: `resource_gate_failed`.\n",
             )
             transaction.write_json("scores.json", diagnostic)
             transaction.write_text(
                 "scores.csv",
-                "stage_status,scientific_decision,conclusion,gate\n"
-                f"invalid,not_evaluated,resource_gate_failed,{gate}\n",
+                "stage_status,scientific_decision,conclusion,science_eligible,gate\n"
+                f"invalid,not_evaluated,resource_gate_failed,False,{gate}\n",
             )
             transaction.write_json("decision.json", diagnostic)
             transaction.write_json(
@@ -3427,6 +3494,8 @@ class DefaultPilotServices:
             memory_bytes=int(config.resources.max_memory_gb * 1024**3),
         )
         worker_root: Path | None = None
+        worker_descriptors: dict[str, int] = {}
+        worker_transfers: list[object] = []
         try:
             (
                 config,
@@ -3614,9 +3683,27 @@ class DefaultPilotServices:
                     "benchmark/finite_shot_predictions.parquet"
                 ],
             }
+            input_descriptors: dict[str, int] = {}
             for name, payload in snapshots.items():
                 guard.checkpoint(total_file_bytes)
-                self._write_report_worker_snapshot(input_root / name, payload)
+                descriptor = self._open_report_worker_file(input_root / name, payload)
+                input_descriptors[name] = descriptor
+                worker_descriptors[f"input:{name}"] = descriptor
+            output_names = {
+                "report.md",
+                "timestamp_scores.parquet",
+                "evaluated_predictions.parquet",
+                "bootstrap_replicates.parquet",
+                "scores.json",
+                "scores.csv",
+                "decision.json",
+                "report_manifest.json",
+            }
+            output_descriptors: dict[str, int] = {}
+            for name in sorted(output_names):
+                descriptor = self._open_report_worker_file(output_root / name)
+                output_descriptors[name] = descriptor
+                worker_descriptors[f"output:{name}"] = descriptor
             versions = {
                 "protocol": config.protocol.version,
                 "canonical_data_schema": data_card.get("canonical_schema_version"),
@@ -3627,10 +3714,19 @@ class DefaultPilotServices:
                 "benchmark_schema": selection_manifest.get("schema_version"),
                 "prediction_fit_phase": "train_plus_validation_refit",
             }
+            input_transfers = {
+                name: duplicate_descriptor_for_worker(descriptor, writable=False)
+                for name, descriptor in input_descriptors.items()
+            }
+            output_transfers = {
+                name: duplicate_descriptor_for_worker(descriptor, writable=True)
+                for name, descriptor in output_descriptors.items()
+            }
+            worker_transfers.extend(input_transfers.values())
+            worker_transfers.extend(output_transfers.values())
             worker_request = {
-                "staging_root": str(worker_root),
-                "input_root": str(input_root),
-                "output_root": str(output_root),
+                "input_handles": input_transfers,
+                "output_handles": output_transfers,
                 "snapshot_sha256": {
                     "exact_predictions.parquet": input_hashes[
                         "benchmark/exact_predictions.parquet"
@@ -3666,12 +3762,17 @@ class DefaultPilotServices:
                 max_memory_bytes=guard.memory_bytes,
                 telemetry_callback=guard.record_fit_rss,
             )
-            worker_result = executor.run(
-                "report-decode-evaluate-serialize",
-                run_report_worker,
-                worker_request,
-                declared_bytes=total_file_bytes,
-            )
+            try:
+                worker_result = executor.run(
+                    "report-decode-evaluate-serialize",
+                    run_report_worker,
+                    worker_request,
+                    declared_bytes=total_file_bytes,
+                )
+            finally:
+                for transfer in worker_transfers:
+                    close_descriptor_transfer(transfer)
+                worker_transfers.clear()
             (
                 report_status,
                 report_decision,
@@ -3679,14 +3780,26 @@ class DefaultPilotServices:
                 worker_outputs,
                 worker_output_bytes,
             ) = self._validate_report_worker_outputs(
-                output_root=output_root,
+                output_descriptors=output_descriptors,
                 worker_result=worker_result,
                 guard=guard,
                 live_bytes=total_file_bytes,
+                expected_science_eligible=config.science_decision_allowed,
+                expected_data_provenance=config.protocol.provenance.value,
+                expected_approved_by=config.protocol.approved_by,
+                expected_approved_at=(
+                    config.protocol.approved_at.astimezone(UTC)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                    if config.protocol.approved_at is not None
+                    else None
+                ),
             )
             publication_live_bytes = total_file_bytes + worker_output_bytes
             guard.checkpoint(publication_live_bytes)
         except _ResourceLimitExceeded as error:
+            self._close_report_worker_files(worker_descriptors)
+            worker_descriptors.clear()
             if worker_root is not None:
                 shutil.rmtree(worker_root, ignore_errors=True)
             return self._publish_report_invalid(
@@ -3696,6 +3809,8 @@ class DefaultPilotServices:
                 message="report generation exceeded a configured resource cap",
             )
         except baseline_models.FitMemoryExceeded:
+            self._close_report_worker_files(worker_descriptors)
+            worker_descriptors.clear()
             if worker_root is not None:
                 shutil.rmtree(worker_root, ignore_errors=True)
             return self._publish_report_invalid(
@@ -3705,6 +3820,8 @@ class DefaultPilotServices:
                 message="report worker exceeded the configured aggregate RSS cap",
             )
         except baseline_models.FitDeadlineExceeded:
+            self._close_report_worker_files(worker_descriptors)
+            worker_descriptors.clear()
             if worker_root is not None:
                 shutil.rmtree(worker_root, ignore_errors=True)
             return self._publish_report_invalid(
@@ -3714,6 +3831,8 @@ class DefaultPilotServices:
                 message="report worker exceeded the configured wall-clock cap",
             )
         except RuntimeError as error:
+            self._close_report_worker_files(worker_descriptors)
+            worker_descriptors.clear()
             if worker_root is not None:
                 shutil.rmtree(worker_root, ignore_errors=True)
             return self._publish_report_invalid(
@@ -3722,7 +3841,9 @@ class DefaultPilotServices:
                 gate="report_worker_failed",
                 message=f"report worker failed: {str(error)[:500]}",
             )
-        except (EvaluationContractError, ReportContractError) as error:
+        except (EvaluationContractError, ReportContractError, OSError) as error:
+            self._close_report_worker_files(worker_descriptors)
+            worker_descriptors.clear()
             if worker_root is not None:
                 shutil.rmtree(worker_root, ignore_errors=True)
             raise ValueError(f"report artifact contract is invalid: {error}") from error
@@ -3793,16 +3914,19 @@ class DefaultPilotServices:
                 preverified_input_hashes=input_hashes,
             ) as transaction:
                 for name in sorted(worker_outputs):
-                    source, digest, size = worker_outputs[name]
-                    transaction.write_file(
+                    descriptor, digest, size, identity = worker_outputs[name]
+                    transaction.write_handle(
                         name,
-                        source,
+                        descriptor,
                         expected_sha256=digest,
                         expected_size=size,
+                        expected_identity=identity,
                     )
                 transaction.write_json("resource_ledger.json", ledger)
                 transaction.write_json("stage_result.json", deterministic_data(result))
         except _ResourceLimitExceeded as error:
+            self._close_report_worker_files(worker_descriptors)
+            worker_descriptors.clear()
             if worker_root is not None:
                 shutil.rmtree(worker_root, ignore_errors=True)
             return self._publish_report_invalid(
@@ -3812,6 +3936,8 @@ class DefaultPilotServices:
                 message="report publication exceeded a configured resource cap",
             )
         finally:
+            self._close_report_worker_files(worker_descriptors)
+            worker_descriptors.clear()
             if worker_root is not None:
                 shutil.rmtree(worker_root, ignore_errors=True)
         return result

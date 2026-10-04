@@ -2096,6 +2096,69 @@ class StageTransaction:
         self._outputs[logical] = temporary
         return self._store.root / logical
 
+    def write_handle(
+        self,
+        relative_path: str | Path,
+        source_descriptor: int,
+        *,
+        expected_sha256: str,
+        expected_size: int,
+        expected_identity: tuple[int, int],
+    ) -> Path:
+        """Stream one already-open, verified worker output into this transaction."""
+
+        if self._private_write_guard is not None:
+            self._private_write_guard()
+        if (
+            len(expected_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in expected_sha256)
+            or expected_size < 0
+        ):
+            raise ValueError("worker output handle contract is invalid")
+        before = os.fstat(source_descriptor)
+        identity = (before.st_dev, before.st_ino)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size != expected_size
+            or identity != expected_identity
+        ):
+            raise ValueError("worker output handle is not a regular single-link file")
+        logical, temporary = self._temporary_target(relative_path)
+        temporary.parent.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256()
+        copied = 0
+        try:
+            os.lseek(source_descriptor, 0, os.SEEK_SET)
+            with temporary.open("xb") as destination:
+                while True:
+                    chunk = os.read(source_descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    copied += len(chunk)
+                    if copied > expected_size:
+                        raise ValueError("worker output exceeded its declared size")
+                    digest.update(chunk)
+                    destination.write(chunk)
+                destination.flush()
+                os.fsync(destination.fileno())
+            after = os.fstat(source_descriptor)
+            if (
+                copied != expected_size
+                or after.st_size != before.st_size
+                or after.st_mtime_ns != before.st_mtime_ns
+                or (after.st_dev, after.st_ino) != expected_identity
+                or digest.hexdigest() != expected_sha256
+            ):
+                raise ValueError("worker output handle checksum or size mismatch")
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+        if self._private_write_guard is not None:
+            self._private_write_guard()
+        self._outputs[logical] = temporary
+        return self._store.root / logical
+
     def write_text(
         self,
         relative_path: str | Path,

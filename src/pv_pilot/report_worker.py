@@ -7,7 +7,8 @@ import io
 import os
 import stat
 from collections.abc import Mapping
-from pathlib import Path
+from contextlib import suppress
+from multiprocessing import reduction
 from typing import Any
 
 import pandas as pd
@@ -34,54 +35,77 @@ _OUTPUT_ATTRIBUTES = {
 }
 
 
-def _is_link_like(path: Path) -> bool:
-    return path.is_symlink() or path.is_junction()
+def duplicate_descriptor_for_worker(descriptor: int, *, writable: bool) -> object:
+    """Return a spawn-picklable duplicate without exposing a data pathname."""
+
+    if os.name == "nt":
+        import _winapi
+        import msvcrt
+
+        access = _winapi.GENERIC_READ
+        if writable:
+            access |= _winapi.GENERIC_WRITE
+        return reduction.DupHandle(msvcrt.get_osfhandle(descriptor), access)
+    dup_fd = getattr(reduction, "DupFd", None)
+    if dup_fd is None:  # pragma: no cover - supported CPython POSIX builds expose DupFd
+        raise RuntimeError("descriptor transfer is unavailable")
+    return dup_fd(descriptor)
 
 
-def _directory_identity(path: Path) -> tuple[int, int]:
-    value = path.lstat()
-    if _is_link_like(path) or not stat.S_ISDIR(value.st_mode) or value.st_nlink != 1:
-        raise ReportContractError(f"report worker directory is unsafe: {path.name}")
-    return value.st_dev, value.st_ino
+def close_descriptor_transfer(transfer: object) -> None:
+    """Close an unused parent-side duplicate after a worker run or failed spawn."""
+
+    detach = getattr(transfer, "detach", None)
+    if not callable(detach):
+        return
+    try:
+        raw = detach()
+    except (EOFError, OSError, ValueError):
+        return
+    if os.name == "nt":
+        import _winapi
+
+        with suppress(OSError):
+            _winapi.CloseHandle(raw)
+    else:
+        with suppress(OSError):
+            os.close(raw)
+
+
+def _detach_descriptor(transfer: object, *, writable: bool) -> int:
+    detach = getattr(transfer, "detach", None)
+    if not callable(detach):
+        raise ReportContractError("report worker descriptor transfer is invalid")
+    raw = detach()
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ReportContractError("report worker descriptor transfer is invalid")
+    if os.name == "nt":
+        import _winapi
+        import msvcrt
+
+        flags = os.O_RDWR if writable else os.O_RDONLY
+        try:
+            return msvcrt.open_osfhandle(raw, flags | getattr(os, "O_BINARY", 0))
+        except BaseException:
+            with suppress(OSError):
+                _winapi.CloseHandle(raw)
+            raise
+    return raw
 
 
 def _ignore_resource_checkpoint(_declared_bytes: int = 0) -> None:
     return None
 
 
-def _validated_directory(raw: object, *, parent: Path, name: str) -> Path:
-    if not isinstance(raw, str):
-        raise ReportContractError(f"report worker {name} directory is invalid")
-    path = Path(raw)
-    resolved = path.resolve(strict=False)
-    before = path.lstat()
-    if (
-        _is_link_like(path)
-        or not stat.S_ISDIR(before.st_mode)
-        or before.st_nlink != 1
-        or resolved.parent != parent
-        or resolved.name != name
-    ):
-        raise ReportContractError(f"report worker {name} directory is unsafe")
-    return resolved
-
-
-def _read_parquet_once(path: Path, expected_sha256: str | None = None) -> pd.DataFrame:
-    parent_identity = _directory_identity(path.parent)
-    before = path.lstat()
-    if _is_link_like(path) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-        raise ReportContractError(f"report worker input is unsafe: {path.name}")
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
+def _read_parquet_handle(
+    transfer: object, expected_sha256: str, *, name: str
+) -> pd.DataFrame:
+    descriptor = _detach_descriptor(transfer, writable=False)
     try:
         opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or opened.st_nlink != 1
-            or opened.st_size != before.st_size
-            or (before.st_ino and opened.st_ino != before.st_ino)
-        ):
-            raise ReportContractError(f"report worker input changed: {path.name}")
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise ReportContractError(f"report worker input is unsafe: {name}")
+        os.lseek(descriptor, 0, os.SEEK_SET)
         digest = hashlib.sha256()
         captured = io.BytesIO()
         while True:
@@ -90,75 +114,55 @@ def _read_parquet_once(path: Path, expected_sha256: str | None = None) -> pd.Dat
                 break
             digest.update(chunk)
             captured.write(chunk)
-        if expected_sha256 is not None and digest.hexdigest() != expected_sha256:
+        if digest.hexdigest() != expected_sha256:
             raise ReportContractError(
-                f"report worker snapshot checksum is invalid: {path.name}"
+                f"report worker snapshot checksum is invalid: {name}"
             )
         after = os.fstat(descriptor)
-        if (
-            after.st_size != opened.st_size
-            or after.st_mtime_ns != opened.st_mtime_ns
-            or _directory_identity(path.parent) != parent_identity
-        ):
-            raise ReportContractError(f"report worker input changed: {path.name}")
+        if after.st_size != opened.st_size or after.st_mtime_ns != opened.st_mtime_ns:
+            raise ReportContractError(f"report worker input changed: {name}")
         captured.seek(0)
-        frame = pd.read_parquet(captured)
-        if _directory_identity(path.parent) != parent_identity:
-            raise ReportContractError(f"report worker input directory changed: {path.name}")
-        return frame
+        return pd.read_parquet(captured)
     finally:
         os.close(descriptor)
 
 
-def _write_output(path: Path, payload: bytes) -> dict[str, object]:
-    parent_identity = _directory_identity(path.parent)
-    if path.exists() or _is_link_like(path):
-        raise ReportContractError(f"report worker output path is unsafe: {path.name}")
-    with path.open("xb") as stream:
-        stream.write(payload)
-        stream.flush()
-        os.fsync(stream.fileno())
-    written = path.lstat()
-    if (
-        not stat.S_ISREG(written.st_mode)
-        or written.st_nlink != 1
-        or _directory_identity(path.parent) != parent_identity
-    ):
-        raise ReportContractError(f"report worker output is unsafe: {path.name}")
-    return {
-        "sha256": hashlib.sha256(payload).hexdigest(),
-        "size": len(payload),
-    }
+def _write_output_handle(
+    transfer: object, payload: bytes, *, name: str
+) -> dict[str, object]:
+    descriptor = _detach_descriptor(transfer, writable=True)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise ReportContractError(f"report worker output is unsafe: {name}")
+        os.ftruncate(descriptor, 0)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        view = memoryview(payload)
+        written = 0
+        while written < len(view):
+            count = os.write(descriptor, view[written : written + 1024 * 1024])
+            if count <= 0:
+                raise OSError("short write")
+            written += count
+        os.fsync(descriptor)
+        final = os.fstat(descriptor)
+        if final.st_size != len(payload):
+            raise ReportContractError(f"report worker output size is invalid: {name}")
+        return {
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+        }
+    finally:
+        os.close(descriptor)
 
 
 def run_report_worker(request: Mapping[str, Any]) -> dict[str, Any]:
     """Decode and evaluate only inside the resource-monitored subprocess."""
 
     try:
-        staging_raw = request.get("staging_root")
-        if not isinstance(staging_raw, str):
-            raise ReportContractError("report worker staging root is invalid")
-        staging_path = Path(staging_raw)
-        if _is_link_like(staging_path):
-            raise ReportContractError("report worker staging root is unsafe")
-        staging = staging_path.resolve(strict=True)
-        staging_stat = staging.lstat()
-        if (
-            _is_link_like(staging)
-            or not stat.S_ISDIR(staging_stat.st_mode)
-            or staging_stat.st_nlink != 1
-        ):
-            raise ReportContractError("report worker staging root is unsafe")
-        staging_identity = _directory_identity(staging)
-        input_root = _validated_directory(
-            request.get("input_root"), parent=staging, name="inputs"
-        )
-        output_root = _validated_directory(
-            request.get("output_root"), parent=staging, name="outputs"
-        )
-        input_identity = _directory_identity(input_root)
-        output_identity = _directory_identity(output_root)
         snapshot_sha256 = request.get("snapshot_sha256")
+        input_handles = request.get("input_handles")
+        output_handles = request.get("output_handles")
         if (
             not isinstance(snapshot_sha256, dict)
             or set(snapshot_sha256) != set(_INPUT_NAMES.values())
@@ -170,15 +174,29 @@ def run_report_worker(request: Mapping[str, Any]) -> dict[str, Any]:
             )
         ):
             raise ReportContractError("report worker snapshot checksum inventory is invalid")
+        if (
+            not isinstance(input_handles, dict)
+            or set(input_handles) != set(_INPUT_NAMES.values())
+        ):
+            raise ReportContractError("report worker input handle inventory is invalid")
+        if (
+            not isinstance(output_handles, dict)
+            or set(output_handles) != set(_OUTPUT_ATTRIBUTES)
+        ):
+            raise ReportContractError("report worker output handle inventory is invalid")
         exact_name = _INPUT_NAMES["exact"]
         baseline_name = _INPUT_NAMES["baseline"]
         finite_name = _INPUT_NAMES["finite"]
-        exact = _read_parquet_once(input_root / exact_name, snapshot_sha256[exact_name])
-        baselines = _read_parquet_once(
-            input_root / baseline_name, snapshot_sha256[baseline_name]
+        exact = _read_parquet_handle(
+            input_handles[exact_name], snapshot_sha256[exact_name], name=exact_name
         )
-        finite = _read_parquet_once(
-            input_root / finite_name, snapshot_sha256[finite_name]
+        baselines = _read_parquet_handle(
+            input_handles[baseline_name],
+            snapshot_sha256[baseline_name],
+            name=baseline_name,
+        )
+        finite = _read_parquet_handle(
+            input_handles[finite_name], snapshot_sha256[finite_name], name=finite_name
         )
         config = PilotConfig.model_validate(request.get("config"))
         products = build_report_products(
@@ -205,13 +223,9 @@ def run_report_worker(request: Mapping[str, Any]) -> dict[str, Any]:
             payload = getattr(products, attribute)
             if not isinstance(payload, bytes):
                 raise ReportContractError(f"report worker payload is invalid: {name}")
-            outputs[name] = _write_output(output_root / name, payload)
-        if (
-            _directory_identity(staging) != staging_identity
-            or _directory_identity(input_root) != input_identity
-            or _directory_identity(output_root) != output_identity
-        ):
-            raise ReportContractError("report worker staging directory changed")
+            outputs[name] = _write_output_handle(
+                output_handles[name], payload, name=name
+            )
         bundle = products.evaluation.score_bundle
         return {
             "schema_version": "1.0",
@@ -236,4 +250,8 @@ def run_report_worker(request: Mapping[str, Any]) -> dict[str, Any]:
         }
 
 
-__all__ = ["run_report_worker"]
+__all__ = [
+    "close_descriptor_transfer",
+    "duplicate_descriptor_for_worker",
+    "run_report_worker",
+]
