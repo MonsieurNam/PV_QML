@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import math
+import multiprocessing
 import os
 import shutil
 import subprocess
@@ -77,33 +78,45 @@ def _process_handle_count() -> int:
     return int(process.num_handles() if sys.platform == "win32" else process.num_fds())
 
 
-def _assert_process_handles_restored(baseline: int) -> None:
-    deadline = time.monotonic() + 5.0
-    current = _process_handle_count()
-    while current != baseline and time.monotonic() < deadline:
-        gc.collect()
-        time.sleep(0.01)
-        current = _process_handle_count()
-    assert current == baseline
+def _install_transfer_ownership_tracker(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fail_duplicate_call: int | None = None,
+) -> tuple[list[object], dict[int, int]]:
+    """Track only report-owned transfers, independent of process-global handles."""
+
+    created: list[object] = []
+    close_counts: dict[int, int] = {}
+    duplicate_calls = 0
+    real_duplicate = report_worker_module.duplicate_descriptor_for_worker
+    real_close = report_worker_module.close_descriptor_transfer
+
+    def tracked_duplicate(descriptor: int, *, writable: bool) -> object:
+        nonlocal duplicate_calls
+        duplicate_calls += 1
+        if duplicate_calls == fail_duplicate_call:
+            raise RuntimeError("injected transfer construction failure")
+        transfer = real_duplicate(descriptor, writable=writable)
+        created.append(transfer)
+        return transfer
+
+    def tracked_close(transfer: object) -> None:
+        identity = id(transfer)
+        close_counts[identity] = close_counts.get(identity, 0) + 1
+        real_close(transfer)
+
+    monkeypatch.setattr(
+        service_module, "duplicate_descriptor_for_worker", tracked_duplicate
+    )
+    monkeypatch.setattr(service_module, "close_descriptor_transfer", tracked_close)
+    return created, close_counts
 
 
-def _process_handle_baseline() -> int:
-    deadline = time.monotonic() + 5.0
-    stable_count = 0
-    previous: int | None = None
-    while time.monotonic() < deadline:
-        gc.collect()
-        current = _process_handle_count()
-        if current == previous:
-            stable_count += 1
-            if stable_count >= 10:
-                return current
-        else:
-            previous = current
-            stable_count = 0
-        time.sleep(0.01)
-    assert previous is not None
-    return previous
+def _assert_owned_transfers_closed_once(
+    created: list[object], close_counts: dict[int, int], *, expected: int
+) -> None:
+    assert len(created) == expected
+    assert close_counts == {id(transfer): 1 for transfer in created}
 
 
 class _E2EConstantEstimator:
@@ -115,6 +128,9 @@ class _E2EConstantEstimator:
 
 
 def _isolated_report_parquet_checks(unique_path: str, empty_path: str) -> dict[str, int]:
+    identifiers = [f"sample-{index:06d}" for index in range(100_000)]
+    pq.write_table(pa.table({"sample_id": identifiers}), unique_path, compression="zstd")
+    del identifiers
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     descriptor = os.open(unique_path, flags)
     try:
@@ -134,8 +150,58 @@ def _isolated_report_parquet_checks(unique_path: str, empty_path: str) -> dict[s
     return {"rows": len(unique), "empty_size": len(empty_payload)}
 
 
+def _isolated_descriptor_transfer_smoke(path: str) -> dict[str, int]:
+    """Exercise a real transfer in a fresh process with no unrelated app handles."""
+
+    gc.collect()
+    before = _process_handle_count()
+    descriptor = os.open(
+        path,
+        os.O_RDWR | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0),
+        0o600,
+    )
+    try:
+        transfer = report_worker_module.duplicate_descriptor_for_worker(
+            descriptor, writable=True
+        )
+        during = _process_handle_count()
+        report_worker_module.close_descriptor_transfer(transfer)
+        report_worker_module.close_descriptor_transfer(transfer)
+    finally:
+        os.close(descriptor)
+    gc.collect()
+    return {"before": before, "during": during, "after": _process_handle_count()}
+
+
+def _write_delta_prefix_parquet_bomb(path: str) -> dict[str, int | str]:
+    destination = Path(path)
+    frame = pd.read_parquet(destination).head(100).copy()
+    frame["sample_id"] = [
+        "x" * 1_000_000 + f"-{index:04d}" for index in range(len(frame))
+    ]
+    table = pa.Table.from_pandas(
+        frame,
+        schema=benchmark_module.exact_prediction_arrow_schema(),
+        preserve_index=False,
+        safe=True,
+    ).replace_schema_metadata(None)
+    with destination.open("wb") as stream:
+        pq.write_table(
+            table,
+            stream,
+            compression="zstd",
+            use_dictionary=False,
+            column_encoding={"sample_id": "DELTA_BYTE_ARRAY"},
+        )
+    return {"size": destination.stat().st_size, "sha256": sha256_file(destination)}
+
+
 def _crash_report_worker(_request: object) -> object:
     raise RuntimeError("injected spawned worker crash")
+
+
+def _ignore_resource_checkpoint(_declared_bytes: int = 0) -> None:
+    return None
 
 
 def _freeze(payload: object) -> str:
@@ -573,23 +639,12 @@ def _make_completed_run(tmp_path: Path) -> RunStore:
     return store
 
 
-@pytest.fixture(scope="module")
-def _warmed_report_worker(tmp_path_factory: pytest.TempPathFactory) -> None:
-    """Pay the one-time multiprocessing handle cost before leak assertions."""
-
-    store = _make_completed_run(tmp_path_factory.mktemp("report-worker-warmup"))
-    assert DefaultPilotServices().report(store.root).status is StageStatus.BLOCKED
-    gc.collect()
-
-
 def test_report_is_read_only_blocked_for_synthetic_and_resumable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    _warmed_report_worker: None,
 ) -> None:
-    del _warmed_report_worker
     store = _make_completed_run(tmp_path)
-    baseline_handles = _process_handle_baseline()
+    created, close_counts = _install_transfer_ownership_tracker(monkeypatch)
 
     def forbidden(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("report attempted training, feature extraction, or benchmarking")
@@ -605,7 +660,7 @@ def test_report_is_read_only_blocked_for_synthetic_and_resumable(
     monkeypatch.setattr(DefaultPilotServices, "benchmark", forbidden)
 
     result = DefaultPilotServices().report(store.root)
-    _assert_process_handles_restored(baseline_handles)
+    _assert_owned_transfers_closed_once(created, close_counts, expected=11)
 
     assert result.status is StageStatus.BLOCKED
     assert dict((item.key, item.value) for item in result.details)["scientific_decision"] == (
@@ -808,37 +863,24 @@ def test_report_parent_never_decodes_untrusted_parquet_and_worker_limit_is_durab
     store = _make_completed_run(tmp_path)
     relative = "benchmark/exact_predictions.parquet"
     path = store.root / relative
-    frame = pd.read_parquet(path).head(100).copy()
-    frame["sample_id"] = [
-        "x" * 1_000_000 + f"-{index:04d}" for index in range(len(frame))
-    ]
-    table = pa.Table.from_pandas(
-        frame,
-        schema=benchmark_module.exact_prediction_arrow_schema(),
-        preserve_index=False,
-        safe=True,
-    ).replace_schema_metadata(None)
-    sink = io.BytesIO()
-    pq.write_table(
-        table,
-        sink,
-        compression="zstd",
-        use_dictionary=False,
-        column_encoding={"sample_id": "DELTA_BYTE_ARRAY"},
+    executor = baseline_module.DeadlineProcessFitExecutor(
+        deadline_monotonic=time.monotonic() + 120,
+        resource_checkpoint=_ignore_resource_checkpoint,
+        private_directory=tmp_path / "bomb-control",
+        max_memory_bytes=1024**3,
     )
-    malicious = sink.getvalue()
-    assert len(malicious) < 5 * 1024**2
-    path.write_bytes(malicious)
+    bomb = executor.run(
+        "report-delta-prefix-fixture", _write_delta_prefix_parquet_bomb, str(path)
+    )
+    assert bomb["size"] < 5 * 1024**2
     marker_path = store.root / "benchmark/stage_manifest.json"
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
     next(item for item in marker["outputs"] if item["path"] == relative)["sha256"] = (
-        sha256_file(path)
+        bomb["sha256"]
     )
     marker_path.write_text(
         json.dumps(marker, sort_keys=True, separators=(",", ":")), encoding="utf-8"
     )
-    del frame, table, sink, malicious
-
     decode_calls: list[object] = []
     executor_calls: list[str] = []
 
@@ -883,6 +925,7 @@ def test_report_parent_never_decodes_untrusted_parquet_and_worker_limit_is_durab
     assert marker["details"]["resource_gate"] == "report_worker_memory_rss"
     assert not (store.root / "report/timestamp_scores.parquet").exists()
     assert DefaultPilotServices().report(store.root).status is StageStatus.INVALID
+    assert multiprocessing.active_children() == []
 
 
 def test_isolated_worker_accepts_realistic_dictionary_ids_and_contains_empty_serialization(
@@ -890,16 +933,10 @@ def test_isolated_worker_accepts_realistic_dictionary_ids_and_contains_empty_ser
 ) -> None:
     unique_path = tmp_path / "unique.parquet"
     empty_path = tmp_path / "empty.parquet"
-    identifiers = [f"sample-{index:06d}" for index in range(100_000)]
-    table = pa.table({"sample_id": identifiers})
-    pq.write_table(table, unique_path, compression="zstd")
-
-    def ignore_checkpoint(_declared: int = 0) -> None:
-        return None
 
     executor = baseline_module.DeadlineProcessFitExecutor(
         deadline_monotonic=time.monotonic() + 120,
-        resource_checkpoint=ignore_checkpoint,
+        resource_checkpoint=_ignore_resource_checkpoint,
         private_directory=tmp_path / "control",
         max_memory_bytes=8 * 1024**3,
     )
@@ -914,16 +951,34 @@ def test_isolated_worker_accepts_realistic_dictionary_ids_and_contains_empty_ser
     assert result["rows"] == 100_000
     assert result["empty_size"] == empty_path.stat().st_size
     assert result["empty_size"] > int(pd.DataFrame().memory_usage(deep=True).sum())
+    assert multiprocessing.active_children() == []
+
+
+def test_real_descriptor_transfer_closes_in_fresh_process(tmp_path: Path) -> None:
+    executor = baseline_module.DeadlineProcessFitExecutor(
+        deadline_monotonic=time.monotonic() + 30,
+        resource_checkpoint=_ignore_resource_checkpoint,
+        private_directory=tmp_path / "handle-control",
+        max_memory_bytes=2 * 1024**3,
+    )
+
+    result = executor.run(
+        "report-real-transfer-smoke",
+        _isolated_descriptor_transfer_smoke,
+        str(tmp_path / "owned.bin"),
+    )
+
+    assert result["during"] > result["before"]
+    assert result["after"] == result["before"]
+    assert multiprocessing.active_children() == []
 
 
 def test_report_worker_hard_deadline_is_durable_and_cleans_staging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    _warmed_report_worker: None,
 ) -> None:
-    del _warmed_report_worker
     store = _make_completed_run(tmp_path)
-    baseline_handles = _process_handle_baseline()
+    created, close_counts = _install_transfer_ownership_tracker(monkeypatch)
 
     class ShortDeadlineExecutor(baseline_module.DeadlineProcessFitExecutor):
         def __init__(self, **kwargs: Any) -> None:
@@ -933,36 +988,33 @@ def test_report_worker_hard_deadline_is_durable_and_cleans_staging(
     monkeypatch.setattr(service_module, "_ReportProcessExecutor", ShortDeadlineExecutor)
 
     result = DefaultPilotServices().report(store.root)
-    _assert_process_handles_restored(baseline_handles)
+    _assert_owned_transfers_closed_once(created, close_counts, expected=11)
 
     assert result.status is StageStatus.INVALID
     marker = json.loads((store.root / "report/stage_manifest.json").read_text())
     assert marker["details"]["resource_gate"] == "report_worker_wall_clock"
     assert list(store.root.glob(".report-worker-*")) == []
     assert DefaultPilotServices().report(store.root).status is StageStatus.INVALID
+    assert multiprocessing.active_children() == []
 
 
 def test_report_worker_spawn_crash_is_durable_and_cleans_staging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    _warmed_report_worker: None,
 ) -> None:
-    del _warmed_report_worker
     monkeypatch.setattr(service_module, "run_report_worker", _crash_report_worker)
-    warm_store = _make_completed_run(tmp_path.parent / "crash-warmup")
-    assert DefaultPilotServices().report(warm_store.root).status is StageStatus.INVALID
-
     store = _make_completed_run(tmp_path)
-    baseline_handles = _process_handle_baseline()
+    created, close_counts = _install_transfer_ownership_tracker(monkeypatch)
 
     result = DefaultPilotServices().report(store.root)
-    _assert_process_handles_restored(baseline_handles)
+    _assert_owned_transfers_closed_once(created, close_counts, expected=11)
 
     assert result.status is StageStatus.INVALID
     marker = json.loads((store.root / "report/stage_manifest.json").read_text())
     assert marker["details"]["resource_gate"] == "report_worker_failed"
     assert list(store.root.glob(".report-worker-*")) == []
     assert DefaultPilotServices().report(store.root).status is StageStatus.INVALID
+    assert multiprocessing.active_children() == []
 
 
 def test_report_resume_removes_abandoned_worker_staging(
@@ -1478,25 +1530,14 @@ def test_report_closes_incremental_transfers_when_second_duplicate_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _make_completed_run(tmp_path)
-    baseline = _process_handle_baseline()
-    real_duplicate = report_worker_module.duplicate_descriptor_for_worker
-    calls = 0
-
-    def fail_second(descriptor: int, *, writable: bool) -> object:
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise RuntimeError("injected transfer construction failure")
-        return real_duplicate(descriptor, writable=writable)
-
-    monkeypatch.setattr(
-        service_module, "duplicate_descriptor_for_worker", fail_second
+    created, close_counts = _install_transfer_ownership_tracker(
+        monkeypatch, fail_duplicate_call=2
     )
 
     result = DefaultPilotServices().report(store.root)
 
     assert result.status is StageStatus.INVALID
-    _assert_process_handles_restored(baseline)
+    _assert_owned_transfers_closed_once(created, close_counts, expected=1)
     assert list(store.root.glob(".report-worker-*")) == []
 
 
@@ -1504,7 +1545,7 @@ def test_report_closes_all_transfers_when_worker_handle_conversion_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _make_completed_run(tmp_path)
-    baseline = _process_handle_baseline()
+    created, close_counts = _install_transfer_ownership_tracker(monkeypatch)
 
     class DirectExecutor:
         def __init__(self, **_kwargs: object) -> None:
@@ -1531,7 +1572,7 @@ def test_report_closes_all_transfers_when_worker_handle_conversion_fails(
     with pytest.raises(ValueError, match="handle conversion failure"):
         DefaultPilotServices().report(store.root)
 
-    _assert_process_handles_restored(baseline)
+    _assert_owned_transfers_closed_once(created, close_counts, expected=11)
     assert list(store.root.glob(".report-worker-*")) == []
 
 
