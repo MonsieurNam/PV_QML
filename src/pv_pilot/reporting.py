@@ -16,7 +16,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .baselines import LOCKED_QUANTILES, prediction_arrow_schema, quantile_columns
+from .baselines import LOCKED_QUANTILES, normalized_wis, prediction_arrow_schema, quantile_columns
 from .benchmark import exact_prediction_arrow_schema, finite_shot_prediction_arrow_schema
 from .config import PilotConfig
 from .domain import ResourceGateEvidence, ScoreBundle, deterministic_data
@@ -29,6 +29,12 @@ from .evaluation import (
     timestamp_normalized_wis,
 )
 from .seeds import SeedManager
+from .three_photon import (
+    DIAGNOSTIC_PATHS,
+    PROFILE_FIXED_PATHS,
+    PROFILE_PREFIX,
+    require_profile_pass,
+)
 
 ResourceCheckpoint = Callable[[int], None]
 
@@ -52,6 +58,35 @@ class ReportProducts:
     report_manifest_json: bytes
     report_markdown: bytes
     declared_live_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class _DiagnosticControlConfiguration:
+    """Frozen three-photon control identity, separate from the primary contract."""
+
+    modes: int
+    photons: int
+    phase_scale: float
+    alpha: float
+    circuit_sha256_by_seed: tuple[tuple[int, str], ...]
+
+    def __post_init__(self) -> None:
+        if (
+            self.modes not in {4, 6}
+            or self.photons != 3
+            or not np.isfinite(self.phase_scale)
+            or self.phase_scale <= 0
+            or not np.isfinite(self.alpha)
+            or self.alpha <= 0
+            or len(self.circuit_sha256_by_seed) != 5
+            or len({seed for seed, _digest in self.circuit_sha256_by_seed}) != 5
+            or any(not _is_sha256(digest) for _seed, digest in self.circuit_sha256_by_seed)
+        ):
+            raise ReportContractError("diagnostic control configuration is invalid")
+
+    @property
+    def circuit_checksums(self) -> dict[int, str]:
+        return dict(self.circuit_sha256_by_seed)
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -93,6 +128,262 @@ def _freeze_sha256(manifest: Mapping[str, Any], post_freeze_fields: set[str]) ->
     return hashlib.sha256(_canonical_json_bytes(frozen)).hexdigest()
 
 
+def _holdout_freeze(config: PilotConfig, selection: Mapping[str, Any]) -> str:
+    primary = _require_sha256(selection.get("selection_freeze_sha256"), "primary freeze")
+    audit = _require_object(selection.get("holdout_audit"), "holdout audit")
+    if not config.photonics.enable_three_photon_benchmark:
+        if "selection_freezes" in audit:
+            raise ReportContractError("disabled diagnostic has unexpected selection freezes")
+        return primary
+    freezes = _require_object(audit.get("selection_freezes"), "combined selection freezes")
+    if set(freezes) != {"primary_2photon", "diagnostic_3photon"}:
+        raise ReportContractError("combined selection freeze inventory is invalid")
+    if freezes["primary_2photon"] != primary:
+        raise ReportContractError("combined primary selection freeze is invalid")
+    _require_sha256(freezes["diagnostic_3photon"], "diagnostic freeze")
+    combined = hashlib.sha256(_canonical_json_bytes(freezes)).hexdigest()
+    if (
+        audit.get("selection_freeze_sha256") != combined
+        or audit.get("opened_after_selection_freeze_sha256") != combined
+        or _require_object(selection.get("baseline_predictions"), "baseline lineage").get(
+            "opened_after_selection_freeze_sha256"
+        ) != combined
+    ):
+        raise ReportContractError("combined holdout selection freeze is invalid")
+    return combined
+
+
+def optional_report_summary(
+    config: PilotConfig,
+    captured: Mapping[str, bytes],
+    primary: Mapping[str, Any],
+    profile_inputs: Mapping[str, str],
+    *,
+    primary_exact: pd.DataFrame | None = None,
+) -> dict[str, Any]:
+    """Validate the authenticated optional inventory without fitting or simulation."""
+    from .photonics import (
+        circuit_checksum,
+        enumerate_fock_states,
+        load_circuit_npz,
+        state_order_checksum,
+    )
+
+    if not config.photonics.enable_three_photon_profile:
+        return {"profile_status": "DISABLED", "benchmark_status": "DISABLED"}
+
+    def object_at(path: str) -> dict[str, Any]:
+        try:
+            return _require_object(json.loads(captured[path]), path)
+        except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ReportContractError(f"optional artifact is invalid: {path}") from error
+
+    gate_path, feature_path, state_path, circuit_path = PROFILE_FIXED_PATHS
+    gate = object_at(gate_path)
+    summary: dict[str, Any] = {
+        "label": "diagnostic_3photon",
+        "profile_status": gate.get("status"),
+        "benchmark_status": "DISABLED",
+        "used_for_go_stop": False,
+        "scientific_decision": "NOT_EVALUATED",
+        "resource_gate": gate,
+    }
+    if gate.get("status") == "FAIL" and not config.photonics.enable_three_photon_benchmark:
+        if (
+            gate.get("config_sha256") != config.config_hash()
+            or gate.get("input_hashes") != dict(profile_inputs)
+            or gate.get("holdout_opened") is not False
+            or not gate.get("failure_gate")
+            or object_at(state_path).get("spaces") != []
+            or object_at(circuit_path).get("circuits") != []
+            or not pd.read_parquet(io.BytesIO(captured[feature_path])).empty
+        ):
+            raise ReportContractError("failed optional profile evidence is invalid")
+        return summary
+    try:
+        require_profile_pass(gate, config, captured[feature_path], dict(profile_inputs))
+    except ValueError as error:
+        raise ReportContractError(str(error)) from error
+    expected_spaces = [
+        {
+            "modes": modes,
+            "photons": 3,
+            "dimension": len(enumerate_fock_states(modes, 3)),
+            "states": [list(state) for state in enumerate_fock_states(modes, 3)],
+            "state_order_sha256": state_order_checksum(enumerate_fock_states(modes, 3)),
+        }
+        for modes in config.photonics.modes
+    ]
+    if object_at(state_path).get("spaces") != expected_spaces:
+        raise ReportContractError("optional canonical state spaces are invalid")
+    records = object_at(circuit_path).get("circuits")
+    if not isinstance(records, list):
+        raise ReportContractError("optional circuit inventory is invalid")
+    circuits: dict[tuple[int, int], str] = {}
+    paths: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            raise ReportContractError("optional circuit record is invalid")
+        path = record.get("path")
+        if (
+            not isinstance(path, str)
+            or not path.startswith(f"{PROFILE_PREFIX}/circuits/")
+            or path in paths
+            or path not in captured
+            or hashlib.sha256(captured[path]).hexdigest() != record.get("npz_sha256")
+        ):
+            raise ReportContractError("optional circuit checksum/path is invalid")
+        circuit = load_circuit_npz(captured[path])
+        key = (circuit.modes, circuit.circuit_seed)
+        checksum = circuit_checksum(circuit)
+        if (
+            key in circuits
+            or circuit.photons != 3
+            or record.get("photons") != 3
+            or record.get("modes") != circuit.modes
+            or record.get("circuit_seed") != circuit.circuit_seed
+            or record.get("state_order_sha256") != circuit.state_order_sha256
+            or record.get("circuit_sha256") != checksum
+        ):
+            raise ReportContractError("optional circuit identity is invalid")
+        circuits[key], paths = checksum, paths | {path}
+    if set(circuits) != {
+        (modes, seed) for modes in config.photonics.modes for seed in config.seeds.circuit_seeds
+    } or paths != {path for path in captured if path.startswith(f"{PROFILE_PREFIX}/circuits/")}:
+        raise ReportContractError("optional circuit grid is incomplete")
+    summary["state_dimensions"] = [space["dimension"] for space in expected_spaces]
+    if not config.photonics.enable_three_photon_benchmark:
+        return summary
+    selection = object_at(DIAGNOSTIC_PATHS[0])
+    freeze = _require_sha256(selection.get("selection_freeze_sha256"), "diagnostic freeze")
+    if freeze != _freeze_sha256(selection, set()):
+        raise ReportContractError("diagnostic selection freeze checksum is invalid")
+    if selection.get("three_photon_profile") != {
+        "status": "PASS",
+        "gate_sha256": hashlib.sha256(captured[gate_path]).hexdigest(),
+    }:
+        raise ReportContractError("diagnostic profile gate lineage is invalid")
+    combined = _holdout_freeze(config, primary)
+    if primary["holdout_audit"]["selection_freezes"]["diagnostic_3photon"] != freeze:
+        raise ReportContractError("diagnostic selection freeze does not match combined freeze")
+    if (
+        selection.get("selection_role") != "diagnostic_3photon"
+        or selection.get("seed_policy") != "equal_weight_mean_no_best_seed"
+        or selection.get("circuit_seeds") != list(config.seeds.circuit_seeds)
+        or selection.get("selection_data") != ["train", "validation"]
+        or selection.get("scaler_policy") != "fit_train_once_fixed_for_validation_refit_and_holdout"
+        or selection.get("refit") != "heads_only_on_train_plus_validation"
+        or selection.get("quantiles") != list(config.evaluation.quantiles)
+    ):
+        raise ReportContractError("diagnostic selection policy is invalid")
+    selected = _require_object(selection.get("selected"), "diagnostic selected configuration")
+    if selected.get("photons") != 3 or selected.get("seed_count") != 5:
+        raise ReportContractError("diagnostic must keep all five three-photon seeds")
+    metrics = object_at(DIAGNOSTIC_PATHS[-1])
+    seed_scores = metrics.get("seed_scores")
+    if (
+        metrics.get("label") != "diagnostic_3photon"
+        or metrics.get("used_for_go_stop") is not False
+        or metrics.get("scientific_decision") != "NOT_EVALUATED"
+        or metrics.get("selection_freeze_sha256") != freeze
+        or metrics.get("joint_selection_freeze_sha256") != combined
+        or metrics.get("seed_policy") != "equal_weight_mean_no_best_seed"
+        or not isinstance(seed_scores, list)
+        or len(seed_scores) != 10
+    ):
+        raise ReportContractError("diagnostic metrics/firewall evidence is invalid")
+    model_evidence = _require_object(metrics.get("model_inventory"), "diagnostic model inventory")
+    model_payload = captured.get(DIAGNOSTIC_PATHS[4])
+    if (
+        not isinstance(model_payload, bytes)
+        or model_evidence.get("models_sha256") != hashlib.sha256(model_payload).hexdigest()
+    ):
+        raise ReportContractError("diagnostic model digest is invalid")
+    expected_models = [
+        {
+            "control": control,
+            "circuit_seed": seed,
+            "modes": selected["modes"],
+            "photons": 3,
+            "phase_scale": selected["phase_scale"],
+            "alpha": selected["alpha"] if control == "indistinguishable"
+                     else selection["matched_control"]["selected_alpha"],
+            "circuit_sha256": circuits[(int(selected["modes"]), seed)],
+            "quantiles": list(LOCKED_QUANTILES),
+        }
+        for control in ("distinguishable", "indistinguishable")
+        for seed in sorted(config.seeds.circuit_seeds)
+    ]
+    if (
+        model_evidence.get("model_keys") != [
+            f"{model['control']}:seed={model['circuit_seed']}" for model in expected_models
+        ]
+        or model_evidence.get("models") != expected_models
+        or model_evidence.get("serialization_roundtrip_verified") is not True
+        or model_evidence.get("holdout_reinference_for_serialization") is not False
+    ):
+        raise ReportContractError("diagnostic model inventory/frozen metadata is invalid")
+    exact = pd.read_parquet(io.BytesIO(captured[DIAGNOSTIC_PATHS[3]]))
+    _validate_schema(exact, exact_prediction_arrow_schema(), "diagnostic exact predictions")
+    expected = _DiagnosticControlConfiguration(
+        modes=int(selected["modes"]), photons=3, phase_scale=float(selected["phase_scale"]),
+        alpha=float(selected["alpha"]),
+        circuit_sha256_by_seed=tuple((seed, circuits[(int(selected["modes"]), seed)])
+                                    for seed in config.seeds.circuit_seeds),
+    )
+    _physical_control_summary(
+        exact, expected, float(selection["matched_control"]["selected_alpha"])
+    )
+    losses = normalized_wis(
+        exact["target_ac_power_kw"].to_numpy(),
+        exact.loc[:, list(quantile_columns(LOCKED_QUANTILES))].to_numpy(),
+        exact["capacity_kw"].to_numpy(),
+        LOCKED_QUANTILES,
+    )
+    scored = exact.loc[:, ["control", "circuit_seed"]].copy()
+    scored["normalized_wis"] = losses
+    grouped = scored.groupby(["control", "circuit_seed"])["normalized_wis"].agg(
+        ["mean", "size"]
+    )
+    expected_keys = {
+        (control, seed)
+        for control in ("indistinguishable", "distinguishable")
+        for seed in config.seeds.circuit_seeds
+    }
+    if set(grouped.index) != expected_keys or any(not isinstance(row, dict) for row in seed_scores):
+        raise ReportContractError("diagnostic seed WIS inventory is invalid")
+    reported = {(row.get("control"), row.get("circuit_seed")): row for row in seed_scores}
+    if set(reported) != expected_keys or len(reported) != len(seed_scores):
+        raise ReportContractError("diagnostic seed WIS inventory is invalid")
+    for key, row in reported.items():
+        score = row.get("normalized_wis")
+        count = row.get("row_count")
+        actual = grouped.loc[key]
+        if (
+            set(row) != {"control", "circuit_seed", "normalized_wis", "row_count"}
+            or type(score) not in (int, float)
+            or not np.isfinite(score)
+            or score < 0
+            or type(count) is not int
+            or count != int(actual["size"])
+            or count <= 0
+            or not np.isclose(score, actual["mean"], rtol=0.0, atol=1e-12)
+        ):
+            raise ReportContractError("diagnostic seed WIS does not match exact predictions")
+    identity = ["sample_id", "site_id", "issued_at_utc", "target_at_utc",
+                "target_ac_power_kw", "capacity_kw", "control", "circuit_seed"]
+    if primary_exact is None:
+        primary_exact = pd.read_parquet(io.BytesIO(captured["benchmark/exact_predictions.parquet"]))
+    if not exact[identity].sort_values(identity).reset_index(drop=True).equals(
+        primary_exact[identity].sort_values(identity).reset_index(drop=True)
+    ):
+        raise ReportContractError("diagnostic predictions do not share primary holdout membership")
+    summary.update(benchmark_status="EVALUATED", selected=selected, seed_scores=seed_scores,
+                   selection_freeze_sha256=freeze, joint_selection_freeze_sha256=combined,
+                   prediction_rows=len(exact))
+    return summary
+
+
 def validate_model_and_selection_lineage(
     *,
     config: PilotConfig,
@@ -132,8 +423,9 @@ def validate_model_and_selection_lineage(
     if freeze != recomputed:
         raise ReportContractError("benchmark selection freeze checksum is invalid")
     holdout = _require_object(selection_manifest.get("holdout_audit"), "holdout audit")
+    expected_holdout_freeze = _holdout_freeze(config, selection_manifest)
     if (
-        holdout.get("opened_after_selection_freeze_sha256") != freeze
+        holdout.get("opened_after_selection_freeze_sha256") != expected_holdout_freeze
         or holdout.get("materialization_count") != 1
         or holdout.get("prediction_passes") != 1
     ):
@@ -527,7 +819,9 @@ def _validate_physical_quantiles(frame: pd.DataFrame, label: str) -> None:
 
 
 def _physical_control_summary(
-    exact: pd.DataFrame, expected: ExpectedPrimaryConfiguration, matched_alpha: float
+    exact: pd.DataFrame,
+    expected: ExpectedPrimaryConfiguration | _DiagnosticControlConfiguration,
+    matched_alpha: float,
 ) -> dict[str, Any]:
     controls = sorted(set(exact["control"].astype(str)))
     if controls != ["distinguishable", "indistinguishable"]:
@@ -677,6 +971,7 @@ def _render_markdown(
     *,
     provenance: str,
     finite_shot: Mapping[str, Any],
+    diagnostic_3photon: Mapping[str, Any],
 ) -> str:
     def metric(value: float | None) -> str:
         return "NA" if value is None else f"{value:.8f}"
@@ -713,6 +1008,32 @@ def _render_markdown(
             "- Flag: ideal_shot_noise_only",
             "- This diagnostic is excluded from GO/STOP.",
             "",
+            "## Three-photon diagnostic",
+            "",
+            f"- Profile: {diagnostic_3photon['profile_status']}",
+            f"- Benchmark: {diagnostic_3photon['benchmark_status']}",
+            *(
+                (
+                    "- Selected modes/photons: "
+                    f"{diagnostic_3photon['selected']['modes']}/"
+                    f"{diagnostic_3photon['selected']['photons']}",
+                    f"- Phase scale: {diagnostic_3photon['selected']['phase_scale']}",
+                    f"- Common alpha: {diagnostic_3photon['selected']['alpha']}",
+                    f"- State dimensions: {diagnostic_3photon['state_dimensions']}",
+                    f"- Per-seed scores: {len(diagnostic_3photon['seed_scores'])}",
+                    *(
+                        f"  - {row['control']} seed {row['circuit_seed']}: "
+                        f"{row['normalized_wis']:.8f}"
+                        for row in diagnostic_3photon["seed_scores"]
+                    ),
+                    "- Joint holdout freeze: "
+                    f"{diagnostic_3photon['joint_selection_freeze_sha256']}",
+                )
+                if diagnostic_3photon["benchmark_status"] == "EVALUATED"
+                else ()
+            ),
+            "- This diagnostic is excluded from GO/STOP.",
+            "",
             "## Scope and limitations",
             "",
             "- CPU/SLOS simulation only; no QPU execution.",
@@ -747,8 +1068,24 @@ def build_report_products(
     baseline_model_manifest: Mapping[str, Any],
     initial_live_bytes: int,
     resource_checkpoint: ResourceCheckpoint,
+    optional_summary: Mapping[str, Any] | None = None,
 ) -> ReportProducts:
     """Evaluate and serialize a report without fitting or reading source data."""
+
+    diagnostic_3photon = dict(optional_summary or {})
+    if not diagnostic_3photon and not config.photonics.enable_three_photon_profile:
+        diagnostic_3photon = {"profile_status": "DISABLED", "benchmark_status": "DISABLED"}
+    if config.photonics.enable_three_photon_profile:
+        if (
+            diagnostic_3photon.get("profile_status") not in {"PASS", "FAIL"}
+            or diagnostic_3photon.get("used_for_go_stop") is not False
+            or diagnostic_3photon.get("scientific_decision") != "NOT_EVALUATED"
+            or diagnostic_3photon.get("benchmark_status")
+            != ("EVALUATED" if config.photonics.enable_three_photon_benchmark else "DISABLED")
+        ):
+            raise ReportContractError("optional diagnostic summary is invalid")
+    elif diagnostic_3photon != {"profile_status": "DISABLED", "benchmark_status": "DISABLED"}:
+        raise ReportContractError("disabled optional diagnostic summary is invalid")
 
     _validate_schema(exact_predictions, exact_prediction_arrow_schema(), "exact predictions")
     _validate_schema(baseline_predictions, prediction_arrow_schema(), "baseline predictions")
@@ -943,6 +1280,7 @@ def build_report_products(
         },
         "physical_controls": physical_controls,
         "finite_shot": finite_summary,
+        "diagnostic_3photon": diagnostic_3photon,
         "limitations": [
             "no_qpu_execution",
             "no_optical_loss_model",
@@ -955,6 +1293,7 @@ def build_report_products(
         bundle,
         provenance=config.protocol.provenance.value,
         finite_shot=finite_summary,
+        diagnostic_3photon=diagnostic_3photon,
     )
     resource_checkpoint(frame_live_bytes + serialized_live_bytes)
     report_manifest_json = _canonical_json_bytes(report_manifest)

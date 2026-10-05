@@ -31,6 +31,7 @@ NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
 PositiveInt = Annotated[StrictInt, Field(gt=0)]
 PositiveFloat = Annotated[StrictFloat, Field(gt=0)]
 RESERVED_COLUMN_PREFIX = "_pv_pilot_"
+HUMAN_CLEANING_TIMEBOX_HOURS = 10.0
 
 
 class StrictConfigModel(BaseModel):
@@ -139,12 +140,26 @@ class AvailabilityConfig(StrictConfigModel):
     weather: AvailabilitySourceConfig
 
 
+class CleaningConfig(StrictConfigModel):
+    """Frozen declaration of cumulative engineer-hours, separate from compute time."""
+
+    human_cleaning_hours: Annotated[StrictFloat, Field(ge=0)]
+    qc_policy_locked: StrictBool
+
+    @model_validator(mode="after")
+    def reached_timebox_requires_locked_policy(self) -> Self:
+        if self.human_cleaning_hours >= HUMAN_CLEANING_TIMEBOX_HOURS and not self.qc_policy_locked:
+            raise ValueError("QC policy must be locked at or beyond the 10-hour cleaning timebox")
+        return self
+
+
 class DataConfig(StrictConfigModel):
     format: Literal["csv", "parquet"]
     raw_cadence_minutes: StrictInt
     timezone: str = Field(min_length=1)
     columns: ColumnMappings
     availability: AvailabilityConfig
+    cleaning: CleaningConfig | None = None
 
     @model_validator(mode="after")
     def column_roles_are_unique(self) -> Self:
@@ -161,8 +176,7 @@ class DataConfig(StrictConfigModel):
         for role, column in roles:
             if column.startswith(RESERVED_COLUMN_PREFIX):
                 raise ValueError(
-                    f"column mapping {column!r} uses reserved prefix "
-                    f"{RESERVED_COLUMN_PREFIX!r}"
+                    f"column mapping {column!r} uses reserved prefix {RESERVED_COLUMN_PREFIX!r}"
                 )
             if column in seen:
                 raise ValueError(
@@ -262,6 +276,9 @@ class PhotonicsConfig(StrictConfigModel):
     primary_photons: PositiveInt
     max_photons: PositiveInt
     enable_three_photon_profile: StrictBool = False
+    enable_three_photon_benchmark: StrictBool = False
+    three_photon_profile_max_wall_clock_seconds: PositiveInt | None = None
+    three_photon_profile_max_memory_gb: PositiveFloat | None = None
     backend: Literal["SLOS"]
     phase_scales: tuple[PositiveFloat, ...]
     raw_attempt_budgets: tuple[PositiveInt, ...]
@@ -278,10 +295,10 @@ class PhotonicsConfig(StrictConfigModel):
             raise ValueError("primary_photons must be 2")
         if self.max_photons < self.primary_photons or self.max_photons > 3:
             raise ValueError("max_photons must include the primary and cannot exceed 3")
-        if self.enable_three_photon_profile:
-            raise ValueError(
-                "v1 supports only the 2-photon primary; 3-photon profiling is disabled"
-            )
+        if self.enable_three_photon_profile and self.max_photons != 3:
+            raise ValueError("three-photon profile requires max_photons=3")
+        if self.enable_three_photon_benchmark and not self.enable_three_photon_profile:
+            raise ValueError("three-photon benchmark requires enable_three_photon_profile")
         if self.phase_scales != (math.pi / 2, math.pi):
             raise ValueError("phase_scales must be exactly [pi/2, pi]")
         if self.raw_attempt_budgets != (1000, 10000):
@@ -426,10 +443,16 @@ class PilotConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def cross_section_contracts_hold(self) -> Self:
-        if (
-            self.daylight.source is DaylightSource.COLUMN
-            and self.data.columns.daylight is None
+        for configured, cap in (
+            (
+                self.photonics.three_photon_profile_max_wall_clock_seconds,
+                self.resources.max_wall_clock_seconds,
+            ),
+            (self.photonics.three_photon_profile_max_memory_gb, self.resources.max_memory_gb),
         ):
+            if configured is not None and configured > cap:
+                raise ValueError("three-photon profile budget cannot exceed its stage cap")
+        if self.daylight.source is DaylightSource.COLUMN and self.data.columns.daylight is None:
             raise ValueError("column daylight requires data.columns.daylight")
         expected_suffix = f".{self.data.format}"
         if self.paths.input_data.suffix.lower() != expected_suffix:
@@ -452,6 +475,16 @@ class PilotConfig(StrictConfigModel):
         """Return deterministic JSON containing every declared configuration field."""
 
         payload = self.model_dump(mode="json")
+        if payload["data"]["cleaning"] is None:
+            del payload["data"]["cleaning"]
+        # Preserve authenticated snapshots from before the optional extension.
+        for field, default in (
+            ("enable_three_photon_benchmark", False),
+            ("three_photon_profile_max_wall_clock_seconds", None),
+            ("three_photon_profile_max_memory_gb", None),
+        ):
+            if payload["photonics"][field] == default:
+                del payload["photonics"][field]
         input_path = self.paths.input_data
         payload["paths"] = {
             "input_data": {
@@ -553,17 +586,13 @@ class LoadedPilotConfig:
         return self.config.config_hash()
 
 
-def load_config(
-    path: str | Path, project_root: str | Path | None = None
-) -> LoadedPilotConfig:
+def load_config(path: str | Path, project_root: str | Path | None = None) -> LoadedPilotConfig:
     """Load YAML into a scientific config plus immutable operational context."""
 
     config_path = Path(path).resolve()
     if config_path.suffix.lower() not in {".yaml", ".yml"}:
         raise ValueError("pilot configuration must be a YAML file")
-    raw: Any = yaml.load(
-        config_path.read_text(encoding="utf-8"), Loader=UniqueKeySafeLoader
-    )
+    raw: Any = yaml.load(config_path.read_text(encoding="utf-8"), Loader=UniqueKeySafeLoader)
     if not isinstance(raw, dict):
         raise ValueError("pilot configuration root must be a mapping")
     config_dir = config_path.parent

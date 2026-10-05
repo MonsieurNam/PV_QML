@@ -1,8 +1,8 @@
 protocol:
   version: "1.0"
   provenance: real
-  approved_by: Quang
-  approved_at: "2026-09-28T00:00:00Z"
+  approved_by: null
+  approved_at: null
 paths:
   input_data: ../data/pv.csv
   artifact_dir: ../artifacts/pilot-example
@@ -10,6 +10,8 @@ data:
   format: csv
   raw_cadence_minutes: 5
   timezone: Asia/Ho_Chi_Minh
+  # Unknown engineer-hours remain unrecorded. Declare cumulative hours and lock status when known.
+  cleaning: null
   columns:
     site: site_id
     timestamp: timestamp

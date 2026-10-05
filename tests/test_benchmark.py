@@ -350,8 +350,7 @@ def test_photonic_candidate_scaling_fit_and_prediction_share_one_batch(
     )
 
     assert operations == [
-        "photonic-candidate-batch:"
-        f"indistinguishable:m=4:c={math.pi / 2}:seed={seed}:alpha=0.01"
+        f"photonic-candidate-batch:indistinguishable:m=4:c={math.pi / 2}:seed={seed}:alpha=0.01"
     ]
     assert len(rows) == 2
     assert scaler.n_features_in_ == math.comb(4 + 1, 2)
@@ -445,15 +444,26 @@ def _feature_frame() -> pd.DataFrame:
     )
 
 
-def _make_service_run(tmp_path: Path) -> RunStore:
-    project = tmp_path / "project"
+def _make_service_run(
+    tmp_path: Path, *, three_photon: bool = False, profile_memory_gb: float | None = None,
+    optional_benchmark: bool = True,
+) -> RunStore:
+    project = tmp_path / ("p" if three_photon else "project")
     (project / ".git").mkdir(parents=True)
     (project / "configs").mkdir()
     (project / "data").mkdir()
     source = Path(__file__).parents[1] / "configs/pilot.synthetic.yaml"
     payload = yaml.safe_load(source.read_text(encoding="utf-8"))
     payload["paths"] = {"input_data": "../data/input.csv", "artifact_dir": "../artifacts"}
+    if three_photon:
+        payload["paths"]["artifact_dir"] = "../a"
     payload["photonics"]["modes"] = [4]
+    if three_photon:
+        payload["photonics"].update(
+            enable_three_photon_profile=True,
+            enable_three_photon_benchmark=optional_benchmark,
+            three_photon_profile_max_memory_gb=profile_memory_gb,
+        )
     config_path = project / "configs/pilot.yaml"
     config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
     (project / "data/input.csv").write_text("placeholder\n", encoding="utf-8")
@@ -933,9 +943,11 @@ def test_benchmark_service_freezes_before_holdout_and_resumes(
     marker = json.loads((store.root / "benchmark/stage_manifest.json").read_text(encoding="utf-8"))
     assert marker["status"] == "SUCCESS"
     assert marker["details"]["selection_freeze_sha256"] == manifest["selection_freeze_sha256"]
-    assert marker["input_hashes"][".benchmark-holdout-access/cache.parquet"] == (
-        manifest["holdout_audit"]["source_sha256"]
-    ) == manifest["holdout_audit"]["cache_sha256"]
+    assert (
+        marker["input_hashes"][".benchmark-holdout-access/cache.parquet"]
+        == (manifest["holdout_audit"]["source_sha256"])
+        == manifest["holdout_audit"]["cache_sha256"]
+    )
     reject_holdout_hash = True
     store.verify_terminal_stage("benchmark")
 
@@ -949,9 +961,7 @@ def test_benchmark_parses_authenticated_development_snapshot_after_path_replacem
     store = _make_service_run(tmp_path)
     _install_fast_benchmark_service(monkeypatch, services_module, benchmark_module)
     service = DefaultPilotServices()
-    development_path = (
-        store.root / "build-photonic-features/development_photonic_features.parquet"
-    )
+    development_path = store.root / "build-photonic-features/development_photonic_features.parquet"
     original_digest = hashlib.sha256(development_path.read_bytes()).hexdigest()
     original_capture = service._capture_report_artifact
     replaced = False
@@ -971,12 +981,11 @@ def test_benchmark_parses_authenticated_development_snapshot_after_path_replacem
 
     assert replaced is True
     assert result.status is StageStatus.SUCCESS
-    marker = json.loads(
-        (store.root / "benchmark/stage_manifest.json").read_text(encoding="utf-8")
+    marker = json.loads((store.root / "benchmark/stage_manifest.json").read_text(encoding="utf-8"))
+    assert (
+        marker["input_hashes"]["build-photonic-features/development_photonic_features.parquet"]
+        == original_digest
     )
-    assert marker["input_hashes"][
-        "build-photonic-features/development_photonic_features.parquet"
-    ] == original_digest
 
 
 def test_benchmark_holdout_materialization_rejects_mutation_of_open_descriptor(
@@ -1209,9 +1218,7 @@ def test_same_attempt_holdout_journal_mutation_cannot_rebind_consumed_snapshot(
     assert not (store.root / "benchmark/stage_manifest.json").exists()
 
 
-@pytest.mark.parametrize(
-    "tamper", ["intent", "cache", "cache_and_complete", "source_marker"]
-)
+@pytest.mark.parametrize("tamper", ["intent", "cache", "cache_and_complete", "source_marker"])
 def test_holdout_access_tamper_fails_closed_without_source_reopen(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str
 ) -> None:

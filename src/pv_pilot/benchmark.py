@@ -111,9 +111,7 @@ class _ValidatedHoldoutFeatures:
         return self._frame.copy(deep=True)
 
 
-def _holdout_integrity_sha256(
-    frame: pd.DataFrame, resource_checkpoint: ResourceCheckpoint
-) -> str:
+def _holdout_integrity_sha256(frame: pd.DataFrame, resource_checkpoint: ResourceCheckpoint) -> str:
     declared = int(frame.memory_usage(index=True, deep=True).sum())
     resource_checkpoint(declared)
     payload = pickle.dumps(frame, protocol=5)
@@ -144,10 +142,7 @@ def _consume_validated_holdout_features(
 ) -> pd.DataFrame:
     if not isinstance(token, _ValidatedHoldoutFeatures):
         raise PhotonicBenchmarkContractError("validated holdout token is required")
-    if (
-        _holdout_integrity_sha256(token._frame, resource_checkpoint)
-        != token._integrity_sha256
-    ):
+    if _holdout_integrity_sha256(token._frame, resource_checkpoint) != token._integrity_sha256:
         raise PhotonicBenchmarkContractError("validated holdout token integrity check failed")
     declared = int(token._frame.memory_usage(index=True, deep=True).sum())
     result = token._frame.copy(deep=True)
@@ -227,25 +222,26 @@ def _validate_trusted_photonic_contracts(
     config: PilotConfig,
     trusted_circuits: Mapping[tuple[int, int], CircuitDefinition],
     trusted_state_spaces: Mapping[tuple[int, int], tuple[int, str]],
+    photons: int = 2,
 ) -> None:
     expected_circuit_keys = {
         (modes, seed) for modes in config.photonics.modes for seed in config.seeds.circuit_seeds
     }
     if set(trusted_circuits) != expected_circuit_keys:
         raise PhotonicBenchmarkContractError("trusted circuit map is not exact")
-    expected_space_keys = {(modes, 2) for modes in config.photonics.modes}
+    expected_space_keys = {(modes, photons) for modes in config.photonics.modes}
     if set(trusted_state_spaces) != expected_space_keys:
         raise PhotonicBenchmarkContractError("trusted state-space map is not exact")
     for modes in config.photonics.modes:
-        canonical_states = enumerate_fock_states(modes, 2)
+        canonical_states = enumerate_fock_states(modes, photons)
         expected_space = (len(canonical_states), state_order_checksum(canonical_states))
-        if trusted_state_spaces[(modes, 2)] != expected_space:
+        if trusted_state_spaces[(modes, photons)] != expected_space:
             raise PhotonicBenchmarkContractError("trusted state-order contract is not canonical")
         for seed in config.seeds.circuit_seeds:
             circuit = trusted_circuits[(modes, seed)]
             if (
                 circuit.modes != modes
-                or circuit.photons != 2
+                or circuit.photons != photons
                 or circuit.circuit_seed != seed
                 or circuit.state_order_sha256 != expected_space[1]
             ):
@@ -262,8 +258,9 @@ def _validate_development(
     trusted_circuits: Mapping[tuple[int, int], CircuitDefinition],
     trusted_state_spaces: Mapping[tuple[int, int], tuple[int, str]],
     resource_checkpoint: ResourceCheckpoint,
+    photons: int = 2,
 ) -> pd.DataFrame:
-    _validate_trusted_photonic_contracts(config, trusted_circuits, trusted_state_spaces)
+    _validate_trusted_photonic_contracts(config, trusted_circuits, trusted_state_spaces, photons)
     reference = _validate_development_reference(development_reference, config)
     required = {
         "sample_id",
@@ -291,8 +288,8 @@ def _validate_development(
         raise PhotonicBenchmarkContractError("development must contain train and validation")
     if set(work["control"].astype(str)) != set(CONTROLS):
         raise PhotonicBenchmarkContractError("both physical controls are required")
-    if set(work["photons"].astype(int)) != {2}:
-        raise PhotonicBenchmarkContractError("G3 primary selection is fixed to two photons")
+    if set(work["photons"].astype(int)) != {photons}:
+        raise PhotonicBenchmarkContractError("candidate photons do not match the selection role")
     if set(work["modes"].astype(int)) != set(config.photonics.modes):
         raise PhotonicBenchmarkContractError("mode candidate grid is incomplete")
     if set(work["circuit_seed"].astype(int)) != set(config.seeds.circuit_seeds):
@@ -360,7 +357,7 @@ def _validate_development(
         if set(group["sample_id"].astype(str)) != expected_samples:
             raise PhotonicBenchmarkContractError(f"candidate {key!r} is not complete")
         modes, phase_scale, circuit_seed, control = key
-        expected_dimension, expected_state_checksum = trusted_state_spaces[(int(modes), 2)]
+        expected_dimension, expected_state_checksum = trusted_state_spaces[(int(modes), photons)]
         trusted_circuit = trusted_circuits[(int(modes), int(circuit_seed))]
         expected_circuit_checksum = circuit_checksum(trusted_circuit)
         if set(group["dimension"].astype(int)) != {expected_dimension}:
@@ -387,7 +384,7 @@ def _validate_development(
             scaled = trusted_sample.loc[list(feature_columns)].to_numpy(dtype=np.float64)
             expected_probabilities = exact_probabilities(
                 build_circuit(trusted_circuit, scaled, float(phase_scale)),
-                photons=2,
+                photons=photons,
                 control=cast(Control, str(control)),
             )
             declared += int(expected_probabilities.nbytes)
@@ -449,7 +446,7 @@ def _score_seed_origins(
                 "selection_role": selection_role,
                 "config_key": config_key,
                 "modes": modes,
-                "photons": 2,
+                "photons": int(validation["photons"].iloc[0]),
                 "phase_scale": phase_scale,
                 "alpha": alpha,
                 "control": control,
@@ -580,9 +577,26 @@ def select_photonic_models(
     trusted_state_spaces: Mapping[tuple[int, int], tuple[int, str]],
     fit_executor: FitExecutor | None = None,
     resource_checkpoint: ResourceCheckpoint | None = None,
+    diagnostic_photons: int | None = None,
+    authenticated_profile_gate_sha256: str | None = None,
 ) -> PhotonicSelectionResult:
     """Select primary m/c/alpha across every seed and UTC-day validation origin."""
 
+    photons = 2 if diagnostic_photons is None else diagnostic_photons
+    if diagnostic_photons is not None and (
+        diagnostic_photons != 3 or not config.photonics.enable_three_photon_benchmark
+    ):
+        raise PhotonicBenchmarkContractError(
+            "diagnostic photons require frozen three-photon opt-in"
+        )
+    if diagnostic_photons is None and authenticated_profile_gate_sha256 is not None:
+        raise PhotonicBenchmarkContractError("primary selection cannot use the optional profile")
+    if diagnostic_photons == 3 and (
+        not isinstance(authenticated_profile_gate_sha256, str)
+        or len(authenticated_profile_gate_sha256) != 64
+        or any(c not in "0123456789abcdef" for c in authenticated_profile_gate_sha256)
+    ):
+        raise PhotonicBenchmarkContractError("diagnostic selection requires authenticated G2 PASS")
     checkpoint = resource_checkpoint or (lambda _declared: None)
     work = _validate_development(
         development_features,
@@ -591,6 +605,7 @@ def select_photonic_models(
         trusted_circuits=trusted_circuits,
         trusted_state_spaces=trusted_state_spaces,
         resource_checkpoint=checkpoint,
+        photons=photons,
     )
     executor = fit_executor or DirectFitExecutor(lambda _declared: None)
     quantiles = tuple(config.evaluation.quantiles)
@@ -636,7 +651,7 @@ def select_photonic_models(
                     }
                 )
     selected = dict(_select_candidate(candidate_summaries))
-    selected.update({"control": "indistinguishable", "photons": 2})
+    selected.update({"control": "indistinguishable", "photons": photons})
 
     control_candidates: list[dict[str, Any]] = []
     for alpha in config.models.quantile_alpha_grid:
@@ -709,15 +724,14 @@ def select_photonic_models(
                 quantiles,
                 alpha,
                 declared_bytes=(
-                    values.nbytes
-                    + subset["target_ac_power_kw"].to_numpy(dtype=np.float64).nbytes
+                    values.nbytes + subset["target_ac_power_kw"].to_numpy(dtype=np.float64).nbytes
                 ),
             )
             models[(control, seed)] = PhotonicSeedModel(
                 control=control,
                 circuit_seed=seed,
                 modes=int(selected["modes"]),
-                photons=2,
+                photons=photons,
                 phase_scale=float(selected["phase_scale"]),
                 alpha=alpha,
                 scaler=scaler,
@@ -735,7 +749,7 @@ def select_photonic_models(
     manifest_base: dict[str, Any] = {
         "schema_version": "1.0",
         "selection_data": ["train", "validation"],
-        "selection_role": "indistinguishable_primary",
+        "selection_role": "indistinguishable_primary" if photons == 2 else "diagnostic_3photon",
         "seed_policy": "equal_weight_mean_no_best_seed",
         "origin_policy": "utc_calendar_day",
         "origin_ids": sorted(validation_frame["origin_id"].unique().tolist()),
@@ -758,7 +772,11 @@ def select_photonic_models(
         "quantiles": list(quantiles),
         "scaler_policy": "fit_train_once_fixed_for_validation_refit_and_holdout",
         "refit": "heads_only_on_train_plus_validation",
-        "three_photon_profile": "not_enabled/not_evaluated",
+        "three_photon_profile": (
+            "not_enabled/not_evaluated"
+            if photons == 2
+            else {"status": "PASS", "gate_sha256": authenticated_profile_gate_sha256}
+        ),
         "libraries": {
             "numpy": version("numpy"),
             "scikit-learn": version("scikit-learn"),

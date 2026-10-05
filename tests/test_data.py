@@ -327,6 +327,7 @@ def make_run(
     availability_columns: bool = False,
     max_wall_seconds: int = 3600,
     max_memory_gb: float = 8.0,
+    cleaning: dict[str, object] | None = None,
 ) -> tuple[RunStore, Path]:
     project = tmp_path / "project"
     (project / ".git").mkdir(parents=True)
@@ -347,6 +348,8 @@ def make_run(
     }
     payload["data"]["format"] = format_
     payload["data"]["timezone"] = "UTC"
+    if cleaning is not None:
+        payload["data"]["cleaning"] = cleaning
     if availability_columns:
         payload["data"]["availability"] = {
             "power": {"column": "power_available"},
@@ -372,6 +375,55 @@ def read_json(path: Path) -> dict[str, Any]:
     value: object = json.loads(path.read_text(encoding="utf-8"))
     assert isinstance(value, dict)
     return value
+
+
+@pytest.mark.parametrize("branch", ["success", "data_invalid", "resource_invalid"])
+@pytest.mark.parametrize(
+    ("hours", "locked", "timebox_status"),
+    [
+        (None, None, "NOT_RECORDED"),
+        (0.0, False, "WITHIN_TIMEBOX"),
+        (4.25, False, "WITHIN_TIMEBOX"),
+        (10.0, True, "TIMEBOX_REACHED"),
+        (12.0, True, "TIMEBOX_REACHED"),
+    ],
+)
+def test_cleaning_ledger_preserves_declaration_across_terminal_branches_and_resume(
+    tmp_path: Path, branch: str, hours: float | None, locked: bool | None,
+    timebox_status: str,
+) -> None:
+    frame = frame_5m()
+    if branch == "data_invalid":
+        frame["capacity_kw"] = 0.0
+    declaration = (
+        None if hours is None else {"human_cleaning_hours": hours, "qc_policy_locked": locked}
+    )
+    store, _ = make_run(
+        tmp_path, frame, cleaning=declaration,
+        max_memory_gb=0.000001 if branch == "resource_invalid" else 8.0,
+    )
+    service = DefaultPilotServices()
+    first = service.validate_data(store.root)
+    ledger_path = store.root / "validate-data/cleaning_ledger.json"
+    original_bytes = ledger_path.read_bytes()
+    ledger = read_json(ledger_path)
+    expected = StageStatus.SUCCESS if branch == "success" else StageStatus.INVALID
+    assert first.status is expected
+    assert ledger["human_cleaning_hours"] == hours
+    assert ledger["human_cleaning_hours_source"] == (
+        "NOT_RECORDED" if hours is None else "CONFIG_DECLARED"
+    )
+    assert ledger["human_cleaning_timebox_hours"] == 10.0
+    assert ledger["human_cleaning_timebox_status"] == timebox_status
+    assert ledger["qc_policy_locked"] is locked
+    assert ledger["elapsed_seconds"] >= 0
+    assert ledger["timebox_seconds"] == 3600
+    assert service.validate_data(store.root).status is expected
+    assert ledger_path.read_bytes() == original_bytes
+    reopened = RunStore.open(store.root)
+    reopened.verify_terminal_stage(
+        "validate-data", accepted_statuses=frozenset({expected.value.upper()})
+    )
 
 
 def test_validate_data_service_writes_atomic_success_artifacts_and_resumes(

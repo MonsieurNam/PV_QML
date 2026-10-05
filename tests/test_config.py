@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -103,6 +104,61 @@ def test_valid_config_exposes_approval_and_derived_circuit_seeds() -> None:
     assert config.seeds.master_seed == 20260928
     assert len(config.seeds.circuit_seeds) == 5
     assert len(set(config.seeds.circuit_seeds)) == 5
+
+
+@pytest.mark.parametrize(
+    ("hours", "locked"), [(0, False), (4.25, False), (9.5, True), (10, True), (12.0, True)]
+)
+def test_cleaning_declaration_accepts_finite_hours_and_is_frozen(
+    hours: float, locked: bool,
+) -> None:
+    payload = valid_config()
+    payload["data"]["cleaning"] = {"human_cleaning_hours": hours, "qc_policy_locked": locked}
+    config = PilotConfig.model_validate(payload)
+    assert config.data.cleaning is not None
+    assert config.data.cleaning.human_cleaning_hours == hours
+    assert config.data.cleaning.qc_policy_locked is locked
+    assert json.loads(config.canonical_json())["data"]["cleaning"] == {
+        "human_cleaning_hours": hours, "qc_policy_locked": locked,
+    }
+    with pytest.raises(ValidationError):
+        config.data.cleaning.human_cleaning_hours = 1.0
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        {"human_cleaning_hours": value, "qc_policy_locked": True}
+        for value in (-1, float("nan"), float("inf"), float("-inf"), True, False, "1")
+    ]
+    + [
+        {"human_cleaning_hours": 10.0, "qc_policy_locked": False},
+        {"human_cleaning_hours": 11.0, "qc_policy_locked": False},
+        {"human_cleaning_hours": 1.0},
+        {"qc_policy_locked": True},
+        {"human_cleaning_hours": 1.0, "qc_policy_locked": 1},
+    ],
+)
+def test_cleaning_declaration_rejects_invalid_or_unlocked_timebox(
+    declaration: dict[str, object],
+) -> None:
+    payload = valid_config()
+    payload["data"]["cleaning"] = declaration
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(payload)
+
+
+def test_unknown_cleaning_preserves_legacy_canonical_hash_and_load(tmp_path: Path) -> None:
+    payload = valid_config()
+    old = PilotConfig.model_validate(payload)
+    assert old.config_hash() == "cd661f86b45cfd9b64b569f78b000210d781349032d0caa150d79d70652e236c"
+    payload["data"]["cleaning"] = None
+    config_path = tmp_path / "pilot.yaml"
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    explicit_unknown = load_config(config_path, project_root=tmp_path).config
+    assert explicit_unknown.data.cleaning is None
+    assert explicit_unknown.canonical_json() == old.canonical_json()
+    assert "cleaning" not in json.loads(explicit_unknown.canonical_json())["data"]
 
 
 @pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
@@ -465,14 +521,48 @@ def test_example_configs_validate() -> None:
     assert synthetic.config.protocol.provenance.value == "synthetic"
     assert synthetic.config.photonics.max_photons == 3
     assert not real.config.photonics.enable_three_photon_profile
+    assert real.science_decision_allowed is False
     assert not synthetic.config.photonics.enable_three_photon_profile
     assert synthetic.science_decision_allowed is False
 
 
-def test_optional_three_photon_profile_is_explicitly_disabled() -> None:
+def test_real_example_requires_actual_protocol_approval() -> None:
+    example = load_config(Path("configs/pilot.example.yaml"))
+    assert example.config.protocol.approved_by is None
+    assert example.config.protocol.approved_at is None
+    assert example.science_decision_allowed is False
+
+
+def test_three_photon_synthetic_config_is_separately_opted_in() -> None:
+    root = Path(__file__).parents[1]
+    baseline = load_config(root / "configs/pilot.synthetic.yaml")
+    optional = load_config(root / "configs/pilot.synthetic.three-photon.yaml")
+    assert optional.config.photonics.enable_three_photon_profile is True
+    assert optional.config.photonics.enable_three_photon_benchmark is True
+    assert optional.config.photonics.primary_photons == 2
+    assert optional.config.paths.artifact_dir != baseline.config.paths.artifact_dir
+    assert optional.science_decision_allowed is False
+
+
+def test_optional_three_photon_profile_requires_frozen_opt_in() -> None:
     payload = valid_config()
     payload["photonics"]["max_photons"] = 3
     assert not PilotConfig.model_validate(payload).photonics.enable_three_photon_profile
     payload["photonics"]["enable_three_photon_profile"] = True
-    with pytest.raises(ValidationError, match="3-photon profiling is disabled"):
+    assert PilotConfig.model_validate(payload).photonics.enable_three_photon_profile
+    payload["photonics"]["enable_three_photon_benchmark"] = True
+    assert PilotConfig.model_validate(payload).photonics.enable_three_photon_benchmark
+    payload["photonics"]["max_photons"] = 2
+    with pytest.raises(ValidationError, match="max_photons=3"):
+        PilotConfig.model_validate(payload)
+
+
+def test_three_photon_benchmark_requires_profile_and_budget_within_stage_cap() -> None:
+    payload = valid_config()
+    payload["photonics"].update(max_photons=3, enable_three_photon_benchmark=True)
+    with pytest.raises(ValidationError, match=r"requires.*profile"):
+        PilotConfig.model_validate(payload)
+    payload["photonics"]["enable_three_photon_profile"] = True
+    payload["photonics"]["three_photon_profile_max_wall_clock_seconds"] = 3601
+    with pytest.raises(ValidationError, match=r"profile.*stage cap"):
         PilotConfig.model_validate(payload)

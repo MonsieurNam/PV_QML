@@ -123,6 +123,72 @@ def test_absolute_lags_never_bridge_gaps_or_sites() -> None:
     assert b_row["power_lag_60m_kw"] == 1006.0
 
 
+@pytest.mark.parametrize("gap", ["00:50", "01:35", "01:40"])
+def test_sample_window_requires_every_same_site_interval(gap: str) -> None:
+    frame = canonical_frame(sites=("A", "B"))
+    frame = frame[
+        ~(
+            frame["site_id"].eq("A")
+            & frame["interval_end_utc"].eq(pd.Timestamp(f"2025-01-01T{gap}:00Z"))
+        )
+    ]
+    result = build_feature_splits(frame, pilot_config())
+    issue = pd.Timestamp("2025-01-01T01:30:00Z")
+    features = result.features.set_index(["site_id", "issued_at_utc"])
+    assert ("A", issue) not in features.index
+    assert ("B", issue) in features.index
+    excluded = result.exclusions.set_index(["site_id", "issued_at_utc"])
+    assert excluded.loc[("A", issue), "reason"] == "noncontiguous_sample_window"
+
+
+@pytest.mark.parametrize("gap", ["00:25", "01:50"])
+def test_gap_outside_inclusive_sample_window_does_not_exclude(gap: str) -> None:
+    frame = canonical_frame()
+    frame = frame[~frame["interval_end_utc"].eq(pd.Timestamp(f"2025-01-01T{gap}:00Z"))]
+    result = build_feature_splits(frame, pilot_config())
+    assert pd.Timestamp("2025-01-01T01:30:00Z") in set(result.features["issued_at_utc"])
+
+
+@pytest.mark.parametrize(
+    ("gap", "reason"), [("00:30", "missing_power_lag"), ("01:45", "missing_target")]
+)
+def test_sample_window_endpoint_gaps_keep_existing_reasons(gap: str, reason: str) -> None:
+    frame = canonical_frame()
+    frame = frame[~frame["interval_end_utc"].eq(pd.Timestamp(f"2025-01-01T{gap}:00Z"))]
+    result = build_feature_splits(frame, pilot_config())
+    excluded = result.exclusions.set_index("issued_at_utc")
+    assert excluded.loc[pd.Timestamp("2025-01-01T01:30:00Z"), "reason"] == reason
+
+
+def test_contiguity_uses_observed_rows_with_bounded_multiyear_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = pd.concat(
+        [canonical_frame(periods=16), canonical_frame(start="2035-01-01", periods=16)]
+    ).reset_index(drop=True)
+    frame["sample_id"] = [f"sample-{index}" for index in frame.index]
+    allocations: list[int] = []
+
+    def forbid_calendar(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("continuity must not expand a calendar range")
+
+    monkeypatch.setattr(pd, "date_range", forbid_calendar)
+    result = build_feature_splits(frame, pilot_config(), resource_checkpoint=allocations.append)
+
+    assert pd.Timestamp("2025-01-01T01:00:00Z") in set(result.features["issued_at_utc"])
+    assert max(allocations) < 200_000
+    assert result.feature_manifest["contiguity_policy"] == {
+        "site_key": "site_id",
+        "cadence_minutes": 5,
+        "window_start_lag_minutes": 60,
+        "window_end_horizon_minutes": 15,
+        "endpoints_inclusive": True,
+        "requires": "every_canonical_interval_in_one_contiguous_block",
+        "future_intervals_used_for": "retrospective_target_eligibility_only",
+        "interpolation": False,
+    }
+
+
 def test_availability_equality_is_accepted_and_delays_are_excluded() -> None:
     frame = canonical_frame()
     delayed_current = pd.Timestamp("2025-01-01T01:25:00Z")
@@ -558,6 +624,9 @@ def test_resource_limit_during_build_publishes_bounded_invalid(
     ledger = read_json(store.root / "build-splits/resource_ledger.json")
     assert ledger["resource_status"] == "EXCEEDED"
     assert (store.root / "build-splits/feature_matrix.parquet").stat().st_size != 0
+    manifest = read_json(store.root / "build-splits/feature_manifest.json")
+    reference = build_feature_splits(canonical_frame(), pilot_config())
+    assert manifest["contiguity_policy"] == reference.feature_manifest["contiguity_policy"]
 
 
 def test_serialization_contract_error_uses_independent_invalid_path(

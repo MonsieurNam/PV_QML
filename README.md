@@ -42,6 +42,16 @@ Validation checks the configured wall-clock and memory limits around source mate
 quality control, serialization, and final publication. Exceeding a cap discards candidate outputs
 and publishes a bounded typed `INVALID` diagnostic bundle without reapplying the expired cap.
 
+Human cleaning uses a separate fixed 10 engineer-hour timebox. Optional `data.cleaning` declares
+cumulative `human_cleaning_hours` (finite and nonnegative) and boolean `qc_policy_locked`; for
+example, `cleaning: {human_cleaning_hours: 4.5, qc_policy_locked: false}`. At or above 10 hours,
+the QC policy must be locked before a run can start. Retain valid canonical blocks without
+interpolation; each feature sample requires every same-site 5-minute interval from t-60 through
+t+15, inclusive. Future interval continuity is retrospective target eligibility only.
+Omitting cleaning or setting it to null records `NOT_RECORDED`, including synthetic runs;
+compute wall-clock time never supplies engineer-hours. Changing a declaration requires a new
+run, and resumed immutable ledgers retain their original declaration.
+
 The bundled fixture is synthetic and exists only for software acceptance:
 
 ```powershell
@@ -80,10 +90,12 @@ PDFs, documentation, and bytecode caches do not affect the source inventory. The
 acceptance verifier can inspect historical artifacts after execution provenance has changed.
 
 The v1 primary scientific contract uses two photons and retains a hard cap of three photons.
-Optional three-photon profiling is explicitly disabled (`enable_three_photon_profile: false`);
-enabling it fails configuration validation until its resource gate and profile artifacts are
-implemented. Validation origins are UTC calendar days; they are blocked scoring groups over
-fixed train/validation partitions, not rolling refits.
+Optional three-photon profiling and benchmarking require explicit frozen opt-ins and are
+diagnostic only. `configs/pilot.synthetic.three-photon.yaml` enables both in a separate artifact
+directory. The three-photon resource gate must pass before benchmark selection; both selections
+freeze before one shared holdout materialization. The report keeps three-photon results separate
+from the GO/STOP decision. Validation origins are UTC calendar days; they are blocked scoring
+groups over fixed train/validation partitions, not rolling refits.
 
 `configs/pilot.example.yaml` carries the real-pilot caps (12 hours and 24 GiB per stage). The
 synthetic CI configuration deliberately retains its smaller acceptance-only caps.

@@ -43,6 +43,7 @@ from pv_pilot.domain import (
     CompletionKind,
     DetailEntry,
     ScientificDecision,
+    ScoreBundle,
     StageResult,
     StageStatus,
     deterministic_data,
@@ -723,6 +724,52 @@ def test_report_is_read_only_blocked_for_synthetic_and_resumable(
     after = {path.name: sha256_file(path) for path in (store.root / "report").iterdir()}
     assert resumed.status is StageStatus.BLOCKED
     assert before == after
+
+
+def test_report_marks_disabled_three_photon_diagnostic_without_changing_decision(
+    tmp_path: Path,
+) -> None:
+    store = _make_completed_run(tmp_path)
+    result = DefaultPilotServices().report(store.root)
+    manifest = json.loads((store.root / "report/report_manifest.json").read_text())
+    decision = json.loads((store.root / "report/decision.json").read_text())
+    markdown = (store.root / "report/report.md").read_text()
+
+    assert result.status is StageStatus.BLOCKED
+    assert manifest["selected_primary"]["photons"] == 2
+    assert manifest["scientific_decision"] == decision["scientific_decision"] == "not_evaluated"
+    assert manifest["diagnostic_3photon"] == {
+        "profile_status": "DISABLED", "benchmark_status": "DISABLED"
+    }
+    assert "Three-photon diagnostic" in markdown
+    assert "DISABLED" in markdown
+
+
+def test_three_photon_markdown_identifies_diagnostic_selection_and_joint_freeze() -> None:
+    diagnostic = {
+        "profile_status": "PASS",
+        "benchmark_status": "EVALUATED",
+        "selected": {"modes": 4, "photons": 3, "phase_scale": 1.5707963267948966, "alpha": 0.01},
+        "seed_scores": [
+            {"control": control, "circuit_seed": seed, "normalized_wis": 0.125}
+            for control in ("indistinguishable", "distinguishable")
+            for seed in range(5)
+        ],
+        "state_dimensions": [20, 56],
+        "joint_selection_freeze_sha256": "a" * 64,
+    }
+    markdown = reporting_module._render_markdown(
+        ScoreBundle(success_rate=0, fallback_rate=0),
+        provenance="synthetic",
+        finite_shot={"budgets": [1000, 10000]},
+        diagnostic_3photon=diagnostic,
+    )
+    assert "Selected modes/photons: 4/3" in markdown
+    assert "Per-seed scores: 10" in markdown
+    assert "State dimensions: [20, 56]" in markdown
+    assert "indistinguishable seed 0: 0.12500000" in markdown
+    assert f"Joint holdout freeze: {'a' * 64}" in markdown
+    assert "excluded from GO/STOP" in markdown
 
 
 def test_report_tamper_is_detected_without_recomputation(tmp_path: Path) -> None:
@@ -2154,6 +2201,57 @@ def test_report_provenance_cannot_swap_between_digest_and_parse(
     ).hexdigest()
     assert report_manifest["provenance"]["code"] == original_payload["git"]
     assert swapped is False
+
+
+def test_report_inventory_uses_captured_config_after_transient_path_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    store = _make_completed_run(tmp_path)
+    expected = frozenset(store.report_input_inventory())
+    config_path = store.root / "config.json"
+    original = config_path.read_bytes()
+    changed = json.loads(original)
+    changed["photonics"]["enable_three_photon_profile"] = True
+    replacement = json.dumps(changed, sort_keys=True, separators=(",", ":")).encode()
+    real_capture = DefaultPilotServices._capture_report_artifact
+    real_read = RunStore._read_json_file
+    captured_config = False
+
+    def capture_then_replace(
+        run_store: RunStore, relative: str, digest: str | None,
+        guard: object, live_bytes: int,
+    ) -> tuple[bytes, int]:
+        nonlocal captured_config
+        result = real_capture(run_store, relative, digest, guard, live_bytes)  # type: ignore[arg-type]
+        if relative == "config.json":
+            config_path.write_bytes(replacement)
+            captured_config = True
+        return result
+
+    def reject_config_reopen(path: Path) -> dict[str, Any]:
+        if path == config_path:
+            raise AssertionError("captured config path was reopened")
+        return real_read(path)
+
+    monkeypatch.setattr(
+        DefaultPilotServices, "_capture_report_artifact", staticmethod(capture_then_replace)
+    )
+    monkeypatch.setattr(RunStore, "_read_json_file", staticmethod(reject_config_reopen))
+    guard = service_module._ResourceGuard(
+        started=time.perf_counter(), wall_seconds=600, memory_bytes=1024**3
+    )
+    try:
+        config, captured, _, _, inventory, _ = DefaultPilotServices._capture_report_provenance(
+            store, guard
+        )
+    finally:
+        config_path.write_bytes(original)
+    assert captured_config
+    assert captured["config.json"] == original
+    assert config.config_hash() == store.config_hash
+    assert inventory == expected
 
 
 def test_report_rejects_transient_base_provenance_swap_during_capture(

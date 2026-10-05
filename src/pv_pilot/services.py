@@ -22,16 +22,19 @@ from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import uuid4
 
+import numpy as np
 import pandas as pd
 import psutil
 import pyarrow as pa
 import pyarrow.parquet as pq
+from sklearn.preprocessing import StandardScaler
 
 from . import baselines as baseline_models
 from . import benchmark as photonic_benchmark
 from . import photonics as photonic_features
+from . import three_photon as optional_photonics
 from .artifacts import RunStore, authenticated_snapshot, sha256_file
-from .config import PilotConfig, load_config
+from .config import HUMAN_CLEANING_TIMEBOX_HOURS, PilotConfig, load_config
 from .data import (
     CANONICAL_SCHEMA_VERSION,
     DataContractError,
@@ -71,6 +74,7 @@ from .splits import (
     empty_clip_metrics,
     feature_dataframe_parquet_bytes,
     feature_schema_sha256,
+    sample_contiguity_policy,
     split_exclusion_dataframe_parquet_bytes,
 )
 
@@ -415,6 +419,58 @@ class DefaultPilotServices:
             ensure_ascii=False,
             allow_nan=False,
         ).encode("utf-8")
+
+    @staticmethod
+    def _verify_optional_model_roundtrip(
+        payload: bytes,
+        originals: dict[tuple[str, int], photonic_benchmark.PhotonicSeedModel],
+        guard: _ResourceGuard,
+        live_bytes: int,
+    ) -> None:
+        """Validate the trusted producer's pickle before its bytes become an artifact."""
+        guard.checkpoint(live_bytes + len(payload))
+        try:
+            restored = pickle.loads(payload)
+            if not isinstance(restored, dict) or set(restored) != set(originals):
+                raise ValueError("model inventory changed")
+            for key, original in originals.items():
+                model = restored[key]
+                if not isinstance(model, photonic_benchmark.PhotonicSeedModel):
+                    raise ValueError("model type changed")
+                if (
+                    not isinstance(model.scaler, StandardScaler)
+                    or not isinstance(model.heads, baseline_models.QuantileHeads)
+                ):
+                    raise ValueError("model scaler or heads type changed")
+                for field in (
+                    "control", "circuit_seed", "modes", "photons", "phase_scale",
+                    "alpha", "circuit_sha256",
+                ):
+                    if getattr(model, field) != getattr(original, field):
+                        raise ValueError(f"model {field} changed")
+                if model.heads.quantiles != original.heads.quantiles:
+                    raise ValueError("model quantiles changed")
+                for field in ("mean_", "scale_", "var_", "n_features_in_", "n_samples_seen_"):
+                    if not np.array_equal(
+                        getattr(model.scaler, field), getattr(original.scaler, field)
+                    ):
+                        raise ValueError(f"model scaler {field} changed")
+                if len(model.heads.estimators) != len(original.heads.estimators):
+                    raise ValueError("model heads changed")
+                for head, source in zip(
+                    model.heads.estimators, original.heads.estimators, strict=True
+                ):
+                    if pickle.dumps(head, protocol=5) != pickle.dumps(source, protocol=5):
+                        raise ValueError("model head coefficients changed")
+            if pickle.dumps(originals, protocol=5) != payload:
+                raise ValueError("model persistence is nondeterministic")
+        except (
+            pickle.UnpicklingError, EOFError, TypeError, AttributeError, ValueError, KeyError
+        ) as error:
+            raise photonic_benchmark.PhotonicBenchmarkContractError(
+                f"optional model serialization round-trip failed: {error}"
+            ) from error
+        guard.checkpoint(live_bytes + len(payload))
 
     @classmethod
     def _run_config(cls, store: RunStore) -> PilotConfig:
@@ -785,7 +841,7 @@ class DefaultPilotServices:
             stage_manifests[stage] = capture(relative)
             stage_hashes[stage] = digests[relative]
         inventory = store.report_input_inventory_from_captured_manifests(
-            stage_manifests, stage_hashes
+            stage_manifests, stage_hashes, captured_config=config
         )
         return config, captured, digests, stage_manifests, inventory, live_bytes
 
@@ -970,6 +1026,28 @@ class DefaultPilotServices:
         return result
 
     @staticmethod
+    def _human_cleaning_ledger(config: PilotConfig) -> dict[str, object]:
+        """Record declared engineer-hours without deriving them from process runtime."""
+
+        cleaning = config.data.cleaning
+        hours = None if cleaning is None else cleaning.human_cleaning_hours
+        return {
+            "human_cleaning_hours": hours,
+            "human_cleaning_hours_source": (
+                "NOT_RECORDED" if cleaning is None else "CONFIG_DECLARED"
+            ),
+            "human_cleaning_timebox_hours": HUMAN_CLEANING_TIMEBOX_HOURS,
+            "human_cleaning_timebox_status": (
+                "NOT_RECORDED"
+                if hours is None
+                else "TIMEBOX_REACHED"
+                if hours >= HUMAN_CLEANING_TIMEBOX_HOURS
+                else "WITHIN_TIMEBOX"
+            ),
+            "qc_policy_locked": None if cleaning is None else cleaning.qc_policy_locked,
+        }
+
+    @staticmethod
     def _publish_resource_invalid(
         *,
         store: RunStore,
@@ -1010,7 +1088,7 @@ class DefaultPilotServices:
         }
         ledger = {
             "elapsed_seconds": elapsed,
-            "human_cleaning_hours": None,
+            **DefaultPilotServices._human_cleaning_ledger(config),
             "peak_declared_bytes_observed": guard.peak_declared_bytes,
             "peak_rss_bytes_observed": guard.peak_rss_bytes,
             "resource_status": "EXCEEDED",
@@ -1281,7 +1359,7 @@ class DefaultPilotServices:
                 elapsed = time.perf_counter() - started
                 ledger = {
                     "elapsed_seconds": elapsed,
-                    "human_cleaning_hours": None,
+                    **self._human_cleaning_ledger(config),
                     "peak_declared_bytes_observed": guard.peak_declared_bytes,
                     "peak_rss_bytes_observed": guard.peak_rss_bytes,
                     "resource_status": resource_status,
@@ -1367,6 +1445,7 @@ class DefaultPilotServices:
             "schema_version": FEATURE_SCHEMA_VERSION,
             "status": StageStatus.INVALID.value,
             "scientific_decision": "NOT_EVALUATED",
+            "contiguity_policy": sample_contiguity_policy(),
             "split_counts": {"train": 0, "validation": 0, "test": 0},
             "exclusion_counts": {},
             "partitions": {
@@ -2314,6 +2393,14 @@ class DefaultPilotServices:
                 DetailEntry(key="holdout_opened", value=False),
             ),
         )
+        optional_profile: optional_photonics.ProfileBundle | None = None
+        if config.photonics.enable_three_photon_profile:
+            profile_started = time.perf_counter()
+            optional_profile = optional_photonics.build_profile(
+                development, config, input_hashes=input_hashes
+            )
+            # The optional measured budget is separate from the exact primary resource gate.
+            guard.started += time.perf_counter() - profile_started
         try:
             with store.stage(
                 "build-photonic-features",
@@ -2336,10 +2423,23 @@ class DefaultPilotServices:
                 for path, payload in sorted(circuit_payloads.items()):
                     transaction.write_bytes(path, payload)
                 transaction.write_json("feature_manifest.json", feature_manifest)
+                if optional_profile is not None:
+                    transaction.write_bytes(
+                        "three-photon/development_features.parquet", optional_profile.feature_bytes
+                    )
+                    transaction.write_json(
+                        "three-photon/state_spaces.json", optional_profile.state_spaces
+                    )
+                    transaction.write_json(
+                        "three-photon/circuit_manifest.json", optional_profile.circuit_manifest
+                    )
+                    transaction.write_json("three-photon/resource_gate.json", optional_profile.gate)
+                    for path, payload in sorted(optional_profile.circuit_payloads.items()):
+                        transaction.write_bytes(path, payload)
                 guard.checkpoint(declared)
                 ledger.update(
                     {
-                        "wall_clock_seconds": time.perf_counter() - started,
+                        "wall_clock_seconds": time.perf_counter() - guard.started,
                         "peak_rss_bytes": guard.peak_rss_bytes,
                         "peak_declared_bytes": guard.peak_declared_bytes,
                     }
@@ -2356,6 +2456,210 @@ class DefaultPilotServices:
                 prerequisite_manifest_hash=split_marker_hash,
             )
         return result
+
+    def _capture_three_photon_selection(
+        self,
+        *,
+        store: RunStore,
+        config: PilotConfig,
+        task7_hashes: dict[str, str],
+        task7_inputs: dict[str, str],
+        development_reference: pd.DataFrame,
+        guard: _ResourceGuard,
+        fit_executor: baseline_models.FitExecutor,
+        captured_input_hashes: dict[str, str],
+    ) -> tuple[
+        dict[str, Any],
+        photonic_benchmark.PhotonicSelectionResult | None,
+        dict[tuple[int, int], photonic_features.CircuitDefinition],
+        dict[tuple[int, int], tuple[int, str]],
+        tuple[str, ...],
+    ]:
+        if not config.photonics.enable_three_photon_profile:
+            return {"profile_status": "DISABLED", "benchmark_status": "DISABLED"}, None, {}, {}, ()
+        payloads: dict[str, bytes] = {}
+        live = 0
+        for path in optional_photonics.PROFILE_FIXED_PATHS:
+            expected = task7_hashes.get(path)
+            if expected is None:
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "enabled three-photon profile artifact is missing"
+                )
+            payload, live = self._capture_report_artifact(store, path, expected, guard, live)
+            payloads[path] = payload
+            captured_input_hashes[path] = expected
+        gate_path, feature_path, state_path, circuit_path = optional_photonics.PROFILE_FIXED_PATHS
+        def optional_object(path: str) -> dict[str, Any]:
+            try:
+                return self._object_from_captured(payloads[path], path)
+            except ValueError as error:
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    f"optional JSON artifact is invalid: {path}"
+                ) from error
+
+        gate = optional_object(gate_path)
+        summary = {
+            "label": "diagnostic_3photon",
+            "profile_status": gate.get("status"),
+            "benchmark_status": "DISABLED",
+            "used_for_go_stop": False,
+            "profile_gate_sha256": task7_hashes[gate_path],
+            "resource_gate": gate,
+        }
+        circuits: dict[tuple[int, int], photonic_features.CircuitDefinition] = {}
+        circuit_manifest = optional_object(circuit_path)
+        state_manifest = optional_object(state_path)
+        if gate.get("status") == "FAIL":
+            if (
+                config.photonics.enable_three_photon_benchmark
+                or gate.get("schema_version") != "1.0"
+                or gate.get("photons") != 3
+                or gate.get("config_sha256") != config.config_hash()
+                or gate.get("input_hashes") != task7_inputs
+                or gate.get("holdout_opened") is not False
+                or gate.get("partition") != "development_only"
+                or gate.get("failure_gate") not in {
+                    "wall_clock", "memory_rss", "dataframe_or_output_bytes",
+                    "preflight_projected_wall_clock",
+                }
+                or gate.get("row_count") != 0
+                or "feature_sha256" in gate
+                or circuit_manifest != {"schema_version": "1.0", "circuits": []}
+                or state_manifest != {"schema_version": "1.0", "spaces": []}
+                or payloads[feature_path] != photonic_features.feature_parquet_bytes(pd.DataFrame())
+            ):
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "failed optional profile evidence is invalid"
+                )
+            return summary, None, {}, {}, tuple(optional_photonics.PROFILE_FIXED_PATHS)
+        records = circuit_manifest.get("circuits")
+        if not isinstance(records, list):
+            raise photonic_benchmark.PhotonicBenchmarkContractError("optional circuit list invalid")
+        paths = list(optional_photonics.PROFILE_FIXED_PATHS)
+        expected_circuit_keys = {
+            (modes, seed) for modes in config.photonics.modes
+            for seed in config.seeds.circuit_seeds
+        }
+
+        def valid_digest(value: object) -> bool:
+            return (
+                isinstance(value, str) and len(value) == 64
+                and all(character in "0123456789abcdef" for character in value)
+            )
+
+        for record in records:
+            if not isinstance(record, dict):
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "optional circuit record invalid"
+                )
+            optional_path = record.get("path")
+            modes, photons, seed = (
+                record.get(name) for name in ("modes", "photons", "circuit_seed")
+            )
+            if (
+                type(modes) is not int or type(photons) is not int or type(seed) is not int
+                or (modes, seed) not in expected_circuit_keys
+                or photons != 3
+                or not isinstance(optional_path, str)
+                or optional_path != (
+                    f"{optional_photonics.PROFILE_PREFIX}/circuits/m{modes}-n3-seed{seed}.npz"
+                )
+                or optional_path not in task7_hashes
+                or optional_path in paths
+                or not valid_digest(record.get("npz_sha256"))
+                or not valid_digest(record.get("circuit_sha256"))
+                or not valid_digest(record.get("state_order_sha256"))
+            ):
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "optional circuit record invalid"
+                )
+            payload, live = self._capture_report_artifact(
+                store, optional_path, task7_hashes[optional_path], guard, live
+            )
+            captured_input_hashes[optional_path] = task7_hashes[optional_path]
+            paths.append(optional_path)
+            try:
+                circuit = photonic_features.load_circuit_npz(payload)
+            except photonic_features.PhotonicContractError as error:
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "optional circuit archive invalid"
+                ) from error
+            if (
+                circuit.photons != 3
+                or hashlib.sha256(payload).hexdigest() != record["npz_sha256"]
+                or photonic_features.circuit_checksum(circuit) != record["circuit_sha256"]
+                or circuit.state_order_sha256 != record["state_order_sha256"]
+                or circuit.modes != modes
+                or circuit.circuit_seed != seed
+                or (circuit.modes, circuit.circuit_seed) in circuits
+            ):
+                raise photonic_benchmark.PhotonicBenchmarkContractError("optional circuit invalid")
+            circuits[(circuit.modes, circuit.circuit_seed)] = circuit
+        if set(circuits) != expected_circuit_keys:
+            raise photonic_benchmark.PhotonicBenchmarkContractError(
+                "optional circuit grid incomplete"
+            )
+        spaces = state_manifest.get("spaces")
+        if not isinstance(spaces, list):
+            raise photonic_benchmark.PhotonicBenchmarkContractError("optional state list invalid")
+        states: dict[tuple[int, int], tuple[int, str]] = {}
+        for record in spaces:
+            if not isinstance(record, dict):
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "optional state record invalid"
+                )
+            modes, photons, dimension = (
+                record.get(name) for name in ("modes", "photons", "dimension")
+            )
+            if (
+                type(modes) is not int or type(photons) is not int
+                or type(dimension) is not int or modes not in config.photonics.modes
+                or photons != 3 or (modes, photons) in states
+            ):
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "optional state record invalid"
+                )
+            canonical_states = photonic_features.enumerate_fock_states(modes, 3)
+            checksum = photonic_features.state_order_checksum(canonical_states)
+            if (
+                dimension != len(canonical_states)
+                or record.get("states") != [list(state) for state in canonical_states]
+                or record.get("state_order_sha256") != checksum
+            ):
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "optional state order invalid"
+                )
+            states[(modes, photons)] = (dimension, checksum)
+        if set(states) != {(modes, 3) for modes in config.photonics.modes}:
+            raise photonic_benchmark.PhotonicBenchmarkContractError(
+                "optional state grid incomplete"
+            )
+        selection = None
+        if config.photonics.enable_three_photon_benchmark:
+            try:
+                optional_photonics.require_profile_pass(
+                    gate, config, payloads[feature_path], task7_inputs
+                )
+            except photonic_features.PhotonicContractError as error:
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "three-photon benchmark requires authenticated G2 profile PASS"
+                ) from error
+            selection = photonic_benchmark.select_photonic_models(
+                pd.read_parquet(io.BytesIO(payloads[feature_path])),
+                config,
+                diagnostic_photons=3,
+                authenticated_profile_gate_sha256=task7_hashes[gate_path],
+                development_reference=development_reference,
+                trusted_circuits=circuits,
+                trusted_state_spaces=states,
+                fit_executor=fit_executor,
+                resource_checkpoint=guard.checkpoint,
+            )
+            summary.update(
+                benchmark_status="SELECTED",
+                selection_freeze_sha256=selection.selection_manifest["selection_freeze_sha256"],
+            )
+        return summary, selection, circuits, states, tuple(paths)
 
     def benchmark(self, run_dir: Path) -> StageResult:
         started = time.perf_counter()
@@ -2560,6 +2864,34 @@ class DefaultPilotServices:
             freeze_hash = selection.selection_manifest["selection_freeze_sha256"]
             if not isinstance(freeze_hash, str) or len(freeze_hash) != 64:
                 raise RuntimeError("photonic selection did not produce a freeze hash")
+            (
+                optional_summary,
+                optional_selection,
+                optional_circuits,
+                optional_states,
+                optional_paths,
+            ) = self._capture_three_photon_selection(
+                store=store,
+                config=config,
+                task7_hashes=task7_hashes,
+                task7_inputs=cast(dict[str, str], task7_inputs),
+                development_reference=development_reference,
+                guard=guard,
+                fit_executor=fit_executor,
+                captured_input_hashes=captured_input_hashes,
+            )
+            access_freeze_hash = freeze_hash
+            if optional_selection is not None:
+                access_freeze_hash = hashlib.sha256(
+                    self._benchmark_json_bytes(
+                        {
+                            "primary_2photon": freeze_hash,
+                            "diagnostic_3photon": optional_selection.selection_manifest[
+                                "selection_freeze_sha256"
+                            ],
+                        }
+                    )
+                ).hexdigest()
 
             # All holdout-bound verification is deliberately below the immutable freeze.
             guard.checkpoint(declared)
@@ -2701,7 +3033,7 @@ class DefaultPilotServices:
                     source_relative=holdout_relative,
                     source_sha256=holdout_sha256,
                     split_marker_sha256=split_marker_hash,
-                    selection_freeze_sha256=freeze_hash,
+                    selection_freeze_sha256=access_freeze_hash,
                     guard=guard,
                     declared_bytes=declared,
                 )
@@ -2770,6 +3102,152 @@ class DefaultPilotServices:
             )
             if len(exact_predictions) != expected_exact_feature_rows:
                 raise RuntimeError("exact holdout predictions are incomplete")
+            optional_payloads: dict[str, bytes] = {}
+            if optional_selection is not None:
+                optional_modes = int(optional_selection.selected["modes"])
+                optional_exact = photonic_benchmark.build_holdout_photonic_features(
+                    holdout,
+                    selected=optional_selection.selected,
+                    circuits={
+                        seed: optional_circuits[(optional_modes, seed)]
+                        for seed in config.seeds.circuit_seeds
+                    },
+                    trusted_state_space=optional_states[(optional_modes, 3)],
+                    resource_checkpoint=guard.checkpoint,
+                )
+                diagnostic_predictions, diagnostic_details = photonic_benchmark.predict_exact(
+                    optional_exact,
+                    optional_selection.selected_models,
+                    tuple(config.evaluation.quantiles),
+                    fit_executor=fit_executor,
+                    resource_checkpoint=guard.checkpoint,
+                )
+                if len(diagnostic_predictions) != expected_exact_feature_rows:
+                    raise RuntimeError("optional exact predictions are incomplete")
+                optional_summary.update(
+                    benchmark_status="EVALUATED",
+                    used_for_go_stop=False,
+                    joint_selection_freeze_sha256=access_freeze_hash,
+                    prediction_rows=len(diagnostic_predictions),
+                )
+                diagnostic_scores = baseline_models.normalized_wis(
+                    diagnostic_predictions["target_ac_power_kw"].to_numpy(),
+                    diagnostic_predictions.loc[
+                        :,
+                        list(baseline_models.quantile_columns(tuple(config.evaluation.quantiles))),
+                    ].to_numpy(),
+                    diagnostic_predictions["capacity_kw"].to_numpy(),
+                    tuple(config.evaluation.quantiles),
+                )
+                metric_frame = diagnostic_predictions.loc[:, ["control", "circuit_seed"]].copy()
+                metric_frame["normalized_wis"] = diagnostic_scores
+                metrics = {
+                    "schema_version": "1.0",
+                    "label": "diagnostic_3photon",
+                    "used_for_go_stop": False,
+                    "scientific_decision": "NOT_EVALUATED",
+                    "synthetic": config.protocol.provenance is DataProvenance.SYNTHETIC,
+                    "seed_policy": "equal_weight_mean_no_best_seed",
+                    "seed_scores": metric_frame.groupby(
+                        ["control", "circuit_seed"], as_index=False
+                    )["normalized_wis"]
+                    .agg(normalized_wis="mean", row_count="size")
+                    .to_dict(orient="records"),
+                    "exact_holdout": diagnostic_details,
+                    "selection_freeze_sha256": optional_summary["selection_freeze_sha256"],
+                    "joint_selection_freeze_sha256": access_freeze_hash,
+                }
+                optional_feature_frame = optional_exact.frame
+                optional_frame_bytes = {
+                    "validation_scores": int(
+                        optional_selection.validation_scores.memory_usage(
+                            index=True, deep=True
+                        ).sum()
+                    ),
+                    "holdout_features": int(
+                        optional_feature_frame.memory_usage(index=True, deep=True).sum()
+                    ),
+                    "exact_predictions": int(
+                        diagnostic_predictions.memory_usage(index=True, deep=True).sum()
+                    ),
+                }
+                optional_live_bytes = (
+                    declared + sum(optional_frame_bytes.values()) + len(baseline_prediction_bytes)
+                )
+                guard.checkpoint(optional_live_bytes)
+
+                def optional_serialize(name: str, producer: Callable[[], bytes]) -> bytes:
+                    nonlocal optional_live_bytes
+                    guard.checkpoint(optional_live_bytes + 2 * optional_frame_bytes.get(name, 0))
+                    payload, optional_live_bytes = self._serialize_benchmark_payload(
+                        f"diagnostic_3photon/{name}", producer,
+                        guard=guard, live_bytes=optional_live_bytes,
+                    )
+                    return payload
+
+                optional_payloads["selection_manifest.json"] = optional_serialize(
+                    "selection_manifest",
+                    lambda: self._benchmark_json_bytes(optional_selection.selection_manifest),
+                )
+                optional_payloads["validation_scores.parquet"] = optional_serialize(
+                    "validation_scores",
+                    lambda: photonic_benchmark.parquet_bytes(
+                        optional_selection.validation_scores,
+                        photonic_benchmark.validation_score_arrow_schema(),
+                    ),
+                )
+                optional_payloads["holdout_features.parquet"] = optional_serialize(
+                    "holdout_features",
+                    lambda: photonic_features.feature_parquet_bytes(optional_feature_frame),
+                )
+                optional_payloads["exact_predictions.parquet"] = optional_serialize(
+                    "exact_predictions",
+                    lambda: photonic_benchmark.parquet_bytes(
+                        diagnostic_predictions, photonic_benchmark.exact_prediction_arrow_schema()
+                    ),
+                )
+                optional_model_bytes = optional_serialize(
+                    "models",
+                    lambda: photonic_benchmark.model_pickle_bytes(
+                        optional_selection.selected_models
+                    ),
+                )
+                self._verify_optional_model_roundtrip(
+                    optional_model_bytes, optional_selection.selected_models,
+                    guard, optional_live_bytes,
+                )
+                optional_payloads["models.pkl"] = optional_model_bytes
+                metrics["model_inventory"] = {
+                    "models_sha256": hashlib.sha256(optional_model_bytes).hexdigest(),
+                    "model_keys": [
+                        f"{control}:seed={seed}"
+                        for control, seed in sorted(optional_selection.selected_models)
+                    ],
+                    "models": [
+                        {
+                            "control": control,
+                            "circuit_seed": seed,
+                            "modes": model.modes,
+                            "photons": model.photons,
+                            "phase_scale": model.phase_scale,
+                            "alpha": model.alpha,
+                            "circuit_sha256": model.circuit_sha256,
+                            "quantiles": list(model.heads.quantiles),
+                        }
+                        for (control, seed), model in sorted(
+                            optional_selection.selected_models.items()
+                        )
+                    ],
+                    "serialization_roundtrip_verified": True,
+                    "holdout_reinference_for_serialization": False,
+                }
+                optional_payloads["metrics.json"] = optional_serialize(
+                    "metrics", lambda: self._benchmark_json_bytes(metrics)
+                )
+                declared += sum(optional_frame_bytes.values()) + sum(
+                    map(len, optional_payloads.values())
+                )
+                guard.checkpoint(declared)
             finite_counts = photonic_benchmark.finite_shot_screen(
                 exact_features,
                 tuple(config.photonics.raw_attempt_budgets),
@@ -2908,7 +3386,7 @@ class DefaultPilotServices:
             {
                 "holdout_audit": {
                     **holdout_access_audit,
-                    "opened_after_selection_freeze_sha256": freeze_hash,
+                    "opened_after_selection_freeze_sha256": access_freeze_hash,
                     "materialization_count": 1,
                     "prediction_passes": 1,
                     "row_count": len(holdout),
@@ -2931,6 +3409,16 @@ class DefaultPilotServices:
                 "scientific_decision": "NOT_EVALUATED",
             }
         )
+        if optional_selection is not None:
+            selection_manifest["holdout_audit"]["selection_freezes"] = {
+                "primary_2photon": freeze_hash,
+                "diagnostic_3photon": optional_selection.selection_manifest[
+                    "selection_freeze_sha256"
+                ],
+            }
+            selection_manifest["baseline_predictions"][
+                "opened_after_selection_freeze_sha256"
+            ] = access_freeze_hash
         model_sha256 = hashlib.sha256(model_bytes).hexdigest()
         model_manifest = {
             "schema_version": "1.0",
@@ -2957,6 +3445,8 @@ class DefaultPilotServices:
                 "used_for_go_stop": False,
             },
         }
+        if config.photonics.enable_three_photon_profile:
+            diagnostics["diagnostic_3photon"] = optional_summary
         guard.sample_without_enforcement()
         ledger = {
             "schema_version": "1.0",
@@ -3003,6 +3493,7 @@ class DefaultPilotServices:
             feature_manifest_relative,
             state_spaces_relative,
             *trusted_circuit_paths,
+            *optional_paths,
             development_reference_relative,
             "build-splits/feature_manifest.json",
             "build-splits/stage_manifest.json",
@@ -3017,6 +3508,7 @@ class DefaultPilotServices:
                 feature_manifest_relative,
                 state_spaces_relative,
                 *trusted_circuit_paths,
+                *optional_paths,
             ),
         }
         try:
@@ -3094,6 +3586,8 @@ class DefaultPilotServices:
                 transaction.write_bytes("models/photonic_models.pkl", model_bytes)
                 transaction.write_bytes("models/manifest.json", model_manifest_bytes)
                 transaction.write_bytes("diagnostics.json", diagnostics_bytes)
+                for name, payload in optional_payloads.items():
+                    transaction.write_bytes(f"diagnostic_3photon/{name}", payload)
                 transaction.write_bytes("resource_ledger.json", ledger_bytes)
                 transaction.write_bytes("stage_result.json", result_bytes)
         except _ResourceLimitExceeded as error:
@@ -3816,6 +4310,21 @@ class DefaultPilotServices:
                     "versions": versions,
                     "baseline_selection": baseline_selection,
                     "baseline_model_manifest": baseline_model_manifest,
+                    "optional_artifacts": {
+                        path: captured[path]
+                        for path in sorted(captured)
+                        if path in optional_photonics.PROFILE_FIXED_PATHS
+                        or path.startswith(f"{optional_photonics.PROFILE_PREFIX}/circuits/")
+                        or path in (
+                            optional_photonics.DIAGNOSTIC_PATHS[0],
+                            optional_photonics.DIAGNOSTIC_PATHS[3],
+                            optional_photonics.DIAGNOSTIC_PATHS[4],
+                            optional_photonics.DIAGNOSTIC_PATHS[-1],
+                        )
+                    },
+                    "profile_input_hashes": stage_manifests[
+                        "build-photonic-features"
+                    ]["input_hashes"],
                 }
                 executor = _ReportProcessExecutor(
                     deadline_monotonic=time.monotonic()

@@ -20,8 +20,9 @@ from types import TracebackType
 from typing import Any, BinaryIO, Literal, Self
 from uuid import uuid4
 
-from .config import LoadedPilotConfig
+from .config import LoadedPilotConfig, PilotConfig
 from .seeds import SeedManager
+from .three_photon import DIAGNOSTIC_PATHS, PROFILE_FIXED_PATHS, PROFILE_PREFIX
 
 SCHEMA_VERSION = "1.0"
 Clock = Callable[[], datetime]
@@ -190,9 +191,16 @@ def _validate_selected_output_shape(
     photonic = set(normalized["build-photonic-features"])
     if not photonic >= _BENCHMARK_PHOTONIC_REQUIRED_OUTPUTS:
         raise ValueError("benchmark photonic allowlist is missing required outputs")
-    circuit_paths = photonic - _BENCHMARK_PHOTONIC_REQUIRED_OUTPUTS
+    optional_fixed = photonic & set(PROFILE_FIXED_PATHS)
+    if optional_fixed and optional_fixed != set(PROFILE_FIXED_PATHS):
+        raise ValueError("benchmark optional profile allowlist is incomplete")
+    circuit_paths = photonic - _BENCHMARK_PHOTONIC_REQUIRED_OUTPUTS - optional_fixed
     if not circuit_paths or any(
-        not path.startswith("build-photonic-features/circuits/") or not path.endswith(".npz")
+        not (
+            path.startswith("build-photonic-features/circuits/")
+            or path.startswith(f"{PROFILE_PREFIX}/circuits/")
+        )
+        or not path.endswith(".npz")
         for path in circuit_paths
     ):
         raise ValueError("benchmark photonic allowlist has invalid circuit outputs")
@@ -633,7 +641,28 @@ class RunStore:
             and str(record.get("path")).startswith("build-photonic-features/circuits/")
             and str(record.get("path")).endswith(".npz")
         }
-        expected_photonic = _BENCHMARK_PHOTONIC_REQUIRED_OUTPUTS | declared_circuits
+        frozen_config = self._read_json_file(self.root / "config.json")
+        photonics = frozen_config.get("photonics", {})
+        optional_paths = {
+            str(record.get("path"))
+            for record in outputs
+            if isinstance(record, dict)
+            and (
+                str(record.get("path")) in PROFILE_FIXED_PATHS
+                or (
+                    str(record.get("path")).startswith(f"{PROFILE_PREFIX}/circuits/")
+                    and str(record.get("path")).endswith(".npz")
+                )
+            )
+        }
+        if photonics.get("enable_three_photon_profile"):
+            if not set(PROFILE_FIXED_PATHS) <= optional_paths:
+                raise ValueError("enabled optional profile inventory is incomplete")
+        elif optional_paths:
+            raise ValueError("disabled optional profile has unexpected outputs")
+        expected_photonic = (
+            _BENCHMARK_PHOTONIC_REQUIRED_OUTPUTS | declared_circuits | optional_paths
+        )
         actual_photonic = set(normalized_allowlist["build-photonic-features"])
         if not declared_circuits or actual_photonic != expected_photonic:
             raise ValueError(
@@ -1415,6 +1444,24 @@ class RunStore:
     def _expected_report_inputs_and_verify_lineage(self) -> frozenset[str]:
         """Derive the exact report input inventory and bind Task 8 to upstream outputs."""
 
+        config_payload = json.loads(self.read_authenticated("config.json"))
+        if not isinstance(config_payload, dict) or not isinstance(
+            config_payload.get("paths"), dict
+        ):
+            raise ValueError("authenticated config snapshot is invalid")
+        config_paths = config_payload["paths"]
+        if any(
+            not isinstance(config_paths.get(key), dict)
+            or not isinstance(config_paths[key].get("value"), str)
+            for key in ("input_data", "artifact_dir")
+        ):
+            raise ValueError("authenticated config paths are invalid")
+        config_payload["paths"] = {
+            key: config_paths[key]["value"] for key in ("input_data", "artifact_dir")
+        }
+        captured_config = PilotConfig.model_validate(config_payload)
+        if captured_config.config_hash() != self.config_hash:
+            raise ValueError("authenticated config does not reproduce its hash")
         self._verify_stage_marker_only("benchmark")
         marker_by_stage: dict[str, Mapping[str, object]] = {}
         marker_hashes: dict[str, str] = {}
@@ -1439,12 +1486,16 @@ class RunStore:
             marker_by_stage[stage] = marker
             marker_hashes[stage] = sha256_file(marker_path)
 
-        return self.report_input_inventory_from_captured_manifests(marker_by_stage, marker_hashes)
+        return self.report_input_inventory_from_captured_manifests(
+            marker_by_stage, marker_hashes, captured_config=captured_config
+        )
 
     def report_input_inventory_from_captured_manifests(
         self,
         marker_by_stage: Mapping[str, Mapping[str, object]],
         marker_hashes: Mapping[str, str],
+        *,
+        captured_config: PilotConfig,
     ) -> frozenset[str]:
         """Validate captured marker snapshots without reopening their paths."""
 
@@ -1487,6 +1538,25 @@ class RunStore:
         }
         if not circuit_paths:
             raise ValueError("photonic output marker has no circuit inventory")
+        optional_profile_paths = {
+            path
+            for path in output_by_stage["build-photonic-features"]
+            if path in PROFILE_FIXED_PATHS
+            or (path.startswith(f"{PROFILE_PREFIX}/circuits/") and path.endswith(".npz"))
+        }
+        diagnostic_paths = set(output_by_stage["benchmark"]) & set(DIAGNOSTIC_PATHS)
+        if captured_config.config_hash() != self.config_hash:
+            raise ValueError("captured report config hash does not match the run")
+        photonics = captured_config.photonics
+        if (
+            bool(optional_profile_paths) != photonics.enable_three_photon_profile
+            or (optional_profile_paths and not set(PROFILE_FIXED_PATHS) <= optional_profile_paths)
+            or (
+                diagnostic_paths
+                != (set(DIAGNOSTIC_PATHS) if photonics.enable_three_photon_benchmark else set())
+            )
+        ):
+            raise ValueError("optional report inventory does not match frozen opt-ins")
 
         benchmark_inputs = marker_by_stage["benchmark"].get("input_hashes")
         if not isinstance(benchmark_inputs, dict) or any(
@@ -1498,6 +1568,7 @@ class RunStore:
             *_BENCHMARK_BASELINE_OUTPUTS,
             *_BENCHMARK_PHOTONIC_REQUIRED_OUTPUTS,
             *circuit_paths,
+            *optional_profile_paths,
         }
         exact_benchmark_inputs = upstream_paths | set(_BENCHMARK_INTERNAL_INPUTS)
         if set(benchmark_inputs) != exact_benchmark_inputs:
@@ -1511,7 +1582,9 @@ class RunStore:
             digest = benchmark_inputs[path]
             if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
                 raise ValueError("benchmark internal input checksum is invalid")
-        return frozenset({*_REPORT_FIXED_INPUTS, *circuit_paths})
+        return frozenset(
+            {*_REPORT_FIXED_INPUTS, *circuit_paths, *optional_profile_paths, *diagnostic_paths}
+        )
 
     @staticmethod
     def _verify_report_output_inventory(manifest: Mapping[str, object]) -> None:
@@ -1920,6 +1993,12 @@ class RunStore:
                             report_preverified
                             and (
                                 relative in _REPORT_FIXED_INPUTS
+                                or relative in PROFILE_FIXED_PATHS
+                                or relative in DIAGNOSTIC_PATHS
+                                or (
+                                    relative.startswith(f"{PROFILE_PREFIX}/circuits/")
+                                    and relative.endswith(".npz")
+                                )
                                 or (
                                     relative.startswith("build-photonic-features/circuits/")
                                     and relative.endswith(".npz")
@@ -1958,7 +2037,16 @@ class RunStore:
                 for path in inputs
                 if path.startswith("build-photonic-features/circuits/") and path.endswith(".npz")
             }
-            captured_report_inputs = frozenset({*_REPORT_FIXED_INPUTS, *report_circuits})
+            optional_report_inputs = {
+                path
+                for path in inputs
+                if path in PROFILE_FIXED_PATHS
+                or path in DIAGNOSTIC_PATHS
+                or (path.startswith(f"{PROFILE_PREFIX}/circuits/") and path.endswith(".npz"))
+            }
+            captured_report_inputs = frozenset(
+                {*_REPORT_FIXED_INPUTS, *report_circuits, *optional_report_inputs}
+            )
             if (
                 stage == _REPORT_SELECTED_STAGE
                 and (

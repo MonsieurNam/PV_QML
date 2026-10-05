@@ -52,6 +52,7 @@ FEATURE_SCHEMA_VERSION = "1.0"
 _SPLIT_NAMES = ("train", "validation", "test")
 _EXPECTED_POWER_LAGS = (0, 5, 10, 15, 30, 60)
 _ESTIMATED_LOOKUP_ENTRY_BYTES = 256
+_ESTIMATED_CONTIGUITY_ENTRY_BYTES = 256
 _ESTIMATED_FEATURE_RECORD_BYTES = 2048
 _ESTIMATED_EXCLUSION_RECORD_BYTES = 512
 
@@ -282,6 +283,21 @@ def empty_clip_metrics() -> dict[str, Any]:
     }
 
 
+def sample_contiguity_policy() -> dict[str, object]:
+    """Describe continuity eligibility consistently in successful and invalid manifests."""
+
+    return {
+        "site_key": "site_id",
+        "cadence_minutes": 5,
+        "window_start_lag_minutes": 60,
+        "window_end_horizon_minutes": 15,
+        "endpoints_inclusive": True,
+        "requires": "every_canonical_interval_in_one_contiguous_block",
+        "future_intervals_used_for": "retrospective_target_eligibility_only",
+        "interpolation": False,
+    }
+
+
 def _exclusion_record(row: pd.Series, reason: str, detail: str) -> dict[str, Any]:
     return {
         "sample_id": str(row["sample_id"]),
@@ -326,14 +342,31 @@ def build_feature_splits(
     solar = _solar_geometry(work, config)
     for column in solar.columns:
         work[column] = solar[column]
-    lookup = {
-        (str(row.site_id), pd.Timestamp(row.interval_end_utc)): row
-        for row in work.itertuples(index=False)
-    }
     static_declared_bytes = int(work.memory_usage(index=True, deep=True).sum())
-    static_declared_bytes += len(lookup) * _ESTIMATED_LOOKUP_ENTRY_BYTES
+    static_declared_bytes += len(work) * (
+        _ESTIMATED_LOOKUP_ENTRY_BYTES + _ESTIMATED_CONTIGUITY_ENTRY_BYTES
+    )
     if resource_checkpoint is not None:
         resource_checkpoint(static_declared_bytes)
+    lookup: dict[tuple[str, pd.Timestamp], Any] = {}
+    blocks: dict[tuple[str, pd.Timestamp], int] = {}
+    previous_site: str | None = None
+    previous_at: pd.Timestamp | None = None
+    block = 0
+    # Only observed canonical rows are indexed; elapsed calendar span allocates nothing.
+    for observation in work.itertuples(index=False):
+        site = str(observation.site_id)
+        observed_at = pd.Timestamp(observation.interval_end_utc)
+        if (
+            site != previous_site
+            or previous_at is None
+            or observed_at - previous_at != timedelta(minutes=5)
+        ):
+            block += 1
+        key = (site, observed_at)
+        lookup[key] = observation
+        blocks[key] = block
+        previous_site, previous_at = site, observed_at
     horizon = timedelta(minutes=15)
     output_rows: list[dict[str, Any]] = []
     exclusions: list[dict[str, Any]] = []
@@ -405,6 +438,17 @@ def build_feature_splits(
                     row,
                     "missing_power_lag",
                     f"no exact same-site observation at lag {missing_lag} minutes",
+                )
+            )
+            continue
+        site = str(row["site_id"])
+        oldest_at = issued_at - timedelta(minutes=60)
+        if not blocks[(site, oldest_at)] == blocks[(site, issued_at)] == blocks[(site, target_at)]:
+            exclusions.append(
+                _exclusion_record(
+                    row,
+                    "noncontiguous_sample_window",
+                    "same-site canonical intervals must be continuous from t-60 through t+15",
                 )
             )
             continue
@@ -510,6 +554,7 @@ def build_feature_splits(
         },
         "availability_policy": "all_predictors_available_at_or_before_issued_at",
         "target_availability_used": False,
+        "contiguity_policy": sample_contiguity_policy(),
         "matched4_columns": list(MATCHED4_COLUMNS),
         "matched6_columns": list(MATCHED6_COLUMNS),
         "xgb_columns": xgb_columns,

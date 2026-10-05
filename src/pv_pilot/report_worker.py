@@ -16,7 +16,7 @@ import pyarrow as pa
 
 from .config import PilotConfig
 from .evaluation import EvaluationContractError
-from .reporting import ReportContractError, build_report_products
+from .reporting import ReportContractError, build_report_products, optional_report_summary
 
 _INPUT_NAMES = {
     "exact": "exact_predictions.parquet",
@@ -199,6 +199,13 @@ def run_report_worker(request: Mapping[str, Any]) -> dict[str, Any]:
             input_handles[finite_name], snapshot_sha256[finite_name], name=finite_name
         )
         config = PilotConfig.model_validate(request.get("config"))
+        optional_summary = optional_report_summary(
+            config,
+            request["optional_artifacts"],
+            request["selection_manifest"],
+            request["profile_input_hashes"],
+            primary_exact=exact,
+        )
         products = build_report_products(
             config=config,
             exact_predictions=exact,
@@ -215,6 +222,7 @@ def run_report_worker(request: Mapping[str, Any]) -> dict[str, Any]:
             versions=request["versions"],
             baseline_selection=request["baseline_selection"],
             baseline_model_manifest=request["baseline_model_manifest"],
+            optional_summary=optional_summary,
             initial_live_bytes=0,
             resource_checkpoint=_ignore_resource_checkpoint,
         )
