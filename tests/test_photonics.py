@@ -618,6 +618,39 @@ def test_service_rejects_tampered_development_input_without_stage_marker(tmp_pat
     assert not (store.root / "build-photonic-features/stage_manifest.json").exists()
 
 
+def test_photonic_stage_parses_authenticated_snapshot_after_path_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _make_photonic_run(tmp_path)
+    service = DefaultPilotServices()
+    development_path = store.root / "build-splits/development_features.parquet"
+    original_digest = hashlib.sha256(development_path.read_bytes()).hexdigest()
+    original_capture = service._capture_report_artifact
+    replaced = False
+
+    def capture_then_replace(*args: Any, **kwargs: Any) -> tuple[bytes, int]:
+        nonlocal replaced
+        payload, live = original_capture(*args, **kwargs)
+        if kwargs.get("relative_path") == "build-splits/development_features.parquet":
+            development_path.write_bytes(b"replacement-after-capture")
+            replaced = True
+        return payload, live
+
+    monkeypatch.setattr(service, "_capture_report_artifact", capture_then_replace)
+    result = service.build_photonic_features(store.root)
+
+    assert replaced is True
+    assert result.status is StageStatus.SUCCESS
+    marker = json.loads(
+        (store.root / "build-photonic-features/stage_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert marker["input_hashes"][
+        "build-splits/development_features.parquet"
+    ] == original_digest
+
+
 def test_success_resume_rejects_marker_downgrade_to_invalid(tmp_path: Path) -> None:
     store = _make_photonic_run(tmp_path)
     result = DefaultPilotServices().build_photonic_features(store.root)

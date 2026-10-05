@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -441,6 +442,35 @@ def test_build_splits_service_publishes_and_resumes(tmp_path: Path) -> None:
     assert read_json(store.root / "build-splits/stage_result.json")["status"] == "success"
 
 
+def test_build_splits_parses_authenticated_descriptor_snapshot_after_path_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = make_run(tmp_path, canonical_frame())
+    service = DefaultPilotServices()
+    assert service.validate_data(store.root).status is StageStatus.SUCCESS
+    canonical_path = store.root / "validate-data/canonical.parquet"
+    original_digest = hashlib.sha256(canonical_path.read_bytes()).hexdigest()
+    original_capture = service._capture_report_artifact
+    replaced = False
+
+    def capture_then_replace(*args: Any, **kwargs: Any) -> tuple[bytes, int]:
+        nonlocal replaced
+        payload, live = original_capture(*args, **kwargs)
+        relative = kwargs.get("relative_path")
+        if relative == "validate-data/canonical.parquet":
+            canonical_path.write_bytes(b"replacement-after-capture")
+            replaced = True
+        return payload, live
+
+    monkeypatch.setattr(service, "_capture_report_artifact", capture_then_replace)
+    result = service.build_splits(store.root)
+
+    assert replaced is True
+    assert result.status is StageStatus.SUCCESS
+    marker = read_json(store.root / "build-splits/stage_manifest.json")
+    assert marker["input_hashes"]["validate-data/canonical.parquet"] == original_digest
+
+
 def test_empty_validation_split_is_durable_invalid(tmp_path: Path) -> None:
     store = make_run(tmp_path, canonical_frame(periods=14))
     service = DefaultPilotServices()
@@ -469,7 +499,7 @@ def test_canonical_tamper_before_build_is_rejected(tmp_path: Path) -> None:
     assert not (store.root / "build-splits/stage_manifest.json").exists()
 
 
-def test_canonical_tamper_during_commit_rolls_back_outputs(
+def test_authenticated_canonical_snapshot_is_not_reopened_during_commit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import inspect
@@ -500,11 +530,11 @@ def test_canonical_tamper_during_commit_rolls_back_outputs(
 
     monkeypatch.setattr(RunStore, "_validated_target", tamper_on_commit)
 
-    with pytest.raises(ValueError, match="stage input changed"):
-        service.build_splits(store.root)
+    result = service.build_splits(store.root)
 
-    assert not (store.root / "build-splits/stage_manifest.json").exists()
-    assert not (store.root / "build-splits/feature_matrix.parquet").exists()
+    assert result.status is StageStatus.SUCCESS
+    assert tampered is False
+    assert (store.root / "build-splits/stage_manifest.json").is_file()
 
 
 def test_resource_limit_during_build_publishes_bounded_invalid(

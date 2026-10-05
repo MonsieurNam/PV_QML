@@ -388,8 +388,8 @@ def _make_completed_run(tmp_path: Path) -> RunStore:
         "quantile_columns": list(Q_COLUMNS),
         "selection_data": ["train", "validation"],
         "tie_tolerance": 1e-12,
-        "test_access": "after_selection_freeze_once",
-        "test_prediction_passes": 1,
+        "holdout_access": "benchmark_only_after_photonic_freeze",
+        "test_prediction_passes": 0,
         "selected": baseline_selected,
         "candidates": [],
         "seeds": {
@@ -403,16 +403,8 @@ def _make_completed_run(tmp_path: Path) -> RunStore:
     with store.stage("train-baselines") as transaction:
         transaction.write_json(
             "selection_manifest.json",
-            {
-                **baseline_selection_base,
-                "selection_freeze_sha256": baseline_freeze,
-                "holdout_audit": {
-                    "opened_after_selection_freeze_sha256": baseline_freeze,
-                    "prediction_passes": 1,
-                },
-            },
+            {**baseline_selection_base, "selection_freeze_sha256": baseline_freeze},
         )
-        transaction.write_bytes("predictions.parquet", prediction_parquet_bytes(baseline))
         transaction.write_bytes("validation_scores.parquet", b"validation")
         transaction.write_json("diagnostics.json", {"schema_version": "1.0"})
         transaction.write_bytes("models/baseline_models.pkl", b"models")
@@ -519,7 +511,11 @@ def _make_completed_run(tmp_path: Path) -> RunStore:
     store.write_json(access_paths[2], {"state": "COMPLETE"})
     circuit_paths = tuple(str(record["path"]) for record in circuits)
     benchmark_allowlist = {
-        "train-baselines": ("train-baselines/predictions.parquet",),
+        "train-baselines": (
+            "train-baselines/selection_manifest.json",
+            "train-baselines/models/baseline_models.pkl",
+            "train-baselines/models/manifest.json",
+        ),
         "build-photonic-features": (
             "build-photonic-features/development_photonic_features.parquet",
             "build-photonic-features/circuit_manifest.json",
@@ -531,6 +527,9 @@ def _make_completed_run(tmp_path: Path) -> RunStore:
     benchmark_inputs = (
         *benchmark_allowlist["train-baselines"],
         *benchmark_allowlist["build-photonic-features"],
+        "build-splits/development_features.parquet",
+        "build-splits/feature_manifest.json",
+        "build-splits/stage_manifest.json",
         *access_paths,
     )
     validation_records: list[dict[str, Any]] = []
@@ -586,15 +585,20 @@ def _make_completed_run(tmp_path: Path) -> RunStore:
                     "prediction_passes": 1,
                 },
                 "baseline_predictions": {
-                    "path": "train-baselines/predictions.parquet",
-                    "sha256": sha256_file(store.root / "train-baselines/predictions.parquet"),
-                    "policy": "immutable_reuse_no_retrain_no_repredict",
+                    "path": "benchmark/baseline_predictions.parquet",
+                    "sha256": hashlib.sha256(
+                        prediction_parquet_bytes(baseline)
+                    ).hexdigest(),
+                    "policy": "same_authenticated_holdout_after_photonic_freeze",
                 },
                 "scientific_decision": "NOT_EVALUATED",
             },
         )
         transaction.write_bytes("validation_scores.parquet", b"scores")
         transaction.write_bytes("holdout_photonic_features.parquet", b"features")
+        transaction.write_bytes(
+            "baseline_predictions.parquet", prediction_parquet_bytes(baseline)
+        )
         transaction.write_bytes(
             "exact_predictions.parquet",
             parquet_bytes(exact, benchmark_module.exact_prediction_arrow_schema()),
@@ -1765,7 +1769,7 @@ def test_report_evaluation_checkpoint_counts_source_frames_with_captured_inputs(
         int(pd.read_parquet(store.root / relative).memory_usage(index=True, deep=True).sum())
         for relative in (
             "benchmark/exact_predictions.parquet",
-            "train-baselines/predictions.parquet",
+            "benchmark/baseline_predictions.parquet",
             "benchmark/finite_shot_predictions.parquet",
         )
     )
@@ -1795,7 +1799,7 @@ def test_report_evaluation_checkpoint_counts_source_frames_with_captured_inputs(
 
     config = DefaultPilotServices._run_config(store)
     exact = pd.read_parquet(store.root / "benchmark/exact_predictions.parquet")
-    baseline = pd.read_parquet(store.root / "train-baselines/predictions.parquet")
+    baseline = pd.read_parquet(store.root / "benchmark/baseline_predictions.parquet")
     finite = pd.read_parquet(store.root / "benchmark/finite_shot_predictions.parquet")
     def read_json(relative: str) -> dict[str, Any]:
         value: object = json.loads((store.root / relative).read_text(encoding="utf-8"))
@@ -2048,7 +2052,7 @@ def test_report_rejects_benchmark_marker_input_hash_not_anchored_upstream(
     store = _make_completed_run(tmp_path)
     marker_path = store.root / "benchmark/stage_manifest.json"
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    marker["input_hashes"]["train-baselines/predictions.parquet"] = "0" * 64
+    marker["input_hashes"]["benchmark/baseline_predictions.parquet"] = "0" * 64
     marker_path.write_text(
         json.dumps(marker, sort_keys=True, separators=(",", ":")), encoding="utf-8"
     )
@@ -2297,6 +2301,9 @@ def test_report_rejects_frozen_selection_or_model_lineage_drift(
         benchmark_marker = json.loads(benchmark_marker_path.read_text(encoding="utf-8"))
         benchmark_marker["prerequisite_manifest_hashes"][stage] = sha256_file(
             store.root / f"{stage}/stage_manifest.json"
+        )
+        benchmark_marker["input_hashes"][relative] = sha256_file(
+            store.root / relative
         )
         benchmark_marker_path.write_text(
             json.dumps(benchmark_marker, sort_keys=True, separators=(",", ":")),

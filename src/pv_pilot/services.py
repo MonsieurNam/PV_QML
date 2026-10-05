@@ -25,13 +25,12 @@ from uuid import uuid4
 import pandas as pd
 import psutil
 import pyarrow as pa
-import pyarrow.dataset as pds
 import pyarrow.parquet as pq
 
 from . import baselines as baseline_models
 from . import benchmark as photonic_benchmark
 from . import photonics as photonic_features
-from .artifacts import RunStore, sha256_file
+from .artifacts import RunStore, authenticated_snapshot, sha256_file
 from .config import PilotConfig, load_config
 from .data import (
     CANONICAL_SCHEMA_VERSION,
@@ -188,25 +187,24 @@ class DefaultPilotServices:
             or path_stat.st_size > max_bytes
         ):
             raise ValueError("benchmark holdout journal file is unsafe")
-        return path.read_bytes()
+        return authenticated_snapshot(path, root=root)
 
     @classmethod
-    def _safe_private_object(cls, path: Path, *, root: Path) -> dict[str, Any]:
+    def _safe_private_object(cls, path: Path, *, root: Path) -> tuple[dict[str, Any], str]:
         try:
-            payload: object = json.loads(
-                cls._safe_private_bytes(path, root=root, max_bytes=64 * 1024).decode("utf-8")
-            )
+            captured = cls._safe_private_bytes(path, root=root, max_bytes=64 * 1024)
+            payload: object = json.loads(captured.decode("utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError("benchmark holdout journal JSON is invalid") from error
         if not isinstance(payload, dict):
             raise ValueError("benchmark holdout journal JSON must be an object")
-        return payload
+        return payload, hashlib.sha256(captured).hexdigest()
 
     @staticmethod
     def _holdout_sample_order_sha256(frame: pd.DataFrame) -> str:
-        payload = json.dumps(
-            frame["sample_id"].astype(str).tolist(), separators=(",", ":")
-        ).encode("utf-8")
+        payload = json.dumps(frame["sample_id"].astype(str).tolist(), separators=(",", ":")).encode(
+            "utf-8"
+        )
         return hashlib.sha256(payload).hexdigest()
 
     def _materialize_benchmark_holdout_source(
@@ -220,23 +218,16 @@ class DefaultPilotServices:
         """Read, checksum, and decode the immutable source through one file open."""
 
         del self
-        guard.checkpoint(declared_bytes)
-        path_stat = path.lstat()
-        if (
-            path.is_symlink()
-            or not stat.S_ISREG(path_stat.st_mode)
-            or path_stat.st_nlink != 1
-        ):
-            raise ValueError("physical holdout source is not a safe regular file")
-        payload = path.read_bytes()
+        payload = authenticated_snapshot(
+            path,
+            expected_sha256=expected_sha256,
+            checkpoint=guard.checkpoint,
+            live_bytes=declared_bytes,
+        )
         live_bytes = declared_bytes + len(payload)
         guard.checkpoint(live_bytes)
-        if hashlib.sha256(payload).hexdigest() != expected_sha256:
-            raise ValueError("physical holdout checksum does not match its trusted marker")
         frame = pd.read_parquet(io.BytesIO(payload))
-        guard.checkpoint(
-            live_bytes + int(frame.memory_usage(index=True, deep=True).sum())
-        )
+        guard.checkpoint(live_bytes + int(frame.memory_usage(index=True, deep=True).sum()))
         return _MaterializedHoldout(frame=frame, source_bytes=payload)
 
     def _load_or_materialize_benchmark_holdout(
@@ -250,7 +241,7 @@ class DefaultPilotServices:
         selection_freeze_sha256: str,
         guard: _ResourceGuard,
         declared_bytes: int,
-    ) -> tuple[pd.DataFrame, dict[str, Any], tuple[str, ...]]:
+    ) -> tuple[pd.DataFrame, dict[str, Any], dict[str, str]]:
         access_relative = ".benchmark-holdout-access"
         access_root = store.root / access_relative
         if access_root.exists() or access_root.is_symlink():
@@ -276,7 +267,7 @@ class DefaultPilotServices:
         cache_path = access_root / "cache.parquet"
         complete_path = access_root / "complete.json"
         if intent_path.exists() or intent_path.is_symlink():
-            intent = self._safe_private_object(intent_path, root=store.root)
+            intent, intent_sha256 = self._safe_private_object(intent_path, root=store.root)
             if any(intent.get(key) != value for key, value in expected_identity.items()):
                 raise ValueError("benchmark holdout intent identity changed")
             access_id = intent.get("access_id")
@@ -290,17 +281,14 @@ class DefaultPilotServices:
                 raise _HoldoutAccessIndeterminate(
                     "holdout INTENT exists without durable COMPLETE; a new run is required"
                 )
-            complete = self._safe_private_object(complete_path, root=store.root)
+            complete, complete_sha256 = self._safe_private_object(complete_path, root=store.root)
             expected_complete_identity = {
                 **expected_identity,
                 "access_id": access_id,
                 "transaction_id": access_id,
                 "state": "COMPLETE",
             }
-            if any(
-                complete.get(key) != value
-                for key, value in expected_complete_identity.items()
-            ):
+            if any(complete.get(key) != value for key, value in expected_complete_identity.items()):
                 raise ValueError("benchmark holdout COMPLETE identity changed")
             cache_bytes = self._safe_private_bytes(
                 cache_path, root=store.root, max_bytes=guard.memory_bytes
@@ -311,10 +299,9 @@ class DefaultPilotServices:
                 raise ValueError(
                     "benchmark holdout cache is not anchored to the trusted source checksum"
                 )
-            if (
-                complete.get("cache_kind") != "exact_source_snapshot"
-                or cache_sha256 != complete.get("cache_sha256")
-            ):
+            if complete.get(
+                "cache_kind"
+            ) != "exact_source_snapshot" or cache_sha256 != complete.get("cache_sha256"):
                 raise ValueError("benchmark holdout cache checksum mismatch")
             holdout = pd.read_parquet(io.BytesIO(cache_bytes))
             guard.checkpoint(
@@ -335,11 +322,11 @@ class DefaultPilotServices:
             return (
                 holdout,
                 audit,
-                (
-                    f"{access_relative}/intent.json",
-                    f"{access_relative}/cache.parquet",
-                    f"{access_relative}/complete.json",
-                ),
+                {
+                    f"{access_relative}/intent.json": intent_sha256,
+                    f"{access_relative}/cache.parquet": source_sha256,
+                    f"{access_relative}/complete.json": complete_sha256,
+                },
             )
 
         if cache_path.exists() or complete_path.exists():
@@ -352,7 +339,9 @@ class DefaultPilotServices:
             "state": "INTENT",
         }
         guard.checkpoint(declared_bytes)
-        store.write_json(f"{access_relative}/intent.json", intent)
+        intent_bytes = self._benchmark_json_bytes(intent)
+        intent_sha256 = hashlib.sha256(intent_bytes).hexdigest()
+        store.write_bytes(f"{access_relative}/intent.json", intent_bytes)
         guard.checkpoint(declared_bytes)
         materialized = self._materialize_benchmark_holdout_source(
             store.root / source_relative,
@@ -382,7 +371,9 @@ class DefaultPilotServices:
             "sample_id_order_sha256": self._holdout_sample_order_sha256(holdout),
         }
         guard.checkpoint(declared_bytes + holdout_memory + len(holdout_bytes))
-        store.write_json(f"{access_relative}/complete.json", complete)
+        complete_bytes = self._benchmark_json_bytes(complete)
+        complete_sha256 = hashlib.sha256(complete_bytes).hexdigest()
+        store.write_bytes(f"{access_relative}/complete.json", complete_bytes)
         guard.checkpoint(declared_bytes + holdout_memory + len(holdout_bytes))
         self._after_benchmark_holdout_cache_complete()
         audit = dict(complete)
@@ -391,11 +382,11 @@ class DefaultPilotServices:
         return (
             holdout,
             audit,
-            (
-                f"{access_relative}/intent.json",
-                f"{access_relative}/cache.parquet",
-                f"{access_relative}/complete.json",
-            ),
+            {
+                f"{access_relative}/intent.json": intent_sha256,
+                f"{access_relative}/cache.parquet": source_sha256,
+                f"{access_relative}/complete.json": complete_sha256,
+            },
         )
 
     def _serialize_benchmark_payload(
@@ -427,13 +418,11 @@ class DefaultPilotServices:
 
     @classmethod
     def _run_config(cls, store: RunStore) -> PilotConfig:
-        payload = cls._read_object(store.root / "config.json")
+        payload = cls._object_from_captured(store.read_authenticated("config.json"), "config.json")
         return cls._config_from_snapshot(payload, store.config_hash)
 
     @staticmethod
-    def _config_from_snapshot(
-        payload: Mapping[str, Any], expected_config_hash: str
-    ) -> PilotConfig:
+    def _config_from_snapshot(payload: Mapping[str, Any], expected_config_hash: str) -> PilotConfig:
         paths = payload.get("paths")
         if not isinstance(paths, dict):
             raise ValueError("run config snapshot has invalid paths")
@@ -552,9 +541,7 @@ class DefaultPilotServices:
         if status == "SUCCESS":
             details = manifest.get("details")
             raw_allowlist = (
-                details.get("prerequisite_output_allowlist")
-                if isinstance(details, dict)
-                else None
+                details.get("prerequisite_output_allowlist") if isinstance(details, dict) else None
             )
             if not isinstance(raw_allowlist, dict) or not all(
                 isinstance(key, str)
@@ -589,9 +576,7 @@ class DefaultPilotServices:
         else:
             details = manifest.get("details")
             raw_allowlist = (
-                details.get("prerequisite_output_allowlist")
-                if isinstance(details, dict)
-                else None
+                details.get("prerequisite_output_allowlist") if isinstance(details, dict) else None
             )
             if not isinstance(raw_allowlist, dict) or not all(
                 isinstance(key, str)
@@ -615,6 +600,7 @@ class DefaultPilotServices:
         return {
             "benchmark": (
                 "benchmark/selection_manifest.json",
+                "benchmark/baseline_predictions.parquet",
                 "benchmark/exact_predictions.parquet",
                 "benchmark/finite_shot_predictions.parquet",
                 "benchmark/diagnostics.json",
@@ -625,9 +611,7 @@ class DefaultPilotServices:
         }
 
     @classmethod
-    def _read_declared_stage_artifact(
-        cls, store: RunStore, stage: str, relative_path: str
-    ) -> Path:
+    def _read_declared_stage_artifact(cls, store: RunStore, stage: str, relative_path: str) -> Path:
         marker = cls._read_object(store.root / stage / "stage_manifest.json")
         if (
             marker.get("schema_version") != "1.0"
@@ -691,44 +675,13 @@ class DefaultPilotServices:
     ) -> tuple[bytes, int]:
         """Capture a trusted regular file once and bind parsing to those bytes."""
 
-        raw_path = store.root / relative_path
-        path = raw_path.resolve(strict=False)
-        if not path.is_relative_to(store.root) or raw_path.is_symlink():
-            raise ValueError(f"report input is unsafe: {relative_path}")
-        before = raw_path.lstat()
-        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-            raise ValueError(f"report input is not a regular single-link file: {relative_path}")
-        # Chunk storage and the immutable joined payload coexist briefly. Refuse
-        # the capture unless that conservative peak fits before allocating either.
-        guard.checkpoint(live_bytes + 2 * before.st_size)
-        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(raw_path, flags)
-        chunks: list[bytes] = []
-        try:
-            opened = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(opened.st_mode)
-                or opened.st_size != before.st_size
-                or (before.st_ino and opened.st_ino != before.st_ino)
-            ):
-                raise ValueError(f"report input changed while opening: {relative_path}")
-            captured = 0
-            while True:
-                chunk = os.read(descriptor, 1024 * 1024)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                captured += len(chunk)
-                guard.checkpoint(live_bytes + captured)
-            after = os.fstat(descriptor)
-            if after.st_size != opened.st_size or after.st_mtime_ns != opened.st_mtime_ns:
-                raise ValueError(f"report input changed while captured: {relative_path}")
-        finally:
-            os.close(descriptor)
-        payload = b"".join(chunks)
-        digest = hashlib.sha256(payload).hexdigest()
-        if expected_sha256 is not None and digest != expected_sha256:
-            raise ValueError(f"report captured checksum mismatch: {relative_path}")
+        payload = authenticated_snapshot(
+            store.root / relative_path,
+            expected_sha256=expected_sha256,
+            checkpoint=guard.checkpoint,
+            live_bytes=live_bytes,
+            root=store.root,
+        )
         return payload, live_bytes + len(payload)
 
     @staticmethod
@@ -852,6 +805,9 @@ class DefaultPilotServices:
             pd.DataFrame(columns=photonic_benchmark.exact_prediction_arrow_schema().names),
             photonic_benchmark.exact_prediction_arrow_schema(),
         )
+        empty_baseline = baseline_models.prediction_parquet_bytes(
+            pd.DataFrame(columns=baseline_models.prediction_arrow_schema().names)
+        )
         empty_shots = photonic_benchmark.parquet_bytes(
             pd.DataFrame(columns=photonic_benchmark.finite_shot_count_arrow_schema().names),
             photonic_benchmark.finite_shot_count_arrow_schema(),
@@ -872,6 +828,7 @@ class DefaultPilotServices:
                 Path("benchmark/selection_manifest.json"),
                 Path("benchmark/validation_scores.parquet"),
                 Path("benchmark/holdout_photonic_features.parquet"),
+                Path("benchmark/baseline_predictions.parquet"),
                 Path("benchmark/exact_predictions.parquet"),
                 Path("benchmark/finite_shot_counts.parquet"),
                 Path("benchmark/finite_shot_predictions.parquet"),
@@ -914,6 +871,7 @@ class DefaultPilotServices:
             )
             transaction.write_bytes("validation_scores.parquet", empty_scores)
             transaction.write_bytes("holdout_photonic_features.parquet", empty_feature_bytes)
+            transaction.write_bytes("baseline_predictions.parquet", empty_baseline)
             transaction.write_bytes("exact_predictions.parquet", empty_exact)
             transaction.write_bytes("finite_shot_counts.parquet", empty_shots)
             transaction.write_bytes("finite_shot_predictions.parquet", empty_shot_predictions)
@@ -942,9 +900,7 @@ class DefaultPilotServices:
         resource_status: str = "EXCEEDED",
     ) -> StageResult:
         del config
-        empty_predictions = pd.DataFrame(columns=baseline_models.prediction_arrow_schema().names)
         empty_scores = pd.DataFrame(columns=baseline_models.validation_score_arrow_schema().names)
-        prediction_bytes = baseline_models.prediction_parquet_bytes(empty_predictions)
         validation_bytes = baseline_models.validation_scores_parquet_bytes(empty_scores)
         model_bytes = pickle.dumps({}, protocol=5)
         result = StageResult(
@@ -953,7 +909,6 @@ class DefaultPilotServices:
             message=message,
             artifacts=(
                 Path("train-baselines/selection_manifest.json"),
-                Path("train-baselines/predictions.parquet"),
                 Path("train-baselines/validation_scores.parquet"),
                 Path("train-baselines/diagnostics.json"),
                 Path("train-baselines/models/baseline_models.pkl"),
@@ -998,7 +953,6 @@ class DefaultPilotServices:
                 "selection_manifest.json",
                 {"schema_version": "1.0", "status": "invalid", "candidates": []},
             )
-            transaction.write_bytes("predictions.parquet", prediction_bytes)
             transaction.write_bytes("validation_scores.parquet", validation_bytes)
             transaction.write_json("diagnostics.json", {"schema_version": "1.0"})
             transaction.write_bytes("models/baseline_models.pkl", model_bytes)
@@ -1107,7 +1061,9 @@ class DefaultPilotServices:
         if existing is not None:
             return existing
         config = self._run_config(store)
-        source_manifest = self._read_object(store.root / "source_manifest.json")
+        source_manifest = self._object_from_captured(
+            store.read_authenticated("source_manifest.json"), "source_manifest.json"
+        )
         source_record = source_manifest.get("input")
         if not isinstance(source_record, dict) or not isinstance(source_record.get("path"), str):
             raise ValueError("source manifest has invalid input record")
@@ -1174,8 +1130,11 @@ class DefaultPilotServices:
             register_external_input = True
             try:
                 guard.checkpoint(source_path.stat().st_size)
+                source_payload = authenticated_snapshot(
+                    source_path, expected_sha256=expected_hash, checkpoint=guard.checkpoint
+                )
                 result = canonicalize_data(
-                    source_path,
+                    source_payload,
                     config.data,
                     config.data.format,
                     resource_checkpoint=guard.checkpoint,
@@ -1478,7 +1437,6 @@ class DefaultPilotServices:
         existing = self._existing_build_splits_result(store)
         if existing is not None:
             return existing
-        store.verify_terminal_stage("validate-data")
         config = self._run_config(store)
         canonical_path = store.root / "validate-data/canonical.parquet"
         guard = _ResourceGuard(
@@ -1487,10 +1445,36 @@ class DefaultPilotServices:
             memory_bytes=int(config.resources.max_memory_gb * 1024**3),
         )
         try:
-            guard.checkpoint(canonical_path.stat().st_size)
-            canonical = pd.read_parquet(canonical_path)
+            validate_marker_sha256 = store.verify_terminal_stage("validate-data")
+            marker_payload, captured_live_bytes = self._capture_report_artifact(
+                store=store,
+                relative_path="validate-data/stage_manifest.json",
+                expected_sha256=validate_marker_sha256,
+                guard=guard,
+                live_bytes=0,
+            )
+            marker = self._object_from_captured(marker_payload, "validate-data/stage_manifest.json")
+            raw_outputs = marker.get("outputs")
+            if not isinstance(raw_outputs, list):
+                raise ValueError("validate-data marker has invalid outputs")
+            canonical_relative = "validate-data/canonical.parquet"
+            matches = [
+                record.get("sha256")
+                for record in raw_outputs
+                if isinstance(record, dict) and record.get("path") == canonical_relative
+            ]
+            if len(matches) != 1 or not isinstance(matches[0], str):
+                raise ValueError("validate-data marker does not bind canonical data")
+            canonical_payload, captured_live_bytes = self._capture_report_artifact(
+                store=store,
+                relative_path=canonical_relative,
+                expected_sha256=matches[0],
+                guard=guard,
+                live_bytes=captured_live_bytes,
+            )
+            canonical = pd.read_parquet(io.BytesIO(canonical_payload))
             declared = int(canonical.memory_usage(index=True, deep=True).sum())
-            guard.checkpoint(declared)
+            guard.checkpoint(captured_live_bytes + declared)
             build = build_feature_splits(
                 canonical,
                 config,
@@ -1585,6 +1569,8 @@ class DefaultPilotServices:
             with store.stage(
                 "build-splits",
                 input_paths=(Path("validate-data/canonical.parquet"),),
+                preverified_input_hashes={canonical_relative: matches[0]},
+                preverified_prerequisite_manifest_hashes={"validate-data": validate_marker_sha256},
                 terminal_status=terminal,
                 details={
                     "result_status": status.value,
@@ -1632,16 +1618,34 @@ class DefaultPilotServices:
         existing = self._existing_train_baselines_result(store)
         if existing is not None:
             return existing
-        store.verify_terminal_stage("validate-data")
         config = self._run_config(store)
-        development_path = store.root / "build-splits/development_features.parquet"
-        holdout_path = store.root / "build-splits/holdout_features.parquet"
-        manifest_path = store.root / "build-splits/feature_manifest.json"
-        split_stage_manifest = self._read_object(store.root / "build-splits/stage_manifest.json")
+        development_relative = "build-splits/development_features.parquet"
+        manifest_relative = "build-splits/feature_manifest.json"
+        scalers_relative = "build-splits/minmax_scalers.json"
+        required_inputs = (development_relative, manifest_relative, scalers_relative)
+        guard = _ResourceGuard(
+            started=started,
+            wall_seconds=config.resources.max_wall_clock_seconds,
+            memory_bytes=int(config.resources.max_memory_gb * 1024**3),
+        )
+        split_marker_hash = store._verify_stage_selected_outputs("build-splits", required_inputs)
+        try:
+            marker_payload, captured_live_bytes = self._capture_report_artifact(
+                store=store,
+                relative_path="build-splits/stage_manifest.json",
+                expected_sha256=split_marker_hash,
+                guard=guard,
+                live_bytes=0,
+            )
+        except _ResourceLimitExceeded as error:
+            return self._publish_baseline_resource_invalid(
+                store=store, config=config, guard=guard, gate=error.gate
+            )
+        split_stage_manifest = self._object_from_captured(
+            marker_payload, "build-splits/stage_manifest.json"
+        )
         if (
             split_stage_manifest.get("schema_version") != "1.0"
-            or split_stage_manifest.get("prerequisite_manifest_hashes")
-            != {"validate-data": sha256_file(store.root / "validate-data/stage_manifest.json")}
             or split_stage_manifest.get("stage") != "build-splits"
             or split_stage_manifest.get("status") != "SUCCESS"
             or split_stage_manifest.get("config_hash") != store.config_hash
@@ -1655,45 +1659,30 @@ class DefaultPilotServices:
             for record in split_outputs
             if isinstance(record, dict)
         }
-        development_relative = "build-splits/development_features.parquet"
-        holdout_relative = "build-splits/holdout_features.parquet"
-        for required in (
-            development_relative,
-            holdout_relative,
-            "build-splits/feature_manifest.json",
-            "build-splits/minmax_scalers.json",
-        ):
+        for required in required_inputs:
             if required not in expected_output_hashes:
                 raise ValueError(f"build-splits marker is missing partition output: {required}")
-        if (
-            not development_path.is_file()
-            or sha256_file(development_path) != expected_output_hashes[development_relative]
-        ):
-            raise ValueError("development partition checksum mismatch")
-        for relative_path in (
-            "build-splits/feature_manifest.json",
-            "build-splits/minmax_scalers.json",
-        ):
-            path = store.root / relative_path
-            if not path.is_file() or sha256_file(path) != expected_output_hashes[relative_path]:
-                raise ValueError(f"split metadata checksum mismatch: {relative_path}")
-        if not holdout_path.is_file():
-            raise ValueError("holdout partition is missing")
-        guard = _ResourceGuard(
-            started=started,
-            wall_seconds=config.resources.max_wall_clock_seconds,
-            memory_bytes=int(config.resources.max_memory_gb * 1024**3),
-        )
         try:
-            guard.checkpoint(development_path.stat().st_size)
-            development = pds.dataset(development_path, format="parquet").to_table().to_pandas()
+            captured_inputs: dict[str, bytes] = {}
+            for relative_path in required_inputs:
+                payload, captured_live_bytes = self._capture_report_artifact(
+                    store=store,
+                    relative_path=relative_path,
+                    expected_sha256=expected_output_hashes[relative_path],
+                    guard=guard,
+                    live_bytes=captured_live_bytes,
+                )
+                captured_inputs[relative_path] = payload
+            development = pd.read_parquet(io.BytesIO(captured_inputs[development_relative]))
             declared = int(development.memory_usage(index=True, deep=True).sum())
-            guard.checkpoint(declared)
+            guard.checkpoint(captured_live_bytes + declared)
         except _ResourceLimitExceeded as error:
             return self._publish_baseline_resource_invalid(
                 store=store, config=config, guard=guard, gate=error.gate
             )
-        feature_manifest = self._read_object(manifest_path)
+        feature_manifest = self._object_from_captured(
+            captured_inputs[manifest_relative], manifest_relative
+        )
         expected_profiles = {
             "matched4_columns": list(MATCHED4_COLUMNS),
             "matched6_columns": list(MATCHED6_COLUMNS),
@@ -1737,19 +1726,9 @@ class DefaultPilotServices:
                 "feature manifest has no immutable partition contract"
             )
         development_contract = partitions.get("development")
-        holdout_contract = partitions.get("holdout")
-        combined_contract = partitions.get("combined")
         if not isinstance(development_contract, dict):
             raise baseline_models.BaselineContractError(
                 "feature manifest development partition record is invalid"
-            )
-        if not isinstance(holdout_contract, dict):
-            raise baseline_models.BaselineContractError(
-                "feature manifest holdout partition record is invalid"
-            )
-        if not isinstance(combined_contract, dict):
-            raise baseline_models.BaselineContractError(
-                "feature manifest combined partition record is invalid"
             )
         development_order = (
             development.sort_values(list(PARTITION_ORDER_COLUMNS), kind="stable")["sample_id"]
@@ -1781,79 +1760,6 @@ class DefaultPilotServices:
                 "development partition sample order hash mismatch"
             )
 
-        holdout_open_count = 0
-        holdout_declared = 0
-
-        def load_holdout(selection_freeze_sha256: str) -> pd.DataFrame:
-            nonlocal holdout_declared, holdout_open_count
-            if len(selection_freeze_sha256) != 64:
-                raise RuntimeError("holdout cannot open before selection is frozen")
-            if holdout_open_count != 0:
-                raise RuntimeError("holdout loader may be invoked exactly once")
-            holdout_open_count += 1
-            if sha256_file(holdout_path) != expected_output_hashes[holdout_relative]:
-                raise ValueError("holdout partition checksum mismatch")
-            holdout = pds.dataset(holdout_path, format="parquet").to_table().to_pandas()
-            holdout_declared = int(holdout.memory_usage(index=True, deep=True).sum())
-            if holdout_contract.get("row_count") != len(holdout):
-                raise baseline_models.BaselineContractError(
-                    "holdout partition violates its manifest row count"
-                )
-            if (
-                holdout_contract.get("schema_sha256") != feature_schema_sha256(config)
-                or holdout_contract.get("path") != holdout_relative
-                or holdout_contract.get("splits") != ["test"]
-                or holdout_contract.get("order_policy") != list(PARTITION_ORDER_COLUMNS)
-                or combined_contract.get("schema_sha256") != feature_schema_sha256(config)
-                or combined_contract.get("membership_policy") != COMBINED_MEMBERSHIP_POLICY
-            ):
-                raise baseline_models.BaselineContractError(
-                    "feature partition schema hash mismatch"
-                )
-            if (
-                set(holdout["split"].astype(str)) != {"test"}
-                or holdout["sample_id"].duplicated().any()
-                or holdout["sample_id"].astype(str).tolist()
-                != holdout.sort_values(list(PARTITION_ORDER_COLUMNS), kind="stable")["sample_id"]
-                .astype(str)
-                .tolist()
-            ):
-                raise baseline_models.BaselineContractError(
-                    "holdout partition violates its split or uniqueness contract"
-                )
-            if combined_contract.get("row_count") != len(development) + len(holdout):
-                raise baseline_models.BaselineContractError(
-                    "feature partitions do not reproduce the combined row count"
-                )
-            holdout_sample_payload = json.dumps(
-                holdout["sample_id"].astype(str).tolist(), separators=(",", ":")
-            )
-            holdout_sample_hash = hashlib.sha256(holdout_sample_payload.encode("utf-8")).hexdigest()
-            declared_holdout_hash = holdout_contract.get("sample_id_order_sha256")
-            if declared_holdout_hash != holdout_sample_hash:
-                raise baseline_models.BaselineContractError(
-                    "holdout partition sample order hash mismatch"
-                )
-            development_ids = development["sample_id"].astype(str).tolist()
-            holdout_ids = holdout["sample_id"].astype(str).tolist()
-            if set(development_ids) & set(holdout_ids):
-                raise baseline_models.BaselineContractError(
-                    "development and holdout partition memberships overlap"
-                )
-            combined_sample_payload = json.dumps(
-                sorted([*development_ids, *holdout_ids]), separators=(",", ":")
-            )
-            declared_combined_hash = combined_contract.get("sample_id_membership_sha256")
-            if (
-                hashlib.sha256(combined_sample_payload.encode("utf-8")).hexdigest()
-                != declared_combined_hash
-            ):
-                raise baseline_models.BaselineContractError(
-                    "feature partitions do not reproduce the combined sample membership hash"
-                )
-            guard.checkpoint(declared + holdout_declared)
-            return holdout
-
         try:
             fit_executor = baseline_models.DeadlineProcessFitExecutor(
                 deadline_monotonic=(
@@ -1871,14 +1777,10 @@ class DefaultPilotServices:
             training = baseline_models.train_baseline_models(
                 development,
                 config,
-                holdout_loader=load_holdout,
                 resource_checkpoint=guard.checkpoint,
                 fit_executor=fit_executor,
             )
-            if holdout_open_count != 1:
-                raise RuntimeError("baseline trainer did not open holdout exactly once")
             guard.checkpoint(declared)
-            prediction_bytes = baseline_models.prediction_parquet_bytes(training.predictions)
             validation_frame = pd.DataFrame.from_records(training.validation_scores)
             validation_bytes = baseline_models.validation_scores_parquet_bytes(validation_frame)
             model_bytes = pickle.dumps(training.models, protocol=5)
@@ -1965,17 +1867,9 @@ class DefaultPilotServices:
             "serialization_roundtrip_verified": True,
             "serialization_probe": "first_three_train_rows",
             "scientific_decision": "NOT_EVALUATED",
-            "selection_freeze_sha256": training.selection_manifest[
-                "selection_freeze_sha256"
-            ],
+            "selection_freeze_sha256": training.selection_manifest["selection_freeze_sha256"],
         }
-        total_bytes = (
-            declared
-            + holdout_declared
-            + len(prediction_bytes)
-            + len(validation_bytes)
-            + len(model_bytes)
-        )
+        total_bytes = declared + len(validation_bytes) + len(model_bytes)
         try:
             guard.checkpoint(total_bytes)
         except _ResourceLimitExceeded as error:
@@ -1984,7 +1878,6 @@ class DefaultPilotServices:
             )
         artifacts = (
             Path("train-baselines/selection_manifest.json"),
-            Path("train-baselines/predictions.parquet"),
             Path("train-baselines/validation_scores.parquet"),
             Path("train-baselines/diagnostics.json"),
             Path("train-baselines/models/baseline_models.pkl"),
@@ -1998,7 +1891,8 @@ class DefaultPilotServices:
             artifacts=artifacts,
             details=(
                 DetailEntry(key="scientific_decision", value="NOT_EVALUATED"),
-                DetailEntry(key="test_prediction_passes", value=1),
+                DetailEntry(key="test_prediction_passes", value=0),
+                DetailEntry(key="holdout_opened", value=False),
             ),
         )
         guard.sample_without_enforcement()
@@ -2021,11 +1915,14 @@ class DefaultPilotServices:
             with store.stage(
                 "train-baselines",
                 input_paths=(
-                    Path("build-splits/development_features.parquet"),
-                    Path("build-splits/holdout_features.parquet"),
-                    Path("build-splits/feature_manifest.json"),
-                    Path("build-splits/minmax_scalers.json"),
+                    Path(development_relative),
+                    Path(manifest_relative),
+                    Path(scalers_relative),
                 ),
+                preverified_input_hashes={
+                    relative: expected_output_hashes[relative] for relative in required_inputs
+                },
+                preverified_prerequisite_manifest_hashes={"build-splits": split_marker_hash},
                 details={
                     "result_status": StageStatus.SUCCESS.value,
                     "scientific_decision": "NOT_EVALUATED",
@@ -2033,7 +1930,6 @@ class DefaultPilotServices:
                 commit_guard=guard.checkpoint,
             ) as transaction:
                 transaction.write_json("selection_manifest.json", training.selection_manifest)
-                transaction.write_bytes("predictions.parquet", prediction_bytes)
                 transaction.write_bytes("validation_scores.parquet", validation_bytes)
                 transaction.write_json("diagnostics.json", training.diagnostics)
                 transaction.write_bytes("models/baseline_models.pkl", model_bytes)
@@ -2153,7 +2049,16 @@ class DefaultPilotServices:
         split_marker_hash: str | None = None
         try:
             split_marker_hash = store.verify_selected_stage_outputs("build-splits", required_inputs)
-            split_stage_marker = self._read_object(store.root / "build-splits/stage_manifest.json")
+            marker_payload, captured_live_bytes = self._capture_report_artifact(
+                store=store,
+                relative_path="build-splits/stage_manifest.json",
+                expected_sha256=split_marker_hash,
+                guard=guard,
+                live_bytes=0,
+            )
+            split_stage_marker = self._object_from_captured(
+                marker_payload, "build-splits/stage_manifest.json"
+            )
             split_outputs = split_stage_marker.get("outputs")
             if not isinstance(split_outputs, list):
                 raise photonic_features.PhotonicContractError(
@@ -2165,13 +2070,25 @@ class DefaultPilotServices:
                 if isinstance(record, dict)
             }
             verified_input_hashes = {path: declared_output_hashes[path] for path in required_inputs}
-            development_path = store.root / required_inputs[0]
-            guard.checkpoint(development_path.stat().st_size)
-            development = pds.dataset(development_path, format="parquet").to_table().to_pandas()
+            captured_inputs: dict[str, bytes] = {}
+            for relative_path in required_inputs:
+                payload, captured_live_bytes = self._capture_report_artifact(
+                    store=store,
+                    relative_path=relative_path,
+                    expected_sha256=verified_input_hashes[relative_path],
+                    guard=guard,
+                    live_bytes=captured_live_bytes,
+                )
+                captured_inputs[relative_path] = payload
+            development = pd.read_parquet(io.BytesIO(captured_inputs[required_inputs[0]]))
             declared = int(development.memory_usage(index=True, deep=True).sum())
-            guard.checkpoint(declared)
-            split_manifest = self._read_object(store.root / required_inputs[1])
-            scalers = self._read_object(store.root / required_inputs[2])
+            guard.checkpoint(captured_live_bytes + declared)
+            split_manifest = self._object_from_captured(
+                captured_inputs[required_inputs[1]], required_inputs[1]
+            )
+            scalers = self._object_from_captured(
+                captured_inputs[required_inputs[2]], required_inputs[2]
+            )
             expected_profiles = {
                 "matched4_columns": list(MATCHED4_COLUMNS),
                 "matched6_columns": list(MATCHED6_COLUMNS),
@@ -2403,6 +2320,8 @@ class DefaultPilotServices:
                 input_paths=required_inputs,
                 prerequisite_verification="selected_outputs",
                 prerequisite_output_allowlist=self._photonic_allowlist(),
+                preverified_input_hashes=input_hashes,
+                preverified_prerequisite_manifest_hashes={"build-splits": split_marker_hash},
                 details={
                     "result_status": "success",
                     "scientific_decision": "NOT_EVALUATED",
@@ -2464,8 +2383,17 @@ class DefaultPilotServices:
                 accepted_statuses=frozenset({"SUCCESS"}),
                 prerequisite_output_allowlist=photonic_allowlist,
             )
-            task7_manifest = self._read_object(
-                store.root / "build-photonic-features/stage_manifest.json"
+            captured_input_hashes: dict[str, str] = {}
+            captured_live_bytes = 0
+            task7_marker_payload, captured_live_bytes = self._capture_report_artifact(
+                store=store,
+                relative_path="build-photonic-features/stage_manifest.json",
+                expected_sha256=photonic_marker_hash,
+                guard=guard,
+                live_bytes=captured_live_bytes,
+            )
+            task7_manifest = self._object_from_captured(
+                task7_marker_payload, "build-photonic-features/stage_manifest.json"
             )
             task7_outputs = task7_manifest.get("outputs")
             if not isinstance(task7_outputs, list):
@@ -2487,26 +2415,49 @@ class DefaultPilotServices:
                     raise photonic_benchmark.PhotonicBenchmarkContractError(
                         f"photonic stage did not declare {relative}"
                     )
-            development_path = store.root / development_relative
-            guard.checkpoint(development_path.stat().st_size)
-            development = pds.dataset(development_path, format="parquet").to_table().to_pandas()
+            task7_payloads: dict[str, bytes] = {}
+            for relative in (
+                development_relative,
+                circuit_manifest_relative,
+                feature_manifest_relative,
+                state_spaces_relative,
+            ):
+                payload, captured_live_bytes = self._capture_report_artifact(
+                    store=store,
+                    relative_path=relative,
+                    expected_sha256=task7_hashes[relative],
+                    guard=guard,
+                    live_bytes=captured_live_bytes,
+                )
+                task7_payloads[relative] = payload
+                captured_input_hashes[relative] = task7_hashes[relative]
+            development = pd.read_parquet(io.BytesIO(task7_payloads[development_relative]))
             declared = int(development.memory_usage(index=True, deep=True).sum())
-            guard.checkpoint(declared)
+            guard.checkpoint(captured_live_bytes + declared)
             task7_inputs = task7_manifest.get("input_hashes")
-            if not isinstance(task7_inputs, dict) or task7_inputs.get(
-                development_reference_relative
-            ) != sha256_file(store.root / development_reference_relative):
+            development_reference_sha256 = (
+                task7_inputs.get(development_reference_relative)
+                if isinstance(task7_inputs, dict)
+                else None
+            )
+            if not isinstance(development_reference_sha256, str):
                 raise photonic_benchmark.PhotonicBenchmarkContractError(
                     "Task 5 development reference is not bound to Task 7"
                 )
-            development_reference = (
-                pds.dataset(store.root / development_reference_relative, format="parquet")
-                .to_table()
-                .to_pandas()
+            development_reference_payload, captured_live_bytes = self._capture_report_artifact(
+                store=store,
+                relative_path=development_reference_relative,
+                expected_sha256=development_reference_sha256,
+                guard=guard,
+                live_bytes=captured_live_bytes,
             )
+            captured_input_hashes[development_reference_relative] = development_reference_sha256
+            development_reference = pd.read_parquet(io.BytesIO(development_reference_payload))
             declared += int(development_reference.memory_usage(index=True, deep=True).sum())
-            guard.checkpoint(declared)
-            task7_feature_manifest = self._read_object(store.root / feature_manifest_relative)
+            guard.checkpoint(captured_live_bytes + declared)
+            task7_feature_manifest = self._object_from_captured(
+                task7_payloads[feature_manifest_relative], feature_manifest_relative
+            )
             if (
                 task7_feature_manifest.get("holdout_opened") is not False
                 or task7_feature_manifest.get("photons") != 2
@@ -2515,7 +2466,9 @@ class DefaultPilotServices:
                 raise photonic_benchmark.PhotonicBenchmarkContractError(
                     "development photonic manifest violates the G3 firewall"
                 )
-            raw_state_spaces = self._read_object(store.root / state_spaces_relative).get("spaces")
+            raw_state_spaces = self._object_from_captured(
+                task7_payloads[state_spaces_relative], state_spaces_relative
+            ).get("spaces")
             if not isinstance(raw_state_spaces, list):
                 raise photonic_benchmark.PhotonicBenchmarkContractError(
                     "trusted state-space manifest is invalid"
@@ -2536,7 +2489,9 @@ class DefaultPilotServices:
                         "trusted state-space record is duplicated"
                     )
                 trusted_state_spaces[key] = value
-            circuit_manifest = self._read_object(store.root / circuit_manifest_relative)
+            circuit_manifest = self._object_from_captured(
+                task7_payloads[circuit_manifest_relative], circuit_manifest_relative
+            )
             circuit_records = circuit_manifest.get("circuits")
             if not isinstance(circuit_records, list):
                 raise photonic_benchmark.PhotonicBenchmarkContractError(
@@ -2554,7 +2509,14 @@ class DefaultPilotServices:
                     raise photonic_benchmark.PhotonicBenchmarkContractError(
                         "circuit archive is not a verified Task 7 output"
                     )
-                payload = (store.root / relative).read_bytes()
+                payload, captured_live_bytes = self._capture_report_artifact(
+                    store=store,
+                    relative_path=relative,
+                    expected_sha256=task7_hashes[relative],
+                    guard=guard,
+                    live_bytes=captured_live_bytes,
+                )
+                captured_input_hashes[relative] = task7_hashes[relative]
                 declared += len(payload)
                 guard.checkpoint(declared)
                 if hashlib.sha256(payload).hexdigest() != record.get("npz_sha256"):
@@ -2601,12 +2563,76 @@ class DefaultPilotServices:
 
             # All holdout-bound verification is deliberately below the immutable freeze.
             guard.checkpoint(declared)
-            baseline_predictions_relative = "train-baselines/predictions.parquet"
-            baseline_marker_hash = store._verify_stage_selected_outputs(
-                "train-baselines", (baseline_predictions_relative,)
+            baseline_selection_relative = "train-baselines/selection_manifest.json"
+            baseline_models_relative = "train-baselines/models/baseline_models.pkl"
+            baseline_model_manifest_relative = "train-baselines/models/manifest.json"
+            baseline_inputs = (
+                baseline_selection_relative,
+                baseline_models_relative,
+                baseline_model_manifest_relative,
             )
-            baseline_predictions_path = store.root / baseline_predictions_relative
-            baseline_predictions_sha256 = sha256_file(baseline_predictions_path)
+            baseline_marker_hash = store._verify_stage_selected_outputs(
+                "train-baselines", baseline_inputs
+            )
+            baseline_marker_payload, captured_live_bytes = self._capture_report_artifact(
+                store=store,
+                relative_path="train-baselines/stage_manifest.json",
+                expected_sha256=baseline_marker_hash,
+                guard=guard,
+                live_bytes=captured_live_bytes,
+            )
+            baseline_marker = self._object_from_captured(
+                baseline_marker_payload, "train-baselines/stage_manifest.json"
+            )
+            raw_baseline_outputs = baseline_marker.get("outputs")
+            if not isinstance(raw_baseline_outputs, list):
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "baseline stage output manifest is invalid"
+                )
+            baseline_hashes = {
+                str(record.get("path")): str(record.get("sha256"))
+                for record in raw_baseline_outputs
+                if isinstance(record, dict)
+            }
+            baseline_payloads: dict[str, bytes] = {}
+            for relative in baseline_inputs:
+                if relative not in baseline_hashes:
+                    raise photonic_benchmark.PhotonicBenchmarkContractError(
+                        f"baseline stage did not declare {relative}"
+                    )
+                payload, captured_live_bytes = self._capture_report_artifact(
+                    store=store,
+                    relative_path=relative,
+                    expected_sha256=baseline_hashes[relative],
+                    guard=guard,
+                    live_bytes=captured_live_bytes,
+                )
+                baseline_payloads[relative] = payload
+                captured_input_hashes[relative] = baseline_hashes[relative]
+            baseline_selection = self._object_from_captured(
+                baseline_payloads[baseline_selection_relative], baseline_selection_relative
+            )
+            baseline_model_bytes = baseline_payloads[baseline_models_relative]
+            baseline_model_manifest = self._object_from_captured(
+                baseline_payloads[baseline_model_manifest_relative],
+                baseline_model_manifest_relative,
+            )
+            if baseline_model_manifest.get("models_sha256") != hashlib.sha256(
+                baseline_model_bytes
+            ).hexdigest() or baseline_model_manifest.get(
+                "selection_freeze_sha256"
+            ) != baseline_selection.get("selection_freeze_sha256"):
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "baseline model lineage is inconsistent"
+                )
+            baseline_model_bundles = pickle.loads(baseline_model_bytes)
+            baseline_selected = baseline_selection.get("selected")
+            if not isinstance(baseline_model_bundles, dict) or not isinstance(
+                baseline_selected, dict
+            ):
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "baseline model bundle is invalid"
+                )
 
             raw_prerequisite_hashes = task7_manifest.get("prerequisite_manifest_hashes")
             split_marker_hash = (
@@ -2618,10 +2644,17 @@ class DefaultPilotServices:
                 raise photonic_benchmark.PhotonicBenchmarkContractError(
                     "Task 7 does not bind a valid split marker"
                 )
-            split_manifest = self._read_object(store.root / "build-splits/feature_manifest.json")
-            split_stage_manifest = self._read_object(
-                store.root / "build-splits/stage_manifest.json"
+            split_marker_payload, captured_live_bytes = self._capture_report_artifact(
+                store=store,
+                relative_path="build-splits/stage_manifest.json",
+                expected_sha256=split_marker_hash,
+                guard=guard,
+                live_bytes=captured_live_bytes,
             )
+            split_stage_manifest = self._object_from_captured(
+                split_marker_payload, "build-splits/stage_manifest.json"
+            )
+            captured_input_hashes["build-splits/stage_manifest.json"] = split_marker_hash
             raw_split_outputs = split_stage_manifest.get("outputs")
             if not isinstance(raw_split_outputs, list):
                 raise photonic_benchmark.PhotonicBenchmarkContractError(
@@ -2638,13 +2671,30 @@ class DefaultPilotServices:
                 raise photonic_benchmark.PhotonicBenchmarkContractError(
                     "split marker does not bind the physical holdout"
                 )
+            split_feature_relative = "build-splits/feature_manifest.json"
+            split_feature_sha256 = split_hashes.get(split_feature_relative)
+            if not isinstance(split_feature_sha256, str):
+                raise photonic_benchmark.PhotonicBenchmarkContractError(
+                    "split marker does not bind its feature manifest"
+                )
+            split_feature_payload, captured_live_bytes = self._capture_report_artifact(
+                store=store,
+                relative_path=split_feature_relative,
+                expected_sha256=split_feature_sha256,
+                guard=guard,
+                live_bytes=captured_live_bytes,
+            )
+            split_manifest = self._object_from_captured(
+                split_feature_payload, split_feature_relative
+            )
+            captured_input_hashes[split_feature_relative] = split_feature_sha256
             partitions = split_manifest.get("partitions")
             holdout_contract = partitions.get("holdout") if isinstance(partitions, dict) else None
             if not isinstance(holdout_contract, dict):
                 raise photonic_benchmark.PhotonicBenchmarkContractError(
                     "holdout partition contract is missing"
                 )
-            holdout, holdout_access_audit, holdout_access_paths = (
+            holdout, holdout_access_audit, holdout_access_hashes = (
                 self._load_or_materialize_benchmark_holdout(
                     store=store,
                     config=config,
@@ -2679,6 +2729,18 @@ class DefaultPilotServices:
                 raise photonic_benchmark.PhotonicBenchmarkContractError(
                     "development and holdout sample IDs overlap"
                 )
+
+            baseline_predictions = baseline_models.predict_test_models(
+                holdout,
+                baseline_model_bundles,
+                tuple(config.evaluation.quantiles),
+                baseline_selected,
+                executor=fit_executor,
+            )
+            baseline_prediction_bytes = baseline_models.prediction_parquet_bytes(
+                baseline_predictions
+            )
+            baseline_predictions_sha256 = hashlib.sha256(baseline_prediction_bytes).hexdigest()
 
             selected_modes = int(selection.selected["modes"])
             circuits = {
@@ -2734,12 +2796,15 @@ class DefaultPilotServices:
                 int(frame.memory_usage(index=True, deep=True).sum())
                 for frame in (
                     selection.validation_scores,
+                    baseline_predictions,
                     exact_predictions,
                     finite_counts,
                     finite_predictions,
                 )
             )
-            serialization_live_bytes = declared + dataframe_live_bytes
+            serialization_live_bytes = (
+                declared + dataframe_live_bytes + len(baseline_prediction_bytes)
+            )
             guard.checkpoint(serialization_live_bytes)
             validation_bytes, serialization_live_bytes = self._serialize_benchmark_payload(
                 "validation_scores",
@@ -2756,16 +2821,14 @@ class DefaultPilotServices:
                 guard=guard,
                 live_bytes=serialization_live_bytes,
             )
-            exact_prediction_bytes, serialization_live_bytes = (
-                self._serialize_benchmark_payload(
-                    "exact_predictions",
-                    lambda: photonic_benchmark.parquet_bytes(
-                        exact_predictions,
-                        photonic_benchmark.exact_prediction_arrow_schema(),
-                    ),
-                    guard=guard,
-                    live_bytes=serialization_live_bytes,
-                )
+            exact_prediction_bytes, serialization_live_bytes = self._serialize_benchmark_payload(
+                "exact_predictions",
+                lambda: photonic_benchmark.parquet_bytes(
+                    exact_predictions,
+                    photonic_benchmark.exact_prediction_arrow_schema(),
+                ),
+                guard=guard,
+                live_bytes=serialization_live_bytes,
             )
             finite_count_bytes, serialization_live_bytes = self._serialize_benchmark_payload(
                 "finite_shot_counts",
@@ -2775,16 +2838,14 @@ class DefaultPilotServices:
                 guard=guard,
                 live_bytes=serialization_live_bytes,
             )
-            finite_prediction_bytes, serialization_live_bytes = (
-                self._serialize_benchmark_payload(
-                    "finite_shot_predictions",
-                    lambda: photonic_benchmark.parquet_bytes(
-                        finite_predictions,
-                        photonic_benchmark.finite_shot_prediction_arrow_schema(),
-                    ),
-                    guard=guard,
-                    live_bytes=serialization_live_bytes,
-                )
+            finite_prediction_bytes, serialization_live_bytes = self._serialize_benchmark_payload(
+                "finite_shot_predictions",
+                lambda: photonic_benchmark.parquet_bytes(
+                    finite_predictions,
+                    photonic_benchmark.finite_shot_prediction_arrow_schema(),
+                ),
+                guard=guard,
+                live_bytes=serialization_live_bytes,
             )
             model_bytes, serialization_live_bytes = self._serialize_benchmark_payload(
                 "photonic_models",
@@ -2863,9 +2924,9 @@ class DefaultPilotServices:
                     "train_baselines": baseline_marker_hash,
                 },
                 "baseline_predictions": {
-                    "path": baseline_predictions_relative,
+                    "path": "benchmark/baseline_predictions.parquet",
                     "sha256": baseline_predictions_sha256,
-                    "policy": "immutable_reuse_no_retrain_no_repredict",
+                    "policy": "same_authenticated_holdout_after_photonic_freeze",
                 },
                 "scientific_decision": "NOT_EVALUATED",
             }
@@ -2916,6 +2977,7 @@ class DefaultPilotServices:
             Path("benchmark/selection_manifest.json"),
             Path("benchmark/validation_scores.parquet"),
             Path("benchmark/holdout_photonic_features.parquet"),
+            Path("benchmark/baseline_predictions.parquet"),
             Path("benchmark/exact_predictions.parquet"),
             Path("benchmark/finite_shot_counts.parquet"),
             Path("benchmark/finite_shot_predictions.parquet"),
@@ -2941,11 +3003,14 @@ class DefaultPilotServices:
             feature_manifest_relative,
             state_spaces_relative,
             *trusted_circuit_paths,
-            *holdout_access_paths,
-            baseline_predictions_relative,
+            development_reference_relative,
+            "build-splits/feature_manifest.json",
+            "build-splits/stage_manifest.json",
+            *holdout_access_hashes,
+            *baseline_inputs,
         )
         benchmark_prerequisite_allowlist = {
-            "train-baselines": (baseline_predictions_relative,),
+            "train-baselines": baseline_inputs,
             "build-photonic-features": (
                 development_relative,
                 circuit_manifest_relative,
@@ -2955,13 +3020,22 @@ class DefaultPilotServices:
             ),
         }
         try:
-            selection_manifest_bytes, serialization_live_bytes = (
-                self._serialize_benchmark_payload(
-                    "selection_manifest_json",
-                    lambda: self._benchmark_json_bytes(selection_manifest),
+            for relative, expected_sha256 in holdout_access_hashes.items():
+                _payload, captured_live_bytes = self._capture_report_artifact(
+                    store=store,
+                    relative_path=relative,
+                    expected_sha256=expected_sha256,
                     guard=guard,
-                    live_bytes=serialization_live_bytes,
+                    live_bytes=captured_live_bytes,
                 )
+                captured_input_hashes[relative] = expected_sha256
+            if set(captured_input_hashes) != set(input_paths):
+                raise RuntimeError("benchmark authenticated input snapshot is incomplete")
+            selection_manifest_bytes, serialization_live_bytes = self._serialize_benchmark_payload(
+                "selection_manifest_json",
+                lambda: self._benchmark_json_bytes(selection_manifest),
+                guard=guard,
+                live_bytes=serialization_live_bytes,
             )
             model_manifest_bytes, serialization_live_bytes = self._serialize_benchmark_payload(
                 "model_manifest_json",
@@ -3002,12 +3076,18 @@ class DefaultPilotServices:
                 },
                 prerequisite_verification="selected_outputs",
                 prerequisite_output_allowlist=benchmark_prerequisite_allowlist,
+                preverified_input_hashes=captured_input_hashes,
+                preverified_prerequisite_manifest_hashes={
+                    "train-baselines": baseline_marker_hash,
+                    "build-photonic-features": photonic_marker_hash,
+                },
                 commit_guard=publication_checkpoint,
                 private_write_guard=publication_checkpoint,
             ) as transaction:
                 transaction.write_bytes("selection_manifest.json", selection_manifest_bytes)
                 transaction.write_bytes("validation_scores.parquet", validation_bytes)
                 transaction.write_bytes("holdout_photonic_features.parquet", feature_bytes)
+                transaction.write_bytes("baseline_predictions.parquet", baseline_prediction_bytes)
                 transaction.write_bytes("exact_predictions.parquet", exact_prediction_bytes)
                 transaction.write_bytes("finite_shot_counts.parquet", finite_count_bytes)
                 transaction.write_bytes("finite_shot_predictions.parquet", finite_prediction_bytes)
@@ -3052,9 +3132,7 @@ class DefaultPilotServices:
                 0,
             )
             try:
-                descriptor = msvcrt.open_osfhandle(
-                    handle, os.O_RDWR | getattr(os, "O_BINARY", 0)
-                )
+                descriptor = msvcrt.open_osfhandle(handle, os.O_RDWR | getattr(os, "O_BINARY", 0))
             except BaseException:
                 with suppress(OSError):
                     _winapi.CloseHandle(handle)
@@ -3070,9 +3148,7 @@ class DefaultPilotServices:
                 view = memoryview(payload)
                 written = 0
                 while written < len(view):
-                    count = os.write(
-                        descriptor, view[written : written + 1024 * 1024]
-                    )
+                    count = os.write(descriptor, view[written : written + 1024 * 1024])
                     if count <= 0:
                         raise OSError("short write")
                     written += count
@@ -3126,13 +3202,9 @@ class DefaultPilotServices:
             try:
                 value: object = json.loads(captured_claims[name].decode("utf-8"))
             except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as error:
-                raise ReportContractError(
-                    f"report decision evidence is invalid: {name}"
-                ) from error
+                raise ReportContractError(f"report decision evidence is invalid: {name}") from error
             if not isinstance(value, dict):
-                raise ReportContractError(
-                    f"report decision evidence must be an object: {name}"
-                )
+                raise ReportContractError(f"report decision evidence must be an object: {name}")
             return value
 
         decision = object_from("decision.json")
@@ -3157,26 +3229,18 @@ class DefaultPilotServices:
             stage_status = StageStatus(str(raw_status))
         except ValueError as error:
             raise ReportContractError("report decision evidence status is invalid") from error
-        expected_status = (
-            StageStatus.SUCCESS if expected_science_eligible else StageStatus.BLOCKED
-        )
+        expected_status = StageStatus.SUCCESS if expected_science_eligible else StageStatus.BLOCKED
         expected_decisions = (
-            {"go", "stop", "inconclusive"}
-            if expected_science_eligible
-            else {"not_evaluated"}
+            {"go", "stop", "inconclusive"} if expected_science_eligible else {"not_evaluated"}
         )
         rationale = f"Decision rationale: `{raw_conclusion}`."
         if (
             stage_status not in _REPORT_STATUS_DECISIONS
             or raw_decision not in _REPORT_STATUS_DECISIONS[stage_status]
-            or _REPORT_DECISION_CONCLUSIONS.get((stage_status, str(raw_decision)))
-            != raw_conclusion
+            or _REPORT_DECISION_CONCLUSIONS.get((stage_status, str(raw_decision))) != raw_conclusion
             or stage_status is not expected_status
             or raw_decision not in expected_decisions
-            or (
-                stage_status is StageStatus.INVALID
-                and raw_conclusion != "resource_gate_failed"
-            )
+            or (stage_status is StageStatus.INVALID and raw_conclusion != "resource_gate_failed")
             or not isinstance(raw_conclusion, str)
             or not raw_conclusion
             or decision.get("schema_version") != "1.0"
@@ -3336,26 +3400,18 @@ class DefaultPilotServices:
         verified: dict[str, tuple[bytes, str, int]] = {}
         captured_bytes = 0
         for name in sorted(expected_names):
-            descriptor, declared_digest, declared_size, identity, initial_mtime_ns = (
-                records[name]
-            )
+            descriptor, declared_digest, declared_size, identity, initial_mtime_ns = records[name]
             buffer = bytearray(declared_size)
             offset = 0
             os.lseek(descriptor, 0, os.SEEK_SET)
             while offset < declared_size:
                 chunk_size = min(1024 * 1024, declared_size - offset)
                 guard.checkpoint(
-                    live_bytes
-                    + captured_bytes
-                    + declared_size
-                    + chunk_size
-                    + capture_overhead
+                    live_bytes + captured_bytes + declared_size + chunk_size + capture_overhead
                 )
                 chunk = os.read(descriptor, chunk_size)
                 if not chunk:
-                    raise ReportContractError(
-                        f"report worker output ended during capture: {name}"
-                    )
+                    raise ReportContractError(f"report worker output ended during capture: {name}")
                 buffer[offset : offset + len(chunk)] = chunk
                 offset += len(chunk)
             if os.read(descriptor, 1):
@@ -3369,9 +3425,7 @@ class DefaultPilotServices:
                 or (after_capture.st_dev, after_capture.st_ino) != identity
             ):
                 raise ReportContractError(f"report worker output changed: {name}")
-            guard.checkpoint(
-                live_bytes + captured_bytes + 2 * declared_size + capture_overhead
-            )
+            guard.checkpoint(live_bytes + captured_bytes + 2 * declared_size + capture_overhead)
             payload = bytes(buffer)
             del buffer
             captured_bytes += declared_size
@@ -3380,10 +3434,9 @@ class DefaultPilotServices:
             try:
                 digest.update(payload)
                 if name in schemas:
-                    actual_schema = (
-                        pq.ParquetFile(pa.BufferReader(payload))
-                        .schema_arrow.remove_metadata()
-                    )
+                    actual_schema = pq.ParquetFile(
+                        pa.BufferReader(payload)
+                    ).schema_arrow.remove_metadata()
                     if not actual_schema.equals(
                         schemas[name].remove_metadata(), check_metadata=False
                     ):
@@ -3454,8 +3507,7 @@ class DefaultPilotServices:
             "gate": gate,
         }
         if (
-            diagnostic["scientific_decision"]
-            not in _REPORT_STATUS_DECISIONS[StageStatus.INVALID]
+            diagnostic["scientific_decision"] not in _REPORT_STATUS_DECISIONS[StageStatus.INVALID]
             or diagnostic["conclusion"] != "resource_gate_failed"
         ):
             raise ReportContractError("invalid report decision evidence is inconsistent")
@@ -3552,7 +3604,6 @@ class DefaultPilotServices:
                 ),
                 "train-baselines": (
                     "train-baselines/selection_manifest.json",
-                    "train-baselines/predictions.parquet",
                     "train-baselines/diagnostics.json",
                     "train-baselines/models/baseline_models.pkl",
                     "train-baselines/models/manifest.json",
@@ -3569,6 +3620,7 @@ class DefaultPilotServices:
                 ),
                 "benchmark": (
                     "benchmark/selection_manifest.json",
+                    "benchmark/baseline_predictions.parquet",
                     "benchmark/exact_predictions.parquet",
                     "benchmark/finite_shot_predictions.parquet",
                     "benchmark/diagnostics.json",
@@ -3604,9 +3656,7 @@ class DefaultPilotServices:
             def captured_object(relative: str) -> dict[str, Any]:
                 return self._object_from_captured(captured[relative], relative)
 
-            circuit_manifest = captured_object(
-                "build-photonic-features/circuit_manifest.json"
-            )
+            circuit_manifest = captured_object("build-photonic-features/circuit_manifest.json")
             raw_circuits = circuit_manifest.get("circuits")
             if not isinstance(raw_circuits, list):
                 raise ReportContractError("circuit manifest has no circuit inventory")
@@ -3625,19 +3675,13 @@ class DefaultPilotServices:
                     )
                 declared_circuits.add(path)
             captured_circuits = {
-                path
-                for path in captured
-                if path.startswith("build-photonic-features/circuits/")
+                path for path in captured if path.startswith("build-photonic-features/circuits/")
             }
             if declared_circuits != captured_circuits:
                 raise ReportContractError("circuit manifest inventory is missing or extra")
             selection_manifest = captured_object("benchmark/selection_manifest.json")
-            baseline_selection = captured_object(
-                "train-baselines/selection_manifest.json"
-            )
-            baseline_model_manifest = captured_object(
-                "train-baselines/models/manifest.json"
-            )
+            baseline_selection = captured_object("train-baselines/selection_manifest.json")
+            baseline_model_manifest = captured_object("train-baselines/models/manifest.json")
             benchmark_model_manifest = captured_object("benchmark/models/manifest.json")
             split_feature_manifest = captured_object("build-splits/feature_manifest.json")
             photonic_feature_manifest = captured_object(
@@ -3661,17 +3705,14 @@ class DefaultPilotServices:
                 "benchmark": "benchmark/resource_ledger.json",
             }
             resource_ledgers = {
-                stage: captured_object(path)
-                for stage, path in ledger_paths.items()
+                stage: captured_object(path) for stage, path in ledger_paths.items()
             }
             environment_manifest = captured_object("environment_manifest.json")
             provenance = {
                 "run_id": store.root.name,
                 "config_sha256": store.config_hash,
                 "canonical_data_sha256": data_card.get("canonical_sha256"),
-                "environment_manifest_sha256": input_hashes[
-                    "environment_manifest.json"
-                ],
+                "environment_manifest_sha256": input_hashes["environment_manifest.json"],
                 "source_manifest_sha256": input_hashes["source_manifest.json"],
                 "run_manifest_sha256": input_hashes["run_manifest.json"],
                 "code": environment_manifest.get("git"),
@@ -3688,9 +3729,7 @@ class DefaultPilotServices:
             }
             staging_parent = store.root.resolve()
             worker_root = Path(
-                tempfile.mkdtemp(
-                    prefix=f".report-worker-{os.getpid()}-", dir=staging_parent
-                )
+                tempfile.mkdtemp(prefix=f".report-worker-{os.getpid()}-", dir=staging_parent)
             )
             if (
                 worker_root.resolve().parent != staging_parent
@@ -3705,12 +3744,8 @@ class DefaultPilotServices:
             output_root.mkdir()
             control_root.mkdir()
             snapshots = {
-                "exact_predictions.parquet": captured[
-                    "benchmark/exact_predictions.parquet"
-                ],
-                "baseline_predictions.parquet": captured[
-                    "train-baselines/predictions.parquet"
-                ],
+                "exact_predictions.parquet": captured["benchmark/exact_predictions.parquet"],
+                "baseline_predictions.parquet": captured["benchmark/baseline_predictions.parquet"],
                 "finite_shot_predictions.parquet": captured[
                     "benchmark/finite_shot_predictions.parquet"
                 ],
@@ -3740,9 +3775,7 @@ class DefaultPilotServices:
                 "protocol": config.protocol.version,
                 "canonical_data_schema": data_card.get("canonical_schema_version"),
                 "split_feature_schema": split_feature_manifest.get("schema_version"),
-                "photonic_feature_schema": photonic_feature_manifest.get(
-                    "schema_version"
-                ),
+                "photonic_feature_schema": photonic_feature_manifest.get("schema_version"),
                 "benchmark_schema": selection_manifest.get("schema_version"),
                 "prediction_fit_phase": "train_plus_validation_refit",
             }
@@ -3750,15 +3783,11 @@ class DefaultPilotServices:
             output_transfers: dict[str, object] = {}
             try:
                 for name, descriptor in input_descriptors.items():
-                    transfer = duplicate_descriptor_for_worker(
-                        descriptor, writable=False
-                    )
+                    transfer = duplicate_descriptor_for_worker(descriptor, writable=False)
                     worker_transfers.append(transfer)
                     input_transfers[name] = transfer
                 for name, descriptor in output_descriptors.items():
-                    transfer = duplicate_descriptor_for_worker(
-                        descriptor, writable=True
-                    )
+                    transfer = duplicate_descriptor_for_worker(descriptor, writable=True)
                     worker_transfers.append(transfer)
                     output_transfers[name] = transfer
                 worker_request = {
@@ -3769,7 +3798,7 @@ class DefaultPilotServices:
                             "benchmark/exact_predictions.parquet"
                         ],
                         "baseline_predictions.parquet": input_hashes[
-                            "train-baselines/predictions.parquet"
+                            "benchmark/baseline_predictions.parquet"
                         ],
                         "finite_shot_predictions.parquet": input_hashes[
                             "benchmark/finite_shot_predictions.parquet"
@@ -3824,9 +3853,7 @@ class DefaultPilotServices:
                 expected_data_provenance=config.protocol.provenance.value,
                 expected_approved_by=config.protocol.approved_by,
                 expected_approved_at=(
-                    config.protocol.approved_at.astimezone(UTC)
-                    .isoformat()
-                    .replace("+00:00", "Z")
+                    config.protocol.approved_at.astimezone(UTC).isoformat().replace("+00:00", "Z")
                     if config.protocol.approved_at is not None
                     else None
                 ),
@@ -3974,9 +4001,7 @@ class DefaultPilotServices:
                 shutil.rmtree(worker_root, ignore_errors=True)
         return result
 
-    def run_pilot(
-        self, *, config: Path | None, run_dir: Path | None
-    ) -> StageResult:
+    def run_pilot(self, *, config: Path | None, run_dir: Path | None) -> StageResult:
         """Initialize or resume the exact immutable G0-G3 stage sequence."""
 
         if (config is None) == (run_dir is None):
@@ -4029,9 +4054,7 @@ class DefaultPilotServices:
                     run_config = self._run_config(store)
                     if run_config.protocol.provenance is DataProvenance.SYNTHETIC:
                         final = final.model_copy(
-                            update={
-                                "completion_kind": CompletionKind.SYNTHETIC_SOFTWARE_ACCEPTANCE
-                            }
+                            update={"completion_kind": CompletionKind.SYNTHETIC_SOFTWARE_ACCEPTANCE}
                         )
                 return with_run_path(final)
             successful_stages.append(final.stage)

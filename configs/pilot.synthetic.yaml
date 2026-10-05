@@ -42,6 +42,7 @@ photonics:
   modes: [4, 6]
   primary_photons: 2
   max_photons: 3
+  enable_three_photon_profile: false
   backend: SLOS
   phase_scales: [1.5707963267948966, 3.141592653589793]
   raw_attempt_budgets: [1000, 10000]

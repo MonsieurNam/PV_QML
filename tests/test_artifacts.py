@@ -12,6 +12,7 @@ import pytest
 import yaml
 from test_config import valid_config
 
+import pv_pilot.artifacts as artifacts_module
 from pv_pilot.artifacts import RunStore, sha256_file
 from pv_pilot.config import LoadedPilotConfig, load_config
 from pv_pilot.services import DefaultPilotServices
@@ -131,6 +132,120 @@ def test_open_can_require_an_expected_config_hash(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="config hash"):
         RunStore.open(store.root, expected_config_hash="0" * 64)
+
+
+def _initialize_tracked_project(loaded: LoadedPilotConfig) -> None:
+    project = loaded.project_root
+    (project / "src").mkdir(exist_ok=True)
+    (project / "src" / "pilot.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (project / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=project, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=project, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=project, check=True)
+    subprocess.run(["git", "add", "."], cwd=project, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "fixture"],
+        cwd=project,
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_resume_rejects_tracked_source_or_lock_drift_but_ignores_untracked_files(
+    tmp_path: Path,
+) -> None:
+    loaded = make_loaded_config(tmp_path)
+    _initialize_tracked_project(loaded)
+    store = RunStore.create(loaded, now=FIXED_NOW)
+
+    (loaded.project_root / "untracked-research.pdf").write_bytes(b"untracked")
+    RunStore.open(store.root)
+
+    source = loaded.project_root / "src/pilot.py"
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="execution provenance"):
+        RunStore.open(store.root)
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+
+    (loaded.project_root / "uv.lock").write_text("version = 2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="execution provenance"):
+        RunStore.open(store.root)
+
+
+def test_resume_rejects_environment_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    loaded = make_loaded_config(tmp_path)
+    _initialize_tracked_project(loaded)
+    store = RunStore.create(loaded, now=FIXED_NOW)
+    original = artifacts_module._package_versions
+
+    def changed_packages() -> dict[str, str | None]:
+        packages = original()
+        packages["numpy"] = "0.0-drift"
+        return packages
+
+    monkeypatch.setattr(artifacts_module, "_package_versions", changed_packages)
+    with pytest.raises(ValueError, match="execution provenance"):
+        RunStore.open(store.root)
+
+
+def test_provenance_detects_new_source_but_ignores_documentation(tmp_path: Path) -> None:
+    loaded = make_loaded_config(tmp_path)
+    _initialize_tracked_project(loaded)
+    store = RunStore.create(loaded, now=FIXED_NOW)
+    (loaded.project_root / "notes.md").write_text("research", encoding="utf-8")
+    RunStore.open(store.root)
+    (loaded.project_root / "src/new_module.py").write_text("VALUE = 2", encoding="utf-8")
+    with pytest.raises(ValueError, match="execution provenance"):
+        RunStore.open(store.root)
+
+
+def test_historical_artifacts_remain_verifiable_after_execution_drift(tmp_path: Path) -> None:
+    loaded = make_loaded_config(tmp_path)
+    _initialize_tracked_project(loaded)
+    store = RunStore.create(loaded, now=FIXED_NOW)
+    (loaded.project_root / "src/pilot.py").write_text("VALUE = 2", encoding="utf-8")
+    historical = RunStore.open(store.root, verify_execution=False)
+    with (
+        pytest.raises(ValueError, match="execution provenance"),
+        historical.stage("validate-data"),
+    ):
+        pytest.fail("execution must not proceed")
+
+
+def test_resume_rejects_original_configuration_file_drift(tmp_path: Path) -> None:
+    loaded = make_loaded_config(tmp_path)
+    store = RunStore.create(loaded, now=FIXED_NOW)
+    loaded.config_file.write_text(loaded.config_file.read_text() + "\n# drift\n")
+    with pytest.raises(ValueError, match="execution provenance"):
+        RunStore.open(store.root)
+
+
+def test_init_rejects_unavailable_executing_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loaded = make_loaded_config(tmp_path)
+    monkeypatch.setattr(artifacts_module, "__file__", str(tmp_path / "src/pv_pilot/artifacts.py"))
+    with pytest.raises(ValueError, match=r"execution provenance.*source"):
+        RunStore.create(loaded, now=FIXED_NOW)
+
+
+def test_snapshot_rejects_linked_ancestor_inside_run(tmp_path: Path) -> None:
+    store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
+    target = store.root / "target"
+    target.mkdir()
+    (target / "value.json").write_bytes(b"{}")
+    linked = store.root / "linked"
+    try:
+        linked.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlink unavailable")
+    from pv_pilot.services import _ResourceGuard
+
+    guard = _ResourceGuard(
+        started=__import__("time").perf_counter(), wall_seconds=60, memory_bytes=1024**3
+    )
+    with pytest.raises(ValueError, match="unsafe"):
+        DefaultPilotServices._capture_report_artifact(store, "linked/value.json", None, guard, 0)
 
 
 def test_stage_order_resume_and_manifest_contract(tmp_path: Path) -> None:
@@ -428,9 +543,7 @@ def test_selected_outputs_rejects_generic_benchmark_allowlist_bypass(
             prerequisite_verification="selected_outputs",
             prerequisite_output_allowlist={
                 "train-baselines": ("train-baselines/keep.bin",),
-                "build-photonic-features": (
-                    "build-photonic-features/keep.bin",
-                ),
+                "build-photonic-features": ("build-photonic-features/keep.bin",),
             },
             now=FIXED_NOW,
         )
@@ -449,7 +562,9 @@ def test_benchmark_selected_outputs_cannot_ignore_tampered_required_output(
         transaction.write_bytes("minmax_scalers.json", b"{}")
         transaction.write_bytes("holdout_features.parquet", b"holdout")
     with store.stage("train-baselines", now=FIXED_NOW) as transaction:
-        transaction.write_bytes("predictions.parquet", b"predictions")
+        transaction.write_bytes("selection_manifest.json", b"{}")
+        transaction.write_bytes("models/baseline_models.pkl", b"models")
+        transaction.write_bytes("models/manifest.json", b"{}")
     with store.stage(
         "build-photonic-features",
         input_paths=(
@@ -478,7 +593,11 @@ def test_benchmark_selected_outputs_cannot_ignore_tampered_required_output(
     state_spaces = store.root / "build-photonic-features/state_spaces.json"
     state_spaces.write_bytes(b"tampered states")
     common = {
-        "train-baselines": ("train-baselines/predictions.parquet",),
+        "train-baselines": (
+            "train-baselines/selection_manifest.json",
+            "train-baselines/models/baseline_models.pkl",
+            "train-baselines/models/manifest.json",
+        ),
         "build-photonic-features": (
             "build-photonic-features/development_photonic_features.parquet",
             "build-photonic-features/circuit_manifest.json",
@@ -490,7 +609,9 @@ def test_benchmark_selected_outputs_cannot_ignore_tampered_required_output(
         store.stage(
             "benchmark",
             input_paths=(
-                "train-baselines/predictions.parquet",
+                "train-baselines/selection_manifest.json",
+                "train-baselines/models/baseline_models.pkl",
+                "train-baselines/models/manifest.json",
                 "build-photonic-features/development_photonic_features.parquet",
                 "build-photonic-features/circuit_manifest.json",
                 "build-photonic-features/feature_manifest.json",
@@ -513,7 +634,9 @@ def test_benchmark_selected_outputs_cannot_ignore_tampered_required_output(
         store.stage(
             "benchmark",
             input_paths=(
-                "train-baselines/predictions.parquet",
+                "train-baselines/selection_manifest.json",
+                "train-baselines/models/baseline_models.pkl",
+                "train-baselines/models/manifest.json",
                 *exact["build-photonic-features"],
                 ".benchmark-holdout-access/intent.json",
                 ".benchmark-holdout-access/cache.parquet",
@@ -638,13 +761,9 @@ def test_post_link_interruption_rolls_back_and_stage_can_rerun(
     original_unlink = Path.unlink
     interruption_injected = False
 
-    def interrupt_first_matching_unlink(
-        path: Path, *, missing_ok: bool = False
-    ) -> None:
+    def interrupt_first_matching_unlink(path: Path, *, missing_ok: bool = False) -> None:
         nonlocal interruption_injected
-        is_output_temp = (
-            path.name == "validated.csv" and path.parent.name.startswith(".stage-")
-        )
+        is_output_temp = path.name == "validated.csv" and path.parent.name.startswith(".stage-")
         is_marker_temp = path.suffix == ".tmp" and path.parent.name == "validate-data"
         selected = is_marker_temp if interrupted_publish == "marker" else is_output_temp
         if selected and not interruption_injected:
@@ -697,18 +816,14 @@ def test_publish_return_interruption_uses_pre_registered_ownership(
     previous_trace = sys.gettrace()
     interruption_injected = False
 
-    def interrupt_on_publish_return(
-        frame: Any, event: str, argument: object
-    ) -> Any:
+    def interrupt_on_publish_return(frame: Any, event: str, argument: object) -> Any:
         del argument
         nonlocal interruption_injected
         if frame.f_code.co_name == "_publish_temp" and event == "return":
             destination: object = frame.f_locals.get("destination")
             if isinstance(destination, Path):
                 is_marker = destination.name == "stage_manifest.json"
-                selected = (
-                    is_marker if interrupted_publish == "marker" else not is_marker
-                )
+                selected = is_marker if interrupted_publish == "marker" else not is_marker
                 if selected and not interruption_injected:
                     interruption_injected = True
                     sys.settrace(previous_trace)
@@ -792,11 +907,7 @@ def test_publication_rollback_cannot_unlink_replacement_after_identity_check(
     def replace_after_stat(path: Path, *args: Any, **kwargs: Any) -> os.stat_result:
         nonlocal race_injected
         result = original_stat(path, *args, **kwargs)
-        if (
-            path == output
-            and kwargs.get("follow_symlinks") is False
-            and not race_injected
-        ):
+        if path == output and kwargs.get("follow_symlinks") is False and not race_injected:
             output.unlink()
             output.write_text("external racer", encoding="utf-8")
             race_injected = True
@@ -861,13 +972,9 @@ def test_publication_rollback_preserves_quarantined_foreign_file_when_raced(
 
     assert race_injected
     assert output.read_text(encoding="utf-8") == "concurrent racer"
-    quarantines = [
-        path for path in output.parent.iterdir() if path.name.startswith(".rollback-")
-    ]
+    quarantines = [path for path in output.parent.iterdir() if path.name.startswith(".rollback-")]
     assert len(quarantines) == 1
-    assert (quarantines[0] / "entry").read_text(encoding="utf-8") == (
-        "foreign before rollback"
-    )
+    assert (quarantines[0] / "entry").read_text(encoding="utf-8") == ("foreign before rollback")
 
 
 def test_publication_rollback_recovers_from_interrupt_after_quarantine_move(
@@ -1153,19 +1260,15 @@ with store.stage("validate-data", terminal_status={terminal_status!r}) as transa
     marker = store.root / "validate-data/stage_manifest.json"
     assert read_json(marker)["status"] == terminal_status
     assert any(
-        path.name.startswith(".rollback-")
-        for path in (store.root / "validate-data").iterdir()
+        path.name.startswith(".rollback-") for path in (store.root / "validate-data").iterdir()
     )
     resumed = RunStore.open(store.root)
-    resumed.verify_terminal_stage(
-        "validate-data", accepted_statuses=frozenset({terminal_status})
-    )
+    resumed.verify_terminal_stage("validate-data", accepted_statuses=frozenset({terminal_status}))
     result = DefaultPilotServices().validate_data(store.root)
     assert result.status.value == terminal_status.lower()
     assert "already" in (result.message or "")
     assert not any(
-        path.name.startswith(".rollback-")
-        for path in (store.root / "validate-data").iterdir()
+        path.name.startswith(".rollback-") for path in (store.root / "validate-data").iterdir()
     )
 
 
@@ -1179,11 +1282,17 @@ from pv_pilot.artifacts import RunStore
 store = RunStore.open(Path({str(store.root)!r}))
 store._release_publications = lambda publications: os._exit(91)
 with store.stage("validate-data", terminal_status="BLOCKED") as transaction:
-    transaction.write_text("stage_result.json", {json.dumps({
-        "schema_version": "1.0",
-        "stage": "validate-data",
-        "status": "blocked",
-    }, separators=(",", ":"), sort_keys=True)!r})
+    transaction.write_text("stage_result.json", {
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "stage": "validate-data",
+                "status": "blocked",
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )!r
+    })
 """
     completed = subprocess.run(
         [sys.executable, "-c", script], check=False, capture_output=True, text=True
@@ -1247,9 +1356,12 @@ def test_stage_revalidates_input_hashes_immediately_before_publication(
     store = RunStore.create(make_loaded_config(tmp_path), now=FIXED_NOW)
     input_path = store.write_text("mutable-input.txt", "before")
 
-    with pytest.raises(ValueError, match=r"input.*changed"), store.stage(
-        "validate-data", input_paths=["mutable-input.txt"], now=FIXED_NOW
-    ) as transaction:
+    with (
+        pytest.raises(ValueError, match=r"input.*changed"),
+        store.stage(
+            "validate-data", input_paths=["mutable-input.txt"], now=FIXED_NOW
+        ) as transaction,
+    ):
         transaction.write_text("validated.csv", "output")
         input_path.write_text("after", encoding="utf-8")
 

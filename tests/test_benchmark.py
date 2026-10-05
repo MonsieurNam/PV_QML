@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import json
 import math
+import pickle
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, cast
@@ -15,7 +16,12 @@ import yaml
 from sklearn.preprocessing import StandardScaler
 
 from pv_pilot.artifacts import RunStore
-from pv_pilot.baselines import DirectFitExecutor, QuantileHeads
+from pv_pilot.baselines import (
+    BaselineModelBundle,
+    DirectFitExecutor,
+    PersistenceModel,
+    QuantileHeads,
+)
 from pv_pilot.benchmark import (
     PhotonicBenchmarkContractError,
     PhotonicSelectionResult,
@@ -41,6 +47,11 @@ from pv_pilot.photonics import (
 from pv_pilot.seeds import SeedManager
 from pv_pilot.services import DefaultPilotServices
 from pv_pilot.splits import feature_dataframe_parquet_bytes, feature_schema_sha256
+
+
+class _ConstantQuantilePredictor:
+    def predict(self, values: np.ndarray) -> np.ndarray:
+        return np.tile(np.linspace(1.0, 2.0, 7), (len(values), 1))
 
 
 @lru_cache(maxsize=1)
@@ -552,8 +563,38 @@ def _make_service_run(tmp_path: Path) -> RunStore:
             "stage_result.json",
             deterministic_data(StageResult(stage="build-splits", status=StageStatus.SUCCESS)),
         )
+    quantiles = tuple(loaded.config.evaluation.quantiles)
+    columns = ("power_lag_0m_kw", "power_lag_15m_kw", "ghi_w_m2", "air_temp_c")
+    baseline_models = {
+        "persistence": PersistenceModel(quantiles, np.zeros(7, dtype=np.float64)),
+        "raw": BaselineModelBundle("raw", columns, _ConstantQuantilePredictor()),
+        "rff": BaselineModelBundle("rff", columns, _ConstantQuantilePredictor()),
+        "xgboost": BaselineModelBundle("xgboost", columns, _ConstantQuantilePredictor()),
+    }
+    baseline_model_bytes = pickle.dumps(baseline_models, protocol=5)
+    baseline_freeze = "b" * 64
     with store.stage("train-baselines") as transaction:
-        transaction.write_bytes("predictions.parquet", b"immutable-baseline-predictions")
+        transaction.write_json(
+            "selection_manifest.json",
+            {
+                "schema_version": "1.0",
+                "selection_freeze_sha256": baseline_freeze,
+                "holdout_access": "benchmark_only_after_photonic_freeze",
+                "selected": {
+                    branch: {"feature_columns": list(columns)}
+                    for branch in ("raw", "rff", "xgboost")
+                },
+            },
+        )
+        transaction.write_bytes("models/baseline_models.pkl", baseline_model_bytes)
+        transaction.write_json(
+            "models/manifest.json",
+            {
+                "schema_version": "1.0",
+                "models_sha256": hashlib.sha256(baseline_model_bytes).hexdigest(),
+                "selection_freeze_sha256": baseline_freeze,
+            },
+        )
         transaction.write_json(
             "stage_result.json",
             deterministic_data(StageResult(stage="train-baselines", status=StageStatus.SUCCESS)),
@@ -878,17 +919,92 @@ def test_benchmark_service_freezes_before_holdout_and_resumes(
     finite = pd.read_parquet(store.root / "benchmark/finite_shot_predictions.parquet")
     assert len(exact) == 10
     assert len(finite) == 10
+    baseline = pd.read_parquet(store.root / "benchmark/baseline_predictions.parquet")
+    assert len(baseline) == 4
+    assert not (store.root / "train-baselines/predictions.parquet").exists()
     manifest = json.loads(
         (store.root / "benchmark/selection_manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["holdout_audit"]["materialization_count"] == 1
-    assert manifest["baseline_predictions"]["policy"] == ("immutable_reuse_no_retrain_no_repredict")
+    assert manifest["baseline_predictions"]["policy"] == (
+        "same_authenticated_holdout_after_photonic_freeze"
+    )
     assert manifest["scientific_decision"] == "NOT_EVALUATED"
     marker = json.loads((store.root / "benchmark/stage_manifest.json").read_text(encoding="utf-8"))
     assert marker["status"] == "SUCCESS"
     assert marker["details"]["selection_freeze_sha256"] == manifest["selection_freeze_sha256"]
+    assert marker["input_hashes"][".benchmark-holdout-access/cache.parquet"] == (
+        manifest["holdout_audit"]["source_sha256"]
+    ) == manifest["holdout_audit"]["cache_sha256"]
     reject_holdout_hash = True
     store.verify_terminal_stage("benchmark")
+
+
+def test_benchmark_parses_authenticated_development_snapshot_after_path_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pv_pilot.benchmark as benchmark_module
+
+    services_module: Any = importlib.import_module("pv_pilot.services")
+    store = _make_service_run(tmp_path)
+    _install_fast_benchmark_service(monkeypatch, services_module, benchmark_module)
+    service = DefaultPilotServices()
+    development_path = (
+        store.root / "build-photonic-features/development_photonic_features.parquet"
+    )
+    original_digest = hashlib.sha256(development_path.read_bytes()).hexdigest()
+    original_capture = service._capture_report_artifact
+    replaced = False
+
+    def capture_then_replace(*args: Any, **kwargs: Any) -> tuple[bytes, int]:
+        nonlocal replaced
+        payload, live = original_capture(*args, **kwargs)
+        if kwargs.get("relative_path") == (
+            "build-photonic-features/development_photonic_features.parquet"
+        ):
+            development_path.write_bytes(b"replacement-after-capture")
+            replaced = True
+        return payload, live
+
+    monkeypatch.setattr(service, "_capture_report_artifact", capture_then_replace)
+    result = service.benchmark(store.root)
+
+    assert replaced is True
+    assert result.status is StageStatus.SUCCESS
+    marker = json.loads(
+        (store.root / "benchmark/stage_manifest.json").read_text(encoding="utf-8")
+    )
+    assert marker["input_hashes"][
+        "build-photonic-features/development_photonic_features.parquet"
+    ] == original_digest
+
+
+def test_benchmark_holdout_materialization_rejects_mutation_of_open_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pv_pilot.benchmark as benchmark_module
+
+    services_module: Any = importlib.import_module("pv_pilot.services")
+    store = _make_service_run(tmp_path)
+    _install_fast_benchmark_service(monkeypatch, services_module, benchmark_module)
+    holdout_path = store.root / "build-splits/holdout_features.parquet"
+    original_open = services_module.os.open
+    swapped = False
+
+    def open_then_replace(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal swapped
+        descriptor = original_open(path, flags, *args, **kwargs)
+        if Path(path).name == "holdout_features.parquet" and not swapped:  # type: ignore[arg-type]
+            holdout_path.write_bytes(b"mutation-after-descriptor-open")
+            swapped = True
+        return descriptor
+
+    monkeypatch.setattr(services_module.os, "open", open_then_replace)
+    with pytest.raises(ValueError, match=r"snapshot input changed while (opening|captured)"):
+        DefaultPilotServices().benchmark(store.root)
+
+    assert swapped is True
+    assert not (store.root / "benchmark/stage_manifest.json").exists()
 
 
 def _install_fast_benchmark_service(
@@ -1032,6 +1148,65 @@ def test_holdout_complete_cache_resumes_success_without_reopening_source(
     resumed = DefaultPilotServices().benchmark(store.root)
     assert resumed.status is StageStatus.SUCCESS
     assert source_opens == 1
+
+
+@pytest.mark.parametrize("tamper", ["intent", "cache", "complete", "cache_and_complete"])
+@pytest.mark.parametrize("resume", [False, True])
+def test_same_attempt_holdout_journal_mutation_cannot_rebind_consumed_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str, resume: bool
+) -> None:
+    import pv_pilot.benchmark as benchmark_module
+
+    services_module: Any = importlib.import_module("pv_pilot.services")
+    store = _make_service_run(tmp_path)
+    _install_fast_benchmark_service(monkeypatch, services_module, benchmark_module)
+    service = DefaultPilotServices()
+
+    def crash_after_complete() -> None:
+        raise RuntimeError("stop after durable COMPLETE")
+
+    if resume:
+        monkeypatch.setattr(
+            service, "_after_benchmark_holdout_cache_complete", crash_after_complete
+        )
+        with pytest.raises(RuntimeError, match="durable COMPLETE"):
+            service.benchmark(store.root)
+
+    access_root = store.root / ".benchmark-holdout-access"
+
+    def mutate_journal() -> None:
+        if tamper in {"cache", "cache_and_complete"}:
+            cache_path = access_root / "cache.parquet"
+            frame = pd.read_parquet(cache_path)
+            frame.loc[0, "target_ac_power_kw"] += 0.125
+            cache_bytes = feature_dataframe_parquet_bytes(frame, _config())
+            cache_path.write_bytes(cache_bytes)
+        if tamper == "cache_and_complete":
+            complete_path = access_root / "complete.json"
+            complete = json.loads(complete_path.read_text(encoding="utf-8"))
+            complete["cache_sha256"] = hashlib.sha256(cache_bytes).hexdigest()
+            complete_path.write_text(json.dumps(complete), encoding="utf-8")
+        elif tamper in {"intent", "complete"}:
+            path = access_root / f"{tamper}.json"
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["access_id"] = "f" * 32
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+    if resume:
+        original_load = service._load_or_materialize_benchmark_holdout
+
+        def load_then_mutate(**kwargs: Any) -> Any:
+            result = original_load(**kwargs)
+            mutate_journal()
+            return result
+
+        monkeypatch.setattr(service, "_load_or_materialize_benchmark_holdout", load_then_mutate)
+    else:
+        monkeypatch.setattr(service, "_after_benchmark_holdout_cache_complete", mutate_journal)
+
+    with pytest.raises(ValueError, match="checksum"):
+        service.benchmark(store.root)
+    assert not (store.root / "benchmark/stage_manifest.json").exists()
 
 
 @pytest.mark.parametrize(

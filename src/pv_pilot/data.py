@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import math
 from collections import Counter
@@ -20,6 +21,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from .artifacts import authenticated_snapshot
 from .config import DataConfig
 from .domain import StageStatus
 
@@ -76,8 +78,7 @@ class DataValidationResult:
     @property
     def exclusion_counts(self) -> dict[str, int]:
         return {
-            key: int(value)
-            for key, value in sorted(Counter(self.exclusions["reason"]).items())
+            key: int(value) for key, value in sorted(Counter(self.exclusions["reason"]).items())
         }
 
 
@@ -171,45 +172,36 @@ def _exclusion_frame(records: list[dict[str, object]]) -> pd.DataFrame:
 
 
 def _read_source(
-    path: Path,
+    payload: bytes,
     format_: Literal["csv", "parquet"],
     resource_checkpoint: ResourceCheckpoint | None,
 ) -> pd.DataFrame:
     if format_ == "csv":
-        with path.open("r", encoding="utf-8-sig", newline="") as stream:
+        with io.TextIOWrapper(io.BytesIO(payload), encoding="utf-8-sig", newline="") as stream:
             header = next(
-                (
-                    row
-                    for row in csv.reader(stream)
-                    if row and any(field.strip() for field in row)
-                ),
+                (row for row in csv.reader(stream) if row and any(field.strip() for field in row)),
                 None,
             )
         if header is None:
             raise DataContractError("CSV input has no header")
-        duplicates = sorted(
-            name for name, count in Counter(header).items() if count > 1
-        )
+        duplicates = sorted(name for name, count in Counter(header).items() if count > 1)
         if duplicates:
-            raise DataContractError(
-                f"duplicate CSV header columns: {', '.join(duplicates)}"
-            )
+            raise DataContractError(f"duplicate CSV header columns: {', '.join(duplicates)}")
         frame = pd.read_csv(
-            path,
+            io.BytesIO(payload),
             encoding="utf-8-sig",
             keep_default_na=False,
             na_filter=False,
         )
     else:
-        parquet = pq.ParquetFile(path)
+        parquet = pq.ParquetFile(io.BytesIO(payload))
         metadata = parquet.metadata
         uncompressed_bytes = sum(
-            metadata.row_group(index).total_byte_size
-            for index in range(metadata.num_row_groups)
+            metadata.row_group(index).total_byte_size for index in range(metadata.num_row_groups)
         )
         if resource_checkpoint is not None:
             resource_checkpoint(uncompressed_bytes)
-        frame = pd.read_parquet(path)
+        frame = pd.read_parquet(io.BytesIO(payload))
     if resource_checkpoint is not None:
         resource_checkpoint(int(frame.memory_usage(index=True, deep=True).sum()))
     return frame
@@ -255,7 +247,7 @@ def exclusion_arrow_schema() -> pa.Schema:
 
 
 def canonicalize_data(
-    path: str | Path,
+    path: str | Path | bytes,
     config: DataConfig,
     format_: Literal["csv", "parquet"] | None = None,
     resource_checkpoint: ResourceCheckpoint | None = None,
@@ -268,10 +260,12 @@ def canonicalize_data(
     precisely the right-closed interval ``(end-5m, end]``.
     """
 
-    source_path = Path(path)
-    source = _read_source(
-        source_path, format_ or config.format, resource_checkpoint
-    ).copy(deep=True)
+    payload = (
+        path
+        if isinstance(path, bytes)
+        else authenticated_snapshot(Path(path).absolute(), checkpoint=resource_checkpoint)
+    )
+    source = _read_source(payload, format_ or config.format, resource_checkpoint).copy(deep=True)
     if resource_checkpoint is not None:
         resource_checkpoint(int(source.memory_usage(index=True, deep=True).sum()))
     mapping = config.columns
@@ -388,12 +382,9 @@ def canonicalize_data(
             span = timestamps.max() - timestamps.min()
             if span > pd.Timedelta(days=MAX_SITE_SPAN_DAYS):
                 raise DataContractError(
-                    f"site {site!r} exceeds maximum site span of "
-                    f"{MAX_SITE_SPAN_DAYS} days"
+                    f"site {site!r} exceeds maximum site span of {MAX_SITE_SPAN_DAYS} days"
                 )
-    duplicate_groups = valid.groupby(
-        ["_pv_pilot_site", "_pv_pilot_timestamp"], dropna=False
-    ).groups
+    duplicate_groups = valid.groupby(["_pv_pilot_site", "_pv_pilot_timestamp"], dropna=False).groups
     for indices in duplicate_groups.values():
         if len(indices) > 1:
             for index in indices:
@@ -428,9 +419,7 @@ def canonicalize_data(
         if policy.column is None:
             assert policy.fixed_latency_minutes is not None
             try:
-                return (
-                    interval + pd.Timedelta(minutes=policy.fixed_latency_minutes)
-                ).as_unit("ns")
+                return (interval + pd.Timedelta(minutes=policy.fixed_latency_minutes)).as_unit("ns")
             except (OverflowError, ValueError):
                 exclude(
                     index,
@@ -463,9 +452,7 @@ def canonicalize_data(
             stamp = source.at[index, "_pv_pilot_timestamp"]
             assert isinstance(stamp, pd.Timestamp)
             record: dict[str, object] = {
-                "sample_id": _sample_id(
-                    str(source.at[index, "_pv_pilot_site"]), stamp
-                ),
+                "sample_id": _sample_id(str(source.at[index, "_pv_pilot_site"]), stamp),
                 "site_id": str(source.at[index, "_pv_pilot_site"]),
                 "interval_end_utc": stamp,
                 "power_available_at_utc": power_available,
@@ -591,11 +578,13 @@ def canonicalize_data(
     if cadence == 5:
         grid_source = source.loc[
             source["_pv_pilot_timestamp"].map(
-                lambda value: isinstance(value, pd.Timestamp)
-                and value.second == 0
-                and value.microsecond == 0
-                and value.nanosecond == 0
-                and value.minute % 5 == 0
+                lambda value: (
+                    isinstance(value, pd.Timestamp)
+                    and value.second == 0
+                    and value.microsecond == 0
+                    and value.nanosecond == 0
+                    and value.minute % 5 == 0
+                )
             )
         ]
         for site, group in grid_source.groupby("_pv_pilot_site", sort=True):

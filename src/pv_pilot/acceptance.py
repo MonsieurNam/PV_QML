@@ -194,7 +194,9 @@ def _latest_run(loaded: LoadedPilotConfig) -> tuple[RunStore, Path, Path]:
     if resolved_candidate.parent != resolved_artifact_root or not resolved_candidate.is_dir():
         raise AcceptanceError("latest run candidate is not a direct safe directory")
     try:
-        store = RunStore.open(candidate, expected_config_hash=loaded.config_hash())
+        store = RunStore.open(
+            candidate, expected_config_hash=loaded.config_hash(), verify_execution=False
+        )
     except (FileNotFoundError, ValueError) as error:
         raise AcceptanceError(f"latest run cannot be opened: {error}") from error
     if store.root != resolved_candidate:

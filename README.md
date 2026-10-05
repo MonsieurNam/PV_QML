@@ -68,6 +68,26 @@ Perceval SLOS distributions, and 2,000-replicate bootstrap protocol. Quantile he
 to one candidate are executed as a single resource-monitored worker batch so Windows process
 startup does not dominate the scientific computation.
 
+`train-baselines` selects and refits models using only the development partition. After
+photonic selection is frozen, `benchmark` opens one authenticated holdout snapshot and uses
+that same frame for baseline and photonic predictions. Parsers consume descriptor-captured
+bytes, and stage input hashes describe those exact bytes.
+
+Initialization records source inventories for `src/` and `scripts/`, the configuration file,
+`pyproject.toml`, `uv.lock`, and the executing Python/package environment. Resume and stage
+execution reject provenance drift, including newly added source modules; research notes,
+PDFs, documentation, and bytecode caches do not affect the source inventory. The read-only
+acceptance verifier can inspect historical artifacts after execution provenance has changed.
+
+The v1 primary scientific contract uses two photons and retains a hard cap of three photons.
+Optional three-photon profiling is explicitly disabled (`enable_three_photon_profile: false`);
+enabling it fails configuration validation until its resource gate and profile artifacts are
+implemented. Validation origins are UTC calendar days; they are blocked scoring groups over
+fixed train/validation partitions, not rolling refits.
+
+`configs/pilot.example.yaml` carries the real-pilot caps (12 hours and 24 GiB per stage). The
+synthetic CI configuration deliberately retains its smaller acceptance-only caps.
+
 Run and verify the complete software acceptance path with:
 
 ```powershell

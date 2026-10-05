@@ -15,7 +15,6 @@ import time
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from importlib.metadata import version
 from multiprocessing.process import BaseProcess
 from pathlib import Path
@@ -517,11 +516,10 @@ def xgboost_estimator(
 
 @dataclass(frozen=True, slots=True)
 class BaselineTrainingResult:
-    """Complete in-memory output of validation selection and final test inference."""
+    """Development-only selection and train+validation refit output."""
 
     selection_manifest: dict[str, Any]
     validation_scores: tuple[dict[str, Any], ...]
-    predictions: Any
     diagnostics: dict[str, Any]
     models: dict[str, Any]
 
@@ -966,11 +964,10 @@ def train_baseline_models(
     development_frame: Any,
     config: PilotConfig,
     *,
-    holdout_loader: Callable[[str], Any],
     resource_checkpoint: Callable[[int], None] | None = None,
     fit_executor: FitExecutor | None = None,
 ) -> BaselineTrainingResult:
-    """Select on validation, freeze choices, refit, and open test once for inference."""
+    """Select on validation and refit without opening or predicting holdout data."""
 
     work = _validate_feature_frame(
         development_frame,
@@ -986,7 +983,6 @@ def train_baseline_models(
         raise BaselineContractError("quantile grid does not match the frozen protocol")
     train = work.loc[work["split"] == "train"].copy()
     validation = work.loc[work["split"] == "validation"].copy()
-    # The holdout loader is intentionally not invoked until selection has been frozen.
     seed_manager = SeedManager(config.seeds.master_seed)
     target_train = train["target_ac_power_kw"].to_numpy(dtype=np.float64)
     target_validation = validation["target_ac_power_kw"].to_numpy(dtype=np.float64)
@@ -1177,8 +1173,8 @@ def train_baseline_models(
         "quantile_columns": list(quantile_columns(quantiles)),
         "selection_data": ["train", "validation"],
         "tie_tolerance": TIE_TOLERANCE,
-        "test_access": "after_selection_freeze_once",
-        "test_prediction_passes": 1,
+        "holdout_access": "benchmark_only_after_photonic_freeze",
+        "test_prediction_passes": 0,
         "selected": selected,
         "candidates": candidates,
         "seeds": {
@@ -1290,51 +1286,14 @@ def train_baseline_models(
         branch="xgboost", feature_columns=xgb_columns, predictor=xgb_heads
     )
 
-    holdout_opened_at = datetime.now(UTC)
-    holdout_candidate = holdout_loader(selection_manifest["selection_freeze_sha256"])
-    test = _validate_feature_frame(
-        holdout_candidate,
-        config,
-        expected_splits=frozenset({"test"}),
-        label="holdout",
-    )
-    if set(work["sample_id"].astype(str)) & set(test["sample_id"].astype(str)):
-        raise BaselineContractError("holdout sample_id values overlap development data")
-    test_sample_payload = json.dumps(
-        test["sample_id"].astype(str).tolist(), separators=(",", ":")
-    )
-    row_hashes = pd.util.hash_pandas_object(test, index=False).to_numpy(dtype=np.uint64)
-    selection_manifest["holdout_audit"] = {
-        "event_order": {
-            "selection_frozen": 1,
-            "models_refit": 2,
-            "holdout_opened": 3,
-            "holdout_predicted": 4,
-        },
-        "opened_at_utc": holdout_opened_at.isoformat().replace("+00:00", "Z"),
-        "opened_after_selection_freeze_sha256": selection_manifest[
-            "selection_freeze_sha256"
-        ],
-        "row_content_sha256": hashlib.sha256(row_hashes.tobytes()).hexdigest(),
-        "sample_id_order_sha256": hashlib.sha256(
-            test_sample_payload.encode("utf-8")
-        ).hexdigest(),
-        "prediction_passes": 1,
-    }
-    predictions, final_diagnostics = _prediction_records(
-        test, models, quantiles, selected, executor
-    )
-    checkpoint(int(predictions.memory_usage(index=True, deep=True).sum()))
     output_diagnostics: dict[str, Any] = {
         "schema_version": "1.0",
         "postprocess_order": ["clip_[0,capacity_kw]", "stable_row_sort"],
         "validation": validation_diagnostics,
-        "test": final_diagnostics,
     }
     return BaselineTrainingResult(
         selection_manifest=selection_manifest,
         validation_scores=tuple(candidates),
-        predictions=predictions,
         diagnostics=output_diagnostics,
         models=models,
     )

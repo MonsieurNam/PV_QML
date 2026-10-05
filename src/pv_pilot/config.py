@@ -261,6 +261,7 @@ class PhotonicsConfig(StrictConfigModel):
     modes: tuple[PositiveInt, ...]
     primary_photons: PositiveInt
     max_photons: PositiveInt
+    enable_three_photon_profile: StrictBool = False
     backend: Literal["SLOS"]
     phase_scales: tuple[PositiveFloat, ...]
     raw_attempt_budgets: tuple[PositiveInt, ...]
@@ -277,6 +278,10 @@ class PhotonicsConfig(StrictConfigModel):
             raise ValueError("primary_photons must be 2")
         if self.max_photons < self.primary_photons or self.max_photons > 3:
             raise ValueError("max_photons must include the primary and cannot exceed 3")
+        if self.enable_three_photon_profile:
+            raise ValueError(
+                "v1 supports only the 2-photon primary; 3-photon profiling is disabled"
+            )
         if self.phase_scales != (math.pi / 2, math.pi):
             raise ValueError("phase_scales must be exactly [pi/2, pi]")
         if self.raw_attempt_budgets != (1000, 10000):

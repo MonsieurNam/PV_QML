@@ -64,13 +64,34 @@ def frame_5m() -> pd.DataFrame:
     )
 
 
-def write_input(
-    path: Path, frame: pd.DataFrame, format_: Literal["csv", "parquet"]
-) -> None:
+def write_input(path: Path, frame: pd.DataFrame, format_: Literal["csv", "parquet"]) -> None:
     if format_ == "csv":
         frame.to_csv(path, index=False)
     else:
         frame.to_parquet(path, index=False)
+
+
+@pytest.mark.parametrize("format_", ["csv", "parquet"])
+def test_source_adapter_consumes_snapshot_during_transient_path_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, format_: Literal["csv", "parquet"]
+) -> None:
+    path = tmp_path / f"data.{format_}"
+    write_input(path, frame_5m(), format_)
+    original_bytes = path.read_bytes()
+    original_reader = pd.read_csv if format_ == "csv" else pd.read_parquet
+    tampered = frame_5m()
+    tampered["power_kw"] = 9.0
+
+    def replace_temporarily(source: Any, *args: Any, **kwargs: Any) -> pd.DataFrame:
+        write_input(path, tampered, format_)
+        try:
+            return original_reader(source, *args, **kwargs)
+        finally:
+            path.write_bytes(original_bytes)
+
+    monkeypatch.setattr(pd, "read_csv" if format_ == "csv" else "read_parquet", replace_temporarily)
+    result = canonicalize_data(path, data_config(), format_)
+    assert result.canonical["ac_power_kw"].tolist() == [1.0, 2.0, 3.0]
 
 
 def test_five_minute_normalization_is_utc_stable_and_does_not_mutate_input(
@@ -176,9 +197,7 @@ def test_explicit_availability_uses_latest_constituent_and_preserves_delay(
     path = tmp_path / "delayed.csv"
     frame.to_csv(path, index=False)
 
-    result = canonicalize_data(
-        path, data_config(availability_columns=True), "csv"
-    )
+    result = canonicalize_data(path, data_config(availability_columns=True), "csv")
 
     assert result.status is StageStatus.SUCCESS
     assert result.canonical["weather_available_at_utc"].iloc[0] == pd.Timestamp(
@@ -263,9 +282,7 @@ def test_off_grid_and_nonfinite_rows_are_excluded_without_interpolation(
     result = canonicalize_data(path, data_config(), "csv")
 
     assert set(result.exclusions["reason"]) >= {"off_grid", "nonfinite_numeric"}
-    assert result.canonical["interval_end_utc"].tolist() == [
-        pd.Timestamp("2025-01-01T00:10:00Z")
-    ]
+    assert result.canonical["interval_end_utc"].tolist() == [pd.Timestamp("2025-01-01T00:10:00Z")]
 
 
 def test_five_minute_alignment_rejects_nanosecond_remainder(tmp_path: Path) -> None:
@@ -348,9 +365,7 @@ def make_run(
     if frame is not None:
         write_input(input_path, frame, format_)
     loaded = load_config(config_path, project_root=project)
-    return RunStore.create(
-        loaded, now=datetime(2026, 9, 29, 1, 2, 3, tzinfo=UTC)
-    ), input_path
+    return RunStore.create(loaded, now=datetime(2026, 9, 29, 1, 2, 3, tzinfo=UTC)), input_path
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -642,9 +657,7 @@ def test_nanosecond_availability_is_preserved_in_canonical_parquet(tmp_path: Pat
     path = tmp_path / "availability.parquet"
     frame.to_parquet(path, index=False)
 
-    result = canonicalize_data(
-        path, data_config(availability_columns=True), "parquet"
-    )
+    result = canonicalize_data(path, data_config(availability_columns=True), "parquet")
     payload = dataframe_parquet_bytes(result.canonical, kind="canonical")
     roundtrip = pq.read_table(pa.BufferReader(payload)).to_pandas()
 
@@ -734,9 +747,7 @@ def test_resource_deadline_across_serializers_publishes_durable_invalid(
     store, _ = make_run(tmp_path, frame_5m(), max_wall_seconds=1)
     original = services_module.dataframe_parquet_bytes
 
-    def slow_serializer(
-        frame: pd.DataFrame, *, kind: Literal["canonical", "exclusions"]
-    ) -> bytes:
+    def slow_serializer(frame: pd.DataFrame, *, kind: Literal["canonical", "exclusions"]) -> bytes:
         time.sleep(0.7)
         return original(frame, kind=kind)
 
@@ -788,9 +799,7 @@ def test_out_of_nanosecond_availability_is_durable_invalid(
     frame = frame_5m().iloc[:1].copy()
     frame["power_available"] = [f"{year}-01-01T00:00:00Z"]
     frame["weather_available"] = ["2025-01-01T00:00:00Z"]
-    store, _ = make_run(
-        tmp_path, frame, format_=format_, availability_columns=True
-    )
+    store, _ = make_run(tmp_path, frame, format_=format_, availability_columns=True)
 
     result = DefaultPilotServices().validate_data(store.root)
     exclusions = pd.read_parquet(store.root / "validate-data/qc_exclusions.parquet")

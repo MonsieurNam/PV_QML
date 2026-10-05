@@ -70,7 +70,11 @@ _TASK7_SELECTED_OUTPUTS = (
     "build-splits/minmax_scalers.json",
 )
 _BENCHMARK_SELECTED_STAGE = "benchmark"
-_BENCHMARK_BASELINE_OUTPUTS = ("train-baselines/predictions.parquet",)
+_BENCHMARK_BASELINE_OUTPUTS = (
+    "train-baselines/selection_manifest.json",
+    "train-baselines/models/baseline_models.pkl",
+    "train-baselines/models/manifest.json",
+)
 _BENCHMARK_PHOTONIC_REQUIRED_OUTPUTS = frozenset(
     {
         "build-photonic-features/development_photonic_features.parquet",
@@ -81,6 +85,9 @@ _BENCHMARK_PHOTONIC_REQUIRED_OUTPUTS = frozenset(
 )
 _BENCHMARK_INTERNAL_INPUTS = frozenset(
     {
+        "build-splits/development_features.parquet",
+        "build-splits/feature_manifest.json",
+        "build-splits/stage_manifest.json",
         ".benchmark-holdout-access/intent.json",
         ".benchmark-holdout-access/cache.parquet",
         ".benchmark-holdout-access/complete.json",
@@ -89,6 +96,7 @@ _BENCHMARK_INTERNAL_INPUTS = frozenset(
 _REPORT_SELECTED_STAGE = "report"
 _REPORT_BENCHMARK_OUTPUTS = (
     "benchmark/selection_manifest.json",
+    "benchmark/baseline_predictions.parquet",
     "benchmark/exact_predictions.parquet",
     "benchmark/finite_shot_predictions.parquet",
     "benchmark/diagnostics.json",
@@ -113,7 +121,6 @@ _REPORT_FIXED_INPUTS = frozenset(
         "build-splits/resource_ledger.json",
         "build-splits/stage_result.json",
         "train-baselines/selection_manifest.json",
-        "train-baselines/predictions.parquet",
         "train-baselines/diagnostics.json",
         "train-baselines/models/baseline_models.pkl",
         "train-baselines/models/manifest.json",
@@ -165,8 +172,7 @@ def _validate_selected_output_shape(
     if set(normalized_allowlist) != set(STAGE_PREREQUISITES[stage]):
         raise ValueError("prerequisite output allowlist must cover exact prerequisites")
     normalized = {
-        prerequisite: tuple(sorted(paths))
-        for prerequisite, paths in normalized_allowlist.items()
+        prerequisite: tuple(sorted(paths)) for prerequisite, paths in normalized_allowlist.items()
     }
     if stage == _TASK7_SELECTED_STAGE:
         selected = normalized[_TASK7_SELECTED_PREREQUISITE]
@@ -186,8 +192,7 @@ def _validate_selected_output_shape(
         raise ValueError("benchmark photonic allowlist is missing required outputs")
     circuit_paths = photonic - _BENCHMARK_PHOTONIC_REQUIRED_OUTPUTS
     if not circuit_paths or any(
-        not path.startswith("build-photonic-features/circuits/")
-        or not path.endswith(".npz")
+        not path.startswith("build-photonic-features/circuits/") or not path.endswith(".npz")
         for path in circuit_paths
     ):
         raise ValueError("benchmark photonic allowlist has invalid circuit outputs")
@@ -231,10 +236,7 @@ class PublicationOwnership:
 
     def _is_owned(self, path: Path) -> bool:
         path_stat = path.stat(follow_symlinks=False)
-        return (
-            path_stat.st_dev == self.source_device
-            and path_stat.st_ino == self.source_inode
-        )
+        return path_stat.st_dev == self.source_device and path_stat.st_ino == self.source_inode
 
     def _restore_foreign(self, quarantine: Path) -> None:
         if os.name == "nt":
@@ -242,8 +244,7 @@ class PublicationOwnership:
             return
         os.link(quarantine, self.destination, follow_symlinks=False)
         raise OSError(
-            "foreign publication was restored but retained in quarantine at "
-            f"{quarantine}"
+            f"foreign publication was restored but retained in quarantine at {quarantine}"
         )
 
     def _settle_quarantine(self, quarantine: Path) -> bool:
@@ -304,6 +305,58 @@ def sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def authenticated_snapshot(
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+    checkpoint: Callable[[int], None] | None = None,
+    live_bytes: int = 0,
+    root: Path | None = None,
+) -> bytes:
+    """Capture one descriptor and authenticate exactly the bytes passed to parsers."""
+
+    boundary = root.resolve() if root is not None else Path(path.anchor)
+    if not path.resolve(strict=False).is_relative_to(boundary):
+        raise ValueError(f"snapshot input is unsafe: {path}")
+    for candidate in (path, *path.parents):
+        info = candidate.lstat()
+        if candidate.is_symlink() or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise ValueError(f"snapshot input is unsafe: {path}")
+        if candidate == boundary:
+            break
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise ValueError(f"snapshot input is not a regular single-link file: {path}")
+    enforce = checkpoint or (lambda _size: None)
+    enforce(live_bytes + 2 * before.st_size)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    chunks: list[bytes] = []
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino, opened.st_size)
+            != (before.st_dev, before.st_ino, before.st_size)
+        ):
+            raise ValueError(f"snapshot input changed while opening: {path}")
+        captured = 0
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+            captured += len(chunk)
+            enforce(live_bytes + 2 * captured)
+        after = os.fstat(descriptor)
+        if (after.st_size, after.st_mtime_ns) != (opened.st_size, opened.st_mtime_ns):
+            raise ValueError(f"snapshot input changed while captured: {path}")
+    finally:
+        os.close(descriptor)
+    payload = b"".join(chunks)
+    if expected_sha256 is not None and hashlib.sha256(payload).hexdigest() != expected_sha256:
+        raise ValueError(f"snapshot captured checksum mismatch: {path}")
+    return payload
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(
         value,
@@ -342,6 +395,74 @@ def _package_versions() -> dict[str, str | None]:
         except PackageNotFoundError:
             versions[package] = None
     return versions
+
+
+def _sha256_canonical(value: object) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _source_fingerprint(project_root: Path) -> tuple[str, int, str]:
+    """Hash executable source, including new modules, without research/documentation noise."""
+
+    project_root = project_root.resolve()
+    paths = [
+        path
+        for directory in ("src", "scripts")
+        for path in (project_root / directory).rglob("*")
+        if path.is_file()
+    ]
+    paths.extend(
+        path for name in ("pyproject.toml", "uv.lock") if (path := project_root / name).is_file()
+    )
+    records: list[dict[str, str]] = []
+    for raw_path in sorted(paths):
+        relative = raw_path.relative_to(project_root).as_posix()
+        if "__pycache__" in raw_path.parts or raw_path.suffix in {".pyc", ".pyo"}:
+            continue
+        resolved = raw_path.resolve(strict=False)
+        if not resolved.is_relative_to(project_root) or raw_path.is_symlink():
+            raise ValueError(f"execution provenance source path is unsafe: {relative}")
+        digest = sha256_file(raw_path)
+        records.append({"path": relative.replace("\\", "/"), "sha256": digest})
+    return _sha256_canonical(records), len(records), "source_inventory"
+
+
+def _runtime_environment_payload() -> dict[str, object]:
+    return {
+        "packages": _package_versions(),
+        "platform": {
+            "machine": platform.machine(),
+            "release": platform.release(),
+            "system": platform.system(),
+        },
+        "python": {
+            "implementation": platform.python_implementation(),
+            "version": platform.python_version(),
+        },
+    }
+
+
+def _execution_provenance(
+    project_root: Path, environment: Mapping[str, object] | None = None
+) -> dict[str, object]:
+    runtime_path = Path(__file__).resolve()
+    if not runtime_path.is_file():
+        raise ValueError("execution provenance executing source is unavailable")
+    source_sha256, source_file_count, source_method = _source_fingerprint(project_root)
+    lock_path = project_root / "uv.lock"
+    lock_sha256 = sha256_file(lock_path) if lock_path.is_file() else None
+    environment_sha256 = _sha256_canonical(
+        dict(environment) if environment is not None else _runtime_environment_payload()
+    )
+    identity = {
+        "source_tree_sha256": source_sha256,
+        "source_method": source_method,
+        "source_file_count": source_file_count,
+        "uv_lock_sha256": lock_sha256,
+        "environment_sha256": environment_sha256,
+        "runtime_source_sha256": _source_fingerprint(runtime_path.parents[2])[0],
+    }
+    return {**identity, "aggregate_sha256": _sha256_canonical(identity)}
 
 
 def _git_manifest(project_root: Path) -> dict[str, str | bool | None]:
@@ -392,19 +513,21 @@ class RunStore:
                 "config_hash": config_hash,
             }
             store.write_json("seed_manifest.json", seed_manifest)
+            runtime_environment = _runtime_environment_payload()
             environment_manifest = {
                 "config_hash": config_hash,
+                "config_source": {
+                    "path": loaded.config_file.as_posix(),
+                    "sha256": sha256_file(loaded.config_file),
+                },
+                "execution_provenance": _execution_provenance(
+                    loaded.project_root, runtime_environment
+                ),
                 "git": _git_manifest(loaded.project_root),
-                "packages": _package_versions(),
-                "platform": {
-                    "machine": platform.machine(),
-                    "release": platform.release(),
-                    "system": platform.system(),
-                },
-                "python": {
-                    "implementation": platform.python_implementation(),
-                    "version": platform.python_version(),
-                },
+                "packages": runtime_environment["packages"],
+                "platform": runtime_environment["platform"],
+                "project_root": loaded.project_root.as_posix(),
+                "python": runtime_environment["python"],
                 "schema_version": SCHEMA_VERSION,
             }
             store.write_json("environment_manifest.json", environment_manifest)
@@ -425,8 +548,7 @@ class RunStore:
             }
             store.write_json("source_manifest.json", source_manifest)
             outputs = [
-                {"path": path, "sha256": sha256_file(store.root / path)}
-                for path in _BASE_ARTIFACTS
+                {"path": path, "sha256": sha256_file(store.root / path)} for path in _BASE_ARTIFACTS
             ]
             init_manifest = {
                 "config_hash": config_hash,
@@ -452,6 +574,7 @@ class RunStore:
         run_dir: str | Path,
         *,
         expected_config_hash: str | None = None,
+        verify_execution: bool = True,
     ) -> Self:
         """Open a run only after validating its init contract and base artifacts."""
 
@@ -467,6 +590,8 @@ class RunStore:
             store._recover_publication_journals()
             store._cleanup_stale_stage_directories()
         store._verify_base(expected_config_hash=expected_config_hash)
+        if verify_execution:
+            store.verify_execution_provenance()
         return store
 
     @staticmethod
@@ -496,9 +621,7 @@ class RunStore:
         _validate_selected_output_shape(stage, normalized_allowlist)
         if stage != _BENCHMARK_SELECTED_STAGE:
             return
-        marker = self._read_json_file(
-            self.root / "build-photonic-features/stage_manifest.json"
-        )
+        marker = self._read_json_file(self.root / "build-photonic-features/stage_manifest.json")
         outputs = marker.get("outputs")
         if not isinstance(outputs, list):
             raise ValueError("benchmark photonic prerequisite marker has invalid outputs")
@@ -631,9 +754,7 @@ class RunStore:
     def _clear_batch_abort(self, transaction_id: str) -> None:
         self._abort_path(transaction_id).unlink(missing_ok=True)
 
-    def _journal_group_committed(
-        self, publications: list[PublicationOwnership]
-    ) -> bool:
+    def _journal_group_committed(self, publications: list[PublicationOwnership]) -> bool:
         first = self._publication_record(publications[0])
         marker_relative = first["marker"]
         if not isinstance(marker_relative, str):
@@ -717,9 +838,7 @@ class RunStore:
                 raise ValueError(f"unsafe publication abort record: {abort_path.name}")
             self._abort_path(transaction_id)
             aborted_transactions.add(transaction_id)
-        journal_roots = sorted(
-            self.root.rglob(".rollback-*"), key=lambda path: path.as_posix()
-        )
+        journal_roots = sorted(self.root.rglob(".rollback-*"), key=lambda path: path.as_posix())
         if len(journal_roots) > 1024:
             raise ValueError("too many publication journals")
         publications: list[PublicationOwnership] = []
@@ -760,8 +879,7 @@ class RunStore:
                 or record["config_hash"] != self.config_hash
                 or record["run_id"] != self.root.name
                 or record["kind"] not in {"output", "marker"}
-                or record["terminal_status"]
-                not in {"SUCCESS", "BLOCKED", "INVALID"}
+                or record["terminal_status"] not in {"SUCCESS", "BLOCKED", "INVALID"}
                 or not isinstance(record.get("source_device"), int)
                 or not isinstance(record.get("source_inode"), int)
             ):
@@ -783,9 +901,7 @@ class RunStore:
             raise ValueError("conflicting publication journals")
         groups: dict[str, list[PublicationOwnership]] = {}
         for publication in publications:
-            record_transaction_id = self._publication_record(publication)[
-                "transaction_id"
-            ]
+            record_transaction_id = self._publication_record(publication)["transaction_id"]
             assert isinstance(record_transaction_id, str)
             groups.setdefault(record_transaction_id, []).append(publication)
         decisions = {
@@ -802,9 +918,7 @@ class RunStore:
             if decisions[transaction_id]:
                 self._release_publications(group)
             else:
-                recovery_failures.extend(
-                    self._rollback_publications(group, recovery_error)
-                )
+                recovery_failures.extend(self._rollback_publications(group, recovery_error))
             if not any(publication.quarantine_root.exists() for publication in group):
                 self._clear_batch_abort(transaction_id)
         for transaction_id in aborted_transactions - groups.keys():
@@ -843,9 +957,7 @@ class RunStore:
                 try:
                     publication.rollback()
                 except BaseException as retry_error:
-                    cleanup_error.add_note(
-                        f"publication cleanup retry failed: {retry_error}"
-                    )
+                    cleanup_error.add_note(f"publication cleanup retry failed: {retry_error}")
                     cleanup_errors.append(cleanup_error)
         for recorded_cleanup_error in cleanup_errors:
             error.add_note(f"publication cleanup failed: {recorded_cleanup_error}")
@@ -858,8 +970,7 @@ class RunStore:
         ordered = sorted(
             publications,
             key=lambda publication: (
-                publication.record is not None
-                and publication.record.get("kind") == "marker"
+                publication.record is not None and publication.record.get("kind") == "marker"
             ),
         )
         for publication in ordered:
@@ -896,8 +1007,7 @@ class RunStore:
             destination=destination,
             source_device=source_stat.st_dev,
             source_inode=source_stat.st_ino,
-            quarantine_root=destination.parent
-            / f".rollback-{destination.name}-{uuid4().hex}",
+            quarantine_root=destination.parent / f".rollback-{destination.name}-{uuid4().hex}",
             record=record,
         )
         local_publication = publications is None
@@ -1007,6 +1117,37 @@ class RunStore:
             ):
                 raise ValueError(f"base manifest config hash mismatch: {name}")
 
+    def verify_execution_provenance(self) -> None:
+        """Require the same executing source, project inputs, and installed environment."""
+
+        environment_manifest = json.loads(self.read_authenticated("environment_manifest.json"))
+        project_root_raw = environment_manifest.get("project_root")
+        expected_provenance = environment_manifest.get("execution_provenance")
+        if not isinstance(project_root_raw, str) or not isinstance(expected_provenance, dict):
+            raise ValueError("execution provenance manifest is missing")
+        project_root = Path(project_root_raw).resolve()
+        if not project_root.is_dir():
+            raise ValueError("execution provenance project root is unavailable")
+        if _execution_provenance(project_root) != expected_provenance:
+            raise ValueError("execution provenance drift detected")
+        config_source = environment_manifest.get("config_source")
+        if not isinstance(config_source, dict) or not isinstance(config_source.get("path"), str):
+            raise ValueError("execution provenance config source is missing")
+        config_path = Path(config_source["path"])
+        if not config_path.is_file() or sha256_file(config_path) != config_source.get("sha256"):
+            raise ValueError("execution provenance configuration drift detected")
+
+    def read_authenticated(self, relative_path: str) -> bytes:
+        """Return base artifact bytes authenticated against the immutable init marker."""
+
+        manifest = self._read_json_file(self.root / "run_manifest.json")
+        outputs = {record["path"]: record["sha256"] for record in manifest["outputs"]}
+        if relative_path not in _BASE_ARTIFACTS or relative_path not in outputs:
+            raise ValueError("authenticated base artifact is not declared")
+        return authenticated_snapshot(
+            self.root / relative_path, expected_sha256=outputs[relative_path], root=self.root
+        )
+
     def _verify_stage(
         self,
         stage: str,
@@ -1022,10 +1163,7 @@ class RunStore:
         if (
             (
                 accepted_statuses == frozenset({"SUCCESS"})
-                or (
-                    stage == _REPORT_SELECTED_STAGE
-                    and accepted_statuses == frozenset({"BLOCKED"})
-                )
+                or (stage == _REPORT_SELECTED_STAGE and accepted_statuses == frozenset({"BLOCKED"}))
             )
             and stage
             in {
@@ -1055,15 +1193,12 @@ class RunStore:
                 return self.verify_terminal_stage(
                     stage,
                     prerequisite_output_allowlist={
-                        prerequisite: tuple(paths)
-                        for prerequisite, paths in raw_allowlist.items()
+                        prerequisite: tuple(paths) for prerequisite, paths in raw_allowlist.items()
                     },
                 )
         prerequisite_hashes: dict[str, str] = {}
         for prerequisite in STAGE_PREREQUISITES[stage]:
-            prerequisite_hashes[prerequisite] = self._verify_stage(
-                prerequisite, verified=verified
-            )
+            prerequisite_hashes[prerequisite] = self._verify_stage(prerequisite, verified=verified)
         path = self.root / stage / "stage_manifest.json"
         if not path.is_file():
             raise ValueError(f"prerequisite stage {stage!r} has no SUCCESS marker")
@@ -1076,8 +1211,7 @@ class RunStore:
         ):
             expected_statuses = ", ".join(sorted(accepted_statuses))
             raise ValueError(
-                f"stage {stage!r} has an invalid marker; "
-                f"expected status in {{{expected_statuses}}}"
+                f"stage {stage!r} has an invalid marker; expected status in {{{expected_statuses}}}"
             )
         if manifest.get("prerequisite_manifest_hashes") != prerequisite_hashes:
             raise ValueError(f"prerequisite manifest hash mismatch for stage {stage!r}")
@@ -1120,9 +1254,7 @@ class RunStore:
                 raise ValueError(f"prerequisite stage {stage!r} has invalid outputs")
             target = self._validated_target(relative_path)
             if not target.is_file() or sha256_file(target) != expected:
-                raise ValueError(
-                    f"prerequisite output checksum mismatch: {relative_path}"
-                )
+                raise ValueError(f"prerequisite output checksum mismatch: {relative_path}")
         self._verify_terminal_result_contract(manifest)
         verified.add(stage)
         return sha256_file(path)
@@ -1146,9 +1278,7 @@ class RunStore:
         if stage in verified:
             return sha256_file(path)
         prerequisite_hashes = {
-            prerequisite: self._verify_stage_marker_only(
-                prerequisite, verified=verified
-            )
+            prerequisite: self._verify_stage_marker_only(prerequisite, verified=verified)
             for prerequisite in STAGE_PREREQUISITES[stage]
         }
         if not path.is_file() or path.is_symlink():
@@ -1223,9 +1353,7 @@ class RunStore:
                 raise ValueError("prerequisite output allowlist contains duplicates")
             expected = output_hashes.get(relative)
             if not isinstance(expected, str):
-                raise ValueError(
-                    f"prerequisite output allowlist path is not declared: {relative}"
-                )
+                raise ValueError(f"prerequisite output allowlist path is not declared: {relative}")
             if not target.is_file() or target.is_symlink() or sha256_file(target) != expected:
                 raise ValueError(f"prerequisite output checksum mismatch: {relative}")
             normalized.append(relative)
@@ -1311,9 +1439,7 @@ class RunStore:
             marker_by_stage[stage] = marker
             marker_hashes[stage] = sha256_file(marker_path)
 
-        return self.report_input_inventory_from_captured_manifests(
-            marker_by_stage, marker_hashes
-        )
+        return self.report_input_inventory_from_captured_manifests(marker_by_stage, marker_hashes)
 
     def report_input_inventory_from_captured_manifests(
         self,
@@ -1357,8 +1483,7 @@ class RunStore:
         circuit_paths = {
             path
             for path in output_by_stage["build-photonic-features"]
-            if path.startswith("build-photonic-features/circuits/")
-            and path.endswith(".npz")
+            if path.startswith("build-photonic-features/circuits/") and path.endswith(".npz")
         }
         if not circuit_paths:
             raise ValueError("photonic output marker has no circuit inventory")
@@ -1391,9 +1516,7 @@ class RunStore:
     @staticmethod
     def _verify_report_output_inventory(manifest: Mapping[str, object]) -> None:
         status = manifest.get("status")
-        expected = (
-            _REPORT_INVALID_OUTPUTS if status == "INVALID" else _REPORT_TERMINAL_OUTPUTS
-        )
+        expected = _REPORT_INVALID_OUTPUTS if status == "INVALID" else _REPORT_TERMINAL_OUTPUTS
         actual = set(RunStore._exact_output_map(manifest, "report"))
         if actual != set(expected):
             raise ValueError("report output inventory does not match exact outputs")
@@ -1458,8 +1581,7 @@ class RunStore:
             } or (
                 accepted_statuses != frozenset({"SUCCESS"})
                 and not (
-                    stage == _REPORT_SELECTED_STAGE
-                    and accepted_statuses == frozenset({"BLOCKED"})
+                    stage == _REPORT_SELECTED_STAGE and accepted_statuses == frozenset({"BLOCKED"})
                 )
             ):
                 raise ValueError(
@@ -1467,8 +1589,7 @@ class RunStore:
                 )
             policy_paths = {
                 prerequisite: tuple(
-                    self._validated_target(path).relative_to(self.root).as_posix()
-                    for path in paths
+                    self._validated_target(path).relative_to(self.root).as_posix() for path in paths
                 )
                 for prerequisite, paths in prerequisite_output_allowlist.items()
             }
@@ -1479,10 +1600,7 @@ class RunStore:
                     if stage == _REPORT_SELECTED_STAGE
                     else self._verify_stage_selected_outputs(
                         prerequisite,
-                        tuple(
-                            str(path)
-                            for path in prerequisite_output_allowlist[prerequisite]
-                        ),
+                        tuple(str(path) for path in prerequisite_output_allowlist[prerequisite]),
                     )
                 )
                 for prerequisite in STAGE_PREREQUISITES[stage]
@@ -1509,9 +1627,7 @@ class RunStore:
                 or details.get("prerequisite_verification") != "selected_outputs"
                 or details.get("prerequisite_output_allowlist") != normalized_allowlist
             ):
-                raise ValueError(
-                    f"stage {stage!r} has an invalid selective verification policy"
-                )
+                raise ValueError(f"stage {stage!r} has an invalid selective verification policy")
             inputs = manifest.get("input_hashes")
             if not isinstance(inputs, dict):
                 raise ValueError(f"stage {stage!r} has invalid input hashes")
@@ -1520,9 +1636,7 @@ class RunStore:
                 if stage == _REPORT_SELECTED_STAGE
                 else None
             )
-            selected_paths = {
-                path for paths in normalized_allowlist.values() for path in paths
-            }
+            selected_paths = {path for paths in normalized_allowlist.values() for path in paths}
             for relative, expected in inputs.items():
                 if not isinstance(relative, str) or not isinstance(expected, str):
                     raise ValueError(f"stage {stage!r} has invalid input hashes")
@@ -1549,9 +1663,7 @@ class RunStore:
                 if not target.is_file() or target.is_symlink() or sha256_file(target) != expected:
                     raise ValueError(f"stage input checksum mismatch: {relative}")
             expected_inputs = selected_paths | (
-                _BENCHMARK_INTERNAL_INPUTS
-                if stage == _BENCHMARK_SELECTED_STAGE
-                else frozenset()
+                _BENCHMARK_INTERNAL_INPUTS if stage == _BENCHMARK_SELECTED_STAGE else frozenset()
             )
             report_inputs_invalid = False
             if stage == _REPORT_SELECTED_STAGE:
@@ -1580,21 +1692,18 @@ class RunStore:
             return sha256_file(marker_path)
         return self._verify_stage(stage, accepted_statuses=accepted_statuses)
 
-    def verify_selected_stage_outputs(
-        self, stage: str, output_paths: Iterable[str | Path]
-    ) -> str:
+    def verify_selected_stage_outputs(self, stage: str, output_paths: Iterable[str | Path]) -> str:
         """Public audited boundary for holdout-safe prerequisite verification."""
 
         paths = tuple(
-            self._validated_target(path).relative_to(self.root).as_posix()
-            for path in output_paths
+            self._validated_target(path).relative_to(self.root).as_posix() for path in output_paths
         )
-        valid_task7 = stage == _TASK7_SELECTED_PREREQUISITE and tuple(
-            sorted(paths)
-        ) == tuple(sorted(_TASK7_SELECTED_OUTPUTS))
-        valid_report = stage == _BENCHMARK_SELECTED_STAGE and tuple(
-            sorted(paths)
-        ) == tuple(sorted(_REPORT_BENCHMARK_OUTPUTS))
+        valid_task7 = stage == _TASK7_SELECTED_PREREQUISITE and tuple(sorted(paths)) == tuple(
+            sorted(_TASK7_SELECTED_OUTPUTS)
+        )
+        valid_report = stage == _BENCHMARK_SELECTED_STAGE and tuple(sorted(paths)) == tuple(
+            sorted(_REPORT_BENCHMARK_OUTPUTS)
+        )
         if not (valid_task7 or valid_report):
             raise ValueError("selected stage output verification violates a fixed contract")
         return self._verify_stage_selected_outputs(stage, paths)
@@ -1663,13 +1772,12 @@ class RunStore:
         external_input_hashes: Mapping[str | Path, str] | None = None,
         details: Mapping[str, object] | None = None,
         terminal_status: Literal["SUCCESS", "BLOCKED", "INVALID"] = "SUCCESS",
-        prerequisite_verification: Literal[
-            "full", "marker_only", "selected_outputs"
-        ] = "full",
+        prerequisite_verification: Literal["full", "marker_only", "selected_outputs"] = "full",
         prerequisite_output_allowlist: Mapping[str, Iterable[str | Path]] | None = None,
         commit_guard: CommitGuard | None = None,
         private_write_guard: CommitGuard | None = None,
         preverified_input_hashes: Mapping[str, str] | None = None,
+        preverified_prerequisite_manifest_hashes: Mapping[str, str] | None = None,
         config_hash: str | None = None,
         now: Now = None,
     ) -> StageTransaction:
@@ -1690,33 +1798,44 @@ class RunStore:
                 _REPORT_SELECTED_STAGE,
             } or (
                 terminal_status != "SUCCESS"
-                and not (
-                    stage == _REPORT_SELECTED_STAGE
-                    and terminal_status == "BLOCKED"
-                )
+                and not (stage == _REPORT_SELECTED_STAGE and terminal_status == "BLOCKED")
             ):
-                raise ValueError(
-                    "selected_outputs is limited to audited terminal stages"
-                )
+                raise ValueError("selected_outputs is limited to audited terminal stages")
             if prerequisite_output_allowlist is None:
                 raise ValueError("selected_outputs requires a prerequisite output allowlist")
             policy_paths = {
                 prerequisite: tuple(
-                    self._validated_target(path).relative_to(self.root).as_posix()
-                    for path in paths
+                    self._validated_target(path).relative_to(self.root).as_posix() for path in paths
                 )
                 for prerequisite, paths in prerequisite_output_allowlist.items()
             }
             self._validate_selected_output_policy(stage, policy_paths)
         elif prerequisite_output_allowlist is not None:
-            raise ValueError(
-                "prerequisite output allowlist requires selected_outputs verification"
-            )
-        if preverified_input_hashes is not None and not (
-            stage == _REPORT_SELECTED_STAGE
-            and prerequisite_verification == "selected_outputs"
-        ):
-            raise ValueError("preverified input hashes are limited to the report stage")
+            raise ValueError("prerequisite output allowlist requires selected_outputs verification")
+        report_preverified = (
+            stage == _REPORT_SELECTED_STAGE and preverified_input_hashes is not None
+        )
+        if preverified_input_hashes is not None and not report_preverified:
+            expected_prerequisites = set(STAGE_PREREQUISITES[stage])
+            if (
+                preverified_prerequisite_manifest_hashes is None
+                or set(preverified_prerequisite_manifest_hashes) != expected_prerequisites
+            ):
+                raise ValueError(
+                    "preverified stage inputs require the exact prerequisite marker hashes"
+                )
+        elif preverified_prerequisite_manifest_hashes is not None and not report_preverified:
+            raise ValueError("preverified prerequisite hashes require preverified inputs")
+        for digest in {
+            **dict(preverified_input_hashes or {}),
+            **dict(preverified_prerequisite_manifest_hashes or {}),
+        }.values():
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise ValueError("preverified hashes must be lowercase SHA-256 digests")
         if commit_guard is not None:
             commit_guard()
         with self._publication_lock():
@@ -1724,13 +1843,11 @@ class RunStore:
             self._cleanup_stale_stage_directories()
         if commit_guard is not None:
             commit_guard()
-        report_preverified = (
-            stage == _REPORT_SELECTED_STAGE and preverified_input_hashes is not None
-        )
         if not report_preverified:
             self._verify_base(expected_config_hash=config_hash)
         elif config_hash is not None and config_hash != self.config_hash:
             raise ValueError("expected config hash does not match run config hash")
+        self.verify_execution_provenance()
         if commit_guard is not None:
             commit_guard()
         marker = self.root / stage / "stage_manifest.json"
@@ -1741,10 +1858,18 @@ class RunStore:
         for prerequisite in STAGE_PREREQUISITES[stage]:
             if commit_guard is not None:
                 commit_guard()
-            if prerequisite_verification == "marker_only":
-                prerequisite_hashes[prerequisite] = self._verify_stage_marker_only(
+            if preverified_prerequisite_manifest_hashes is not None:
+                prerequisite_hashes[prerequisite] = preverified_prerequisite_manifest_hashes[
                     prerequisite
-                )
+                ]
+                if prerequisite_verification == "selected_outputs":
+                    assert prerequisite_output_allowlist is not None
+                    normalized_allowlist[prerequisite] = sorted(
+                        self._validated_target(path).relative_to(self.root).as_posix()
+                        for path in prerequisite_output_allowlist[prerequisite]
+                    )
+            elif prerequisite_verification == "marker_only":
+                prerequisite_hashes[prerequisite] = self._verify_stage_marker_only(prerequisite)
             elif prerequisite_verification == "selected_outputs":
                 assert prerequisite_output_allowlist is not None
                 paths = tuple(
@@ -1760,8 +1885,8 @@ class RunStore:
                         raise ValueError("captured prerequisite marker checksum is invalid")
                     prerequisite_hashes[prerequisite] = marker_digest
                 else:
-                    prerequisite_hashes[prerequisite] = (
-                        self._verify_stage_selected_outputs(prerequisite, paths)
+                    prerequisite_hashes[prerequisite] = self._verify_stage_selected_outputs(
+                        prerequisite, paths
                     )
                 normalized_allowlist[prerequisite] = sorted(paths)
             else:
@@ -1769,14 +1894,9 @@ class RunStore:
             if commit_guard is not None:
                 commit_guard()
         inputs: dict[str, str] = {}
-        selected_paths = {
-            path
-            for paths in normalized_allowlist.values()
-            for path in paths
-        }
+        selected_paths = {path for paths in normalized_allowlist.values() for path in paths}
         normalized_requested_inputs = tuple(
-            self._validated_target(path).relative_to(self.root).as_posix()
-            for path in input_paths
+            self._validated_target(path).relative_to(self.root).as_posix() for path in input_paths
         )
         if preverified_input_hashes is not None:
             if len(normalized_requested_inputs) != len(set(normalized_requested_inputs)):
@@ -1791,8 +1911,7 @@ class RunStore:
                 prerequisite_verification == "selected_outputs"
                 and relative not in selected_paths
                 and not (
-                    stage == _BENCHMARK_SELECTED_STAGE
-                    and relative in _BENCHMARK_INTERNAL_INPUTS
+                    stage == _BENCHMARK_SELECTED_STAGE and relative in _BENCHMARK_INTERNAL_INPUTS
                 )
                 and not (
                     stage == _REPORT_SELECTED_STAGE
@@ -1802,9 +1921,7 @@ class RunStore:
                             and (
                                 relative in _REPORT_FIXED_INPUTS
                                 or (
-                                    relative.startswith(
-                                        "build-photonic-features/circuits/"
-                                    )
+                                    relative.startswith("build-photonic-features/circuits/")
                                     and relative.endswith(".npz")
                                 )
                             )
@@ -1813,9 +1930,7 @@ class RunStore:
                     )
                 )
             ):
-                raise ValueError(
-                    "selected-output stage inputs must be explicitly allowlisted"
-                )
+                raise ValueError("selected-output stage inputs must be explicitly allowlisted")
             if preverified_input_hashes is None:
                 if not target.is_file():
                     raise FileNotFoundError(f"stage input is not a file: {relative}")
@@ -1831,22 +1946,17 @@ class RunStore:
                 and not report_preverified
                 and self._declared_report_input_sha256(relative) != inputs[relative]
             ):
-                raise ValueError(
-                    "report input checksum is not anchored to its source marker"
-                )
+                raise ValueError("report input checksum is not anchored to its source marker")
             if commit_guard is not None:
                 commit_guard()
         if prerequisite_verification == "selected_outputs":
             expected_inputs = selected_paths | (
-                _BENCHMARK_INTERNAL_INPUTS
-                if stage == _BENCHMARK_SELECTED_STAGE
-                else frozenset()
+                _BENCHMARK_INTERNAL_INPUTS if stage == _BENCHMARK_SELECTED_STAGE else frozenset()
             )
             report_circuits = {
                 path
                 for path in inputs
-                if path.startswith("build-photonic-features/circuits/")
-                and path.endswith(".npz")
+                if path.startswith("build-photonic-features/circuits/") and path.endswith(".npz")
             }
             captured_report_inputs = frozenset({*_REPORT_FIXED_INPUTS, *report_circuits})
             if (
@@ -1860,18 +1970,15 @@ class RunStore:
                         else self._expected_report_inputs_and_verify_lineage()
                     )
                 )
-            ) or (
-                stage != _REPORT_SELECTED_STAGE and set(inputs) != expected_inputs
-            ):
+            ) or (stage != _REPORT_SELECTED_STAGE and set(inputs) != expected_inputs):
                 raise ValueError("selected-output stage inputs do not match the fixed contract")
         external_inputs: dict[str, str] = {}
         for input_path, expected in (external_input_hashes or {}).items():
             if commit_guard is not None:
                 commit_guard()
             target = Path(input_path).resolve()
-            if (
-                len(expected) != 64
-                or any(character not in "0123456789abcdef" for character in expected)
+            if len(expected) != 64 or any(
+                character not in "0123456789abcdef" for character in expected
             ):
                 raise ValueError("external input checksum must be a lowercase SHA-256 digest")
             if not target.is_file() or sha256_file(target) != expected:
@@ -2139,9 +2246,7 @@ class StageTransaction:
             try:
                 result_payload = self._store._read_json_file(result_temporary)
                 if result_payload.get("stage") != self.stage:
-                    raise ValueError(
-                        "terminal result stage does not match its transaction"
-                    )
+                    raise ValueError("terminal result stage does not match its transaction")
                 result_status = _normalize_terminal_status(result_payload.get("status"))
                 if result_status != self._terminal_status:
                     raise ValueError("terminal result status does not match stage marker")
@@ -2169,10 +2274,7 @@ class StageTransaction:
                     for logical, temporary in sorted(self._outputs.items())
                 ]
                 published.output_hashes.update(
-                    {
-                        str(record["path"]): str(record["sha256"])
-                        for record in output_records
-                    }
+                    {str(record["path"]): str(record["sha256"]) for record in output_records}
                 )
                 if self._commit_guard is not None:
                     self._commit_guard()
@@ -2189,10 +2291,7 @@ class StageTransaction:
                     if self._commit_guard is not None:
                         self._commit_guard()
                     external_path = Path(raw_path)
-                    if (
-                        not external_path.is_file()
-                        or sha256_file(external_path) != expected
-                    ):
+                    if not external_path.is_file() or sha256_file(external_path) != expected:
                         raise ValueError(f"external stage input changed: {raw_path}")
                     if self._commit_guard is not None:
                         self._commit_guard()
@@ -2251,8 +2350,7 @@ class StageTransaction:
                     self._store._rollback_publications(published, error)
                 finally:
                     if published and not any(
-                        publication.quarantine_root.exists()
-                        for publication in published
+                        publication.quarantine_root.exists() for publication in published
                     ):
                         self._store._clear_batch_abort(published.transaction_id)
             raise

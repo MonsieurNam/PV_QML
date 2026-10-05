@@ -35,6 +35,7 @@ from pv_pilot.baselines import (
     fit_rff_transform,
     normalized_wis,
     postprocess_quantiles,
+    predict_test_models,
     prediction_parquet_bytes,
     quantile_columns,
     train_baseline_models,
@@ -191,14 +192,10 @@ def development_and_holdout(
 
 
 def train_fixture(*, test_target_offset: float = 0.0) -> BaselineTrainingResult:
-    development, holdout = development_and_holdout(
+    development, _holdout = development_and_holdout(
         test_target_offset=test_target_offset
     )
-    return train_baseline_models(
-        development,
-        pilot_config(),
-        holdout_loader=lambda _selection_hash: holdout,
-    )
+    return train_baseline_models(development, pilot_config())
 
 
 def make_feature_run(tmp_path: Path) -> RunStore:
@@ -676,7 +673,7 @@ def test_training_selects_one_shared_configuration_and_never_uses_test_for_selec
 
     assert first.selection_manifest["selected"] == changed_test.selection_manifest["selected"]
     assert first.selection_manifest["selection_data"] == ["train", "validation"]
-    assert first.selection_manifest["test_access"] == "after_selection_freeze_once"
+    assert first.selection_manifest["holdout_access"] == "benchmark_only_after_photonic_freeze"
     assert set(first.models) == {"persistence", "raw", "rff", "xgboost"}
     persistence = first.models["persistence"]
     assert isinstance(persistence, PersistenceModel)
@@ -685,56 +682,28 @@ def test_training_selects_one_shared_configuration_and_never_uses_test_for_selec
         selected = first.selection_manifest["selected"][branch]
         assert isinstance(selected, dict)
         assert "validation_mean_normalized_wis" in selected
-    assert set(first.predictions["split"]) == {"test"}
-    assert set(first.predictions["model"]) == {"persistence", "raw", "rff", "xgboost"}
-    assert len(first.predictions) == 4 * 12
 
 
-def test_holdout_is_opened_once_only_after_selection_freezes_and_fits_complete(
+def test_baseline_training_has_no_holdout_loader_or_holdout_predictions(
     fast_baseline_fits: None,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import pv_pilot.baselines as module
+    development, _holdout = development_and_holdout()
+    result = train_baseline_models(development, pilot_config())
 
-    development, holdout = development_and_holdout()
-    poisoned = holdout.copy()
-    poisoned["target_ac_power_kw"] = np.nan
-    original_fit = module._fit_linear_heads
-    fit_count = 0
-    loader_calls: list[str] = []
-
-    def counted_fit(*args: object, **kwargs: object) -> QuantileHeads:
-        nonlocal fit_count
-        fit_count += 1
-        return original_fit(*args, **kwargs)  # type: ignore[arg-type]
-
-    def load_holdout(selection_freeze_sha256: str) -> pd.DataFrame:
-        loader_calls.append(selection_freeze_sha256)
-        assert fit_count == 34  # all 32 candidates plus two selected refits
-        assert len(selection_freeze_sha256) == 64
-        return poisoned
-
-    monkeypatch.setattr(module, "_fit_linear_heads", counted_fit)
-    with pytest.raises(BaselineContractError, match="holdout"):
-        train_baseline_models(
-            development,
-            pilot_config(),
-            holdout_loader=load_holdout,
-        )
-
-    assert len(loader_calls) == 1
+    assert not hasattr(result, "predictions")
+    assert result.selection_manifest["holdout_access"] == "benchmark_only_after_photonic_freeze"
+    assert "test" not in result.diagnostics
 
 
 def test_resource_checkpoint_runs_through_candidate_and_refit_boundaries(
     fast_baseline_fits: None,
 ) -> None:
-    development, holdout = development_and_holdout()
+    development, _holdout = development_and_holdout()
     checkpoints: list[int] = []
 
     train_baseline_models(
         development,
         pilot_config(),
-        holdout_loader=lambda _selection_hash: holdout,
         resource_checkpoint=checkpoints.append,
     )
 
@@ -915,10 +884,15 @@ def test_candidate_records_use_common_alpha_and_xgboost_tuple_for_all_heads(
 def test_prediction_and_validation_schemas_are_stable_for_empty_frames(
     fast_baseline_fits: None,
 ) -> None:
-    predictions = train_fixture().predictions
-    scores = pd.DataFrame.from_records(
-        train_fixture().validation_scores
+    trained = train_fixture()
+    _development, holdout = development_and_holdout()
+    predictions = predict_test_models(
+        holdout,
+        trained.models,
+        QUANTILES,
+        trained.selection_manifest["selected"],
     )
+    scores = pd.DataFrame.from_records(trained.validation_scores)
 
     prediction_schema = pq.read_schema(pa.BufferReader(prediction_parquet_bytes(predictions)))
     empty_prediction_schema = pq.read_schema(
@@ -950,7 +924,6 @@ def test_train_baselines_service_publishes_complete_artifacts_and_resumes(
     assert "already successful" in (second.message or "")
     expected = {
         "selection_manifest.json",
-        "predictions.parquet",
         "validation_scores.parquet",
         "diagnostics.json",
         "stage_result.json",
@@ -959,9 +932,7 @@ def test_train_baselines_service_publishes_complete_artifacts_and_resumes(
     }
     assert expected <= {path.name for path in (store.root / "train-baselines").iterdir()}
     store.verify_terminal_stage("train-baselines")
-    predictions = pd.read_parquet(store.root / "train-baselines/predictions.parquet")
-    assert set(predictions["model"]) == {"persistence", "raw", "rff", "xgboost"}
-    assert len(predictions) == 48
+    assert not (store.root / "train-baselines/predictions.parquet").exists()
     model_dir = store.root / "train-baselines/models"
     assert {"baseline_models.pkl", "manifest.json"} <= {
         path.name for path in model_dir.iterdir()
@@ -1002,13 +973,11 @@ def test_validate_build_train_pipeline_preserves_partition_membership(
     stage_marker = json.loads(
         (store.root / "train-baselines/stage_manifest.json").read_text(encoding="utf-8")
     )
-    assert {
-        "build-splits/development_features.parquet",
-        "build-splits/holdout_features.parquet",
-    } <= set(stage_marker["input_hashes"])
+    assert "build-splits/development_features.parquet" in stage_marker["input_hashes"]
+    assert "build-splits/holdout_features.parquet" not in stage_marker["input_hashes"]
 
 
-def test_service_scans_development_before_lazy_holdout_and_opens_holdout_once(
+def test_service_never_hashes_or_opens_holdout_during_baseline_training(
     tmp_path: Path,
     fast_baseline_fits: None,
     monkeypatch: pytest.MonkeyPatch,
@@ -1018,14 +987,9 @@ def test_service_scans_development_before_lazy_holdout_and_opens_holdout_once(
 
     store = make_feature_run(tmp_path)
     original = baseline_module.train_baseline_models
-    original_dataset = services_module.pds.dataset
     original_sha256 = services_module.sha256_file
     events: list[str] = []
     partition_reads: list[str] = []
-
-    def audited_dataset(path: object, *args: object, **kwargs: object) -> object:
-        partition_reads.append(Path(path).name)  # type: ignore[arg-type]
-        return original_dataset(path, *args, **kwargs)
 
     def audited_sha256(path: Path) -> str:
         if path.name == "holdout_features.parquet":
@@ -1035,47 +999,59 @@ def test_service_scans_development_before_lazy_holdout_and_opens_holdout_once(
     def audited_train(
         development_frame: pd.DataFrame,
         config: PilotConfig,
-        *,
-        holdout_loader: Callable[[str], pd.DataFrame],
         **_kwargs: object,
     ) -> BaselineTrainingResult:
         assert set(development_frame["split"]) == {"train", "validation"}
-        assert partition_reads == ["development_features.parquet"]
+        assert partition_reads == []
         events.append("development_received")
-
-        def audited_loader(selection_hash: str) -> pd.DataFrame:
-            events.append("holdout_opened")
-            assert len(selection_hash) == 64
-            return holdout_loader(selection_hash)
-
-        return original(
-            development_frame,
-            config,
-            holdout_loader=audited_loader,
-        )
+        return original(development_frame, config)
 
     monkeypatch.setattr(baseline_module, "train_baseline_models", audited_train)
-    monkeypatch.setattr(services_module.pds, "dataset", audited_dataset)
     monkeypatch.setattr(services_module, "sha256_file", audited_sha256)
     result = DefaultPilotServices().train_baselines(store.root)
 
     assert result.status is StageStatus.SUCCESS
-    assert events == ["development_received", "holdout_opened"]
-    assert partition_reads[:3] == [
-        "development_features.parquet",
-        "holdout_checksum",
-        "holdout_features.parquet",
-    ]
+    assert events == ["development_received"]
+    assert partition_reads == []
     selection = json.loads(
         (store.root / "train-baselines/selection_manifest.json").read_text(
             encoding="utf-8"
         )
     )
-    audit = selection["holdout_audit"]
-    assert audit["event_order"]["selection_frozen"] < audit["event_order"]["holdout_opened"]
-    assert audit["prediction_passes"] == 1
-    assert audit["opened_at_utc"].endswith("Z")
-    assert len(audit["row_content_sha256"]) == 64
+    assert selection["holdout_access"] == "benchmark_only_after_photonic_freeze"
+
+
+def test_train_baselines_parses_authenticated_development_snapshot_after_path_replacement(
+    tmp_path: Path,
+    fast_baseline_fits: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = make_feature_run(tmp_path)
+    service = DefaultPilotServices()
+    development_path = store.root / "build-splits/development_features.parquet"
+    original_digest = hashlib.sha256(development_path.read_bytes()).hexdigest()
+    original_capture = service._capture_report_artifact
+    replaced = False
+
+    def capture_then_replace(*args: Any, **kwargs: Any) -> tuple[bytes, int]:
+        nonlocal replaced
+        payload, live = original_capture(*args, **kwargs)
+        if kwargs.get("relative_path") == "build-splits/development_features.parquet":
+            development_path.write_bytes(b"replacement-after-capture")
+            replaced = True
+        return payload, live
+
+    monkeypatch.setattr(service, "_capture_report_artifact", capture_then_replace)
+    result = service.train_baselines(store.root)
+
+    assert replaced is True
+    assert result.status is StageStatus.SUCCESS
+    marker = json.loads(
+        (store.root / "train-baselines/stage_manifest.json").read_text(encoding="utf-8")
+    )
+    assert marker["input_hashes"][
+        "build-splits/development_features.parquet"
+    ] == original_digest
 
 
 def test_train_baselines_rejects_feature_input_tamper(
@@ -1093,7 +1069,7 @@ def test_train_baselines_rejects_feature_input_tamper(
 
 
 @pytest.mark.parametrize("mutation", ["missing-and-extra", "duplicate"])
-def test_train_baselines_rejects_invalid_combined_partition_membership(
+def test_train_baselines_does_not_open_holdout_to_validate_combined_membership(
     tmp_path: Path,
     fast_baseline_fits: None,
     mutation: str,
@@ -1147,11 +1123,12 @@ def test_train_baselines_rejects_invalid_combined_partition_membership(
 
     result = DefaultPilotServices().train_baselines(store.root)
 
-    assert result.status is StageStatus.INVALID
-    assert "contract" in (result.message or "")
-    store.verify_terminal_stage(
-        "train-baselines", accepted_statuses=frozenset({"INVALID"})
+    assert result.status is StageStatus.SUCCESS
+    assert not (store.root / "train-baselines/predictions.parquet").exists()
+    marker = json.loads(
+        (store.root / "train-baselines/stage_manifest.json").read_text(encoding="utf-8")
     )
+    assert "build-splits/holdout_features.parquet" not in marker["input_hashes"]
 
 
 def test_train_baselines_resource_limit_publishes_bounded_invalid(
@@ -1175,7 +1152,7 @@ def test_train_baselines_resource_limit_publishes_bounded_invalid(
         (store.root / "train-baselines/resource_ledger.json").read_text(encoding="utf-8")
     )
     assert ledger["resource_status"] == "EXCEEDED"
-    assert pd.read_parquet(store.root / "train-baselines/predictions.parquet").empty
+    assert not (store.root / "train-baselines/predictions.parquet").exists()
 
 
 def test_train_baselines_hard_deadline_is_durable_without_pre_freeze_holdout_read(
@@ -1231,11 +1208,9 @@ def test_train_baselines_contract_error_publishes_invalid_not_failed(
     def reject(
         frame: pd.DataFrame,
         config: object,
-        *,
-        holdout_loader: object,
         **_kwargs: object,
     ) -> object:
-        del frame, config, holdout_loader
+        del frame, config
         raise BaselineContractError("bad split schema")
 
     monkeypatch.setattr(baseline_module, "train_baseline_models", reject)

@@ -56,7 +56,7 @@ def valid_config() -> dict[str, Any]:
         "photonics": {
             "modes": [4, 6],
             "primary_photons": 2,
-            "max_photons": 3,
+            "max_photons": 2,
             "backend": "SLOS",
             "phase_scales": [math.pi / 2, math.pi],
             "raw_attempt_budgets": [1000, 10000],
@@ -459,5 +459,20 @@ def test_example_configs_validate() -> None:
     synthetic = load_config(root / "configs/pilot.synthetic.yaml")
 
     assert real.config.protocol.provenance.value == "real"
+    assert real.config.resources.max_wall_clock_seconds == 12 * 60 * 60
+    assert real.config.resources.max_memory_gb == 24.0
+    assert real.config.photonics.max_photons == 3
     assert synthetic.config.protocol.provenance.value == "synthetic"
+    assert synthetic.config.photonics.max_photons == 3
+    assert not real.config.photonics.enable_three_photon_profile
+    assert not synthetic.config.photonics.enable_three_photon_profile
     assert synthetic.science_decision_allowed is False
+
+
+def test_optional_three_photon_profile_is_explicitly_disabled() -> None:
+    payload = valid_config()
+    payload["photonics"]["max_photons"] = 3
+    assert not PilotConfig.model_validate(payload).photonics.enable_three_photon_profile
+    payload["photonics"]["enable_three_photon_profile"] = True
+    with pytest.raises(ValidationError, match="3-photon profiling is disabled"):
+        PilotConfig.model_validate(payload)

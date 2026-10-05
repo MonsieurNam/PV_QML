@@ -168,16 +168,14 @@ def validate_model_and_selection_lineage(
     baseline_freeze = _require_sha256(
         baseline_selection.get("selection_freeze_sha256"), "baseline selection freeze"
     )
-    if baseline_freeze != _freeze_sha256(baseline_selection, {"holdout_audit"}):
+    if baseline_freeze != _freeze_sha256(baseline_selection, set()):
         raise ReportContractError("baseline selection freeze checksum is invalid")
-    baseline_holdout = _require_object(
-        baseline_selection.get("holdout_audit"), "baseline holdout audit"
-    )
     if (
-        baseline_holdout.get("opened_after_selection_freeze_sha256") != baseline_freeze
-        or baseline_holdout.get("prediction_passes") != 1
+        baseline_selection.get("holdout_access")
+        != "benchmark_only_after_photonic_freeze"
+        or baseline_selection.get("test_prediction_passes") != 0
     ):
-        raise ReportContractError("baseline holdout evidence is inconsistent")
+        raise ReportContractError("baseline development-only policy is inconsistent")
     if baseline_model_manifest.get("selection_freeze_sha256") != baseline_freeze:
         raise ReportContractError("baseline model selection lineage is inconsistent")
     _require_sha256(baseline_model_manifest.get("models_sha256"), "baseline models")
@@ -786,11 +784,11 @@ def build_report_products(
     baseline_link = _require_object(
         selection_manifest.get("baseline_predictions"), "baseline prediction lineage"
     )
-    baseline_path = "train-baselines/predictions.parquet"
+    baseline_path = "benchmark/baseline_predictions.parquet"
     if (
         baseline_link.get("path") != baseline_path
         or baseline_link.get("sha256") != input_hashes.get(baseline_path)
-        or baseline_link.get("policy") != "immutable_reuse_no_retrain_no_repredict"
+        or baseline_link.get("policy") != "same_authenticated_holdout_after_photonic_freeze"
     ):
         raise ReportContractError("baseline prediction lineage is inconsistent")
     expected_model_keys = {
