@@ -1,0 +1,27 @@
+{
+  "items": [
+    {
+      "filename": "nist_roof.jpg",
+      "slide": "P02",
+      "purpose": "Documentary photograph of the exact NIST Roof PV installation",
+      "search_query": "",
+      "orientation": "",
+      "provider": "manual",
+      "title": "NIST Roof Tilted Array",
+      "author": "National Institute of Standards and Technology",
+      "source_page_url": "https://www.nist.gov/el/beed/heat-transfer-alternative-energy-systems/photovoltaic-testbeds/roof-tilted-array",
+      "download_url": "https://www.nist.gov/sites/default/files/styles/960_x_960_limit/public/images/2016/08/26/roof_installation.jpg.webp?itok=npxG4bgC",
+      "license_name": "NIST public-information reuse statement; no asset-specific copyright notice found on the source page",
+      "license_url": "https://www.nist.gov/copyrights-disclaimers",
+      "license_tier": "manual",
+      "attribution_required": false,
+      "width": 960,
+      "height": 640,
+      "attribution_text": "",
+      "status": "manual",
+      "note": "Official source and reuse statement reviewed 2026-10-20; credit NIST. Direct-source manual acquisition, not an inferred CC license."
+    }
+  ],
+  "generated_at": "2026-10-20T05:36:18.005957Z",
+  "license_verification": "provider metadata used; manual review recommended for external delivery"
+}

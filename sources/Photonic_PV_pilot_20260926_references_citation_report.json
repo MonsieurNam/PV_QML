@@ -1,0 +1,88 @@
+{
+  "total_dois": 8,
+  "verified": [
+    "10.1007/s42484-025-00261-9",
+    "10.1038/s41534-026-01236-9",
+    "10.22331/q-2026-03-16-2030",
+    "10.1038/s41534-026-01251-w",
+    "10.1016/j.solener.2025.114016",
+    "10.1016/j.renene.2026.125960",
+    "10.1016/j.ins.2026.123505",
+    "10.1038/s41566-026-01880-9"
+  ],
+  "failed": [],
+  "metadata": {
+    "10.1007/s42484-025-00261-9": {
+      "title": "Optimal training of finitely sampled quantum reservoir computers for forecasting of chaotic dynamics",
+      "authors": "Ahmed, O., Tennie, F., Magri, L.",
+      "year": "2025",
+      "journal": "Quantum Machine Intelligence",
+      "volume": "7",
+      "pages": "",
+      "doi": "10.1007/s42484-025-00261-9"
+    },
+    "10.1038/s41534-026-01236-9": {
+      "title": "Time-series forecasting with multiphoton quantum states and integrated photonics",
+      "authors": "Di Bartolo, R., Piacentini, S., Ceccarelli, F., et al.",
+      "year": "2026",
+      "journal": "npj Quantum Information",
+      "volume": "12",
+      "pages": "",
+      "doi": "10.1038/s41534-026-01236-9"
+    },
+    "10.22331/q-2026-03-16-2030": {
+      "title": "Mitigating photon loss in linear optical quantum circuits",
+      "authors": "Mills, J., Mezher, R.",
+      "year": "2026",
+      "journal": "Quantum",
+      "volume": "10",
+      "pages": "2030",
+      "doi": "10.22331/q-2026-03-16-2030"
+    },
+    "10.1038/s41534-026-01251-w": {
+      "title": "Large-scale quantum reservoir computing using a Gaussian Boson Sampler",
+      "authors": "Cimini, V., Sohoni, M., Presutti, F., et al.",
+      "year": "2026",
+      "journal": "npj Quantum Information",
+      "volume": "12",
+      "pages": "",
+      "doi": "10.1038/s41534-026-01251-w"
+    },
+    "10.1016/j.solener.2025.114016": {
+      "title": "Photovoltaic power forecasting using quantum machine learning",
+      "authors": "Sagingalieva, A., Komornyik, S., Senokosov, A., et al.",
+      "year": "2025",
+      "journal": "Solar Energy",
+      "volume": "302",
+      "pages": "114016",
+      "doi": "10.1016/j.solener.2025.114016"
+    },
+    "10.1016/j.renene.2026.125960": {
+      "title": "A two-stage hybrid framework for photovoltaic power forecasting using MTF-MTS-Mixer and physics-informed Bayesian neural networks",
+      "authors": "Liu, W., Mo, L., Liu, Z., et al.",
+      "year": "2026",
+      "journal": "Renewable Energy",
+      "volume": "270",
+      "pages": "125960",
+      "doi": "10.1016/j.renene.2026.125960"
+    },
+    "10.1016/j.ins.2026.123505": {
+      "title": "Towards reliable photovoltaic power interval forecasting: A novel cross-channel multi-scale fusion transformer with non-crossing multi-quantile learning",
+      "authors": "Chen, K., Li, Y., Wang, J.",
+      "year": "2026",
+      "journal": "Information Sciences",
+      "volume": "748",
+      "pages": "123505",
+      "doi": "10.1016/j.ins.2026.123505"
+    },
+    "10.1038/s41566-026-01880-9": {
+      "title": "Experimental memory control in continuous-variable optical quantum reservoir computing",
+      "authors": "Paparelle, I., Henaff, J., Garc\u00eda-Beni, J., et al.",
+      "year": "2026",
+      "journal": "Nature Photonics",
+      "volume": "20",
+      "pages": "413-420",
+      "doi": "10.1038/s41566-026-01880-9"
+    }
+  }
+}

@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" font-family="Arial" data-pptx-page-role="cover">
+  <defs><marker id="tip" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M 0 0 L 8 4 L 0 8 Z" fill="#80C7C2"/></marker></defs>
+  <rect id="canvas" data-pptx-role="background" width="1280" height="720" fill="#F7F9FC"/>
+  <rect id="board" data-pptx-role="background" x="20" y="20" width="1240" height="680" fill="#14263D"/>
+  <g id="project-title" data-pptx-bounds="72 68 680 340">
+    <text x="80" y="102" font-size="22" fill="#80C7C2" letter-spacing="2">QUANOVA / RESEARCH BRIEF</text>
+    <text x="80" y="196" font-size="72" font-weight="bold" fill="#F7F9FC">Photonic PV<tspan x="80" dy="82">forecasting</tspan></text>
+    <path d="M 83 302 L 255 299 L 428 304 L 555 301" fill="none" stroke="#80C7C2" stroke-width="4" stroke-linecap="round"/>
+    <text x="80" y="350" font-size="28" fill="#E7EDF4">From an industry-first question<tspan x="80" dy="40">to a testable 15-minute-ahead pilot.</tspan></text>
+  </g>
+  <g id="project-tension" data-pptx-bounds="72 440 675 155">
+    <text x="80" y="494" font-size="38" font-weight="bold" fill="#80C7C2">Data ready.</text>
+    <text x="80" y="547" font-size="38" font-weight="bold" fill="#F7F9FC">Evidence still to earn.</text>
+  </g>
+  <g id="research-path" data-pptx-bounds="784 108 410 465">
+    <text x="985" y="153" font-size="28" fill="#F7F9FC" text-anchor="middle">PV history</text>
+    <line x1="985" y1="180" x2="985" y2="228" stroke="#80C7C2" stroke-width="2.5" marker-end="url(#tip)"/>
+    <path d="M 855 260 L 1110 257 L 1114 369 L 853 372 Z" fill="none" stroke="#80C7C2" stroke-width="2.5"/>
+    <text x="985" y="302" font-size="28" fill="#80C7C2" text-anchor="middle">Photonic</text>
+    <text x="985" y="343" font-size="28" fill="#80C7C2" text-anchor="middle">features</text>
+    <line x1="985" y1="394" x2="985" y2="443" stroke="#80C7C2" stroke-width="2.5" marker-end="url(#tip)"/>
+    <text x="985" y="493" font-size="28" fill="#F7F9FC" text-anchor="middle">Quantile forecasts</text>
+    <text x="985" y="535" font-size="22" fill="#E1BA82" text-anchor="middle">EXACT SIMULATOR STUDY</text>
+  </g>
+  <g id="footer" data-pptx-bounds="72 627 1132 54" data-pptx-role="footer">
+    <text x="80" y="659" font-size="16" fill="#E7EDF4">20 OCT 2026 · Latest execution evidence: 16 Oct · Full benchmark pending · No hardware advantage claim</text>
+    <text x="1195" y="659" font-size="16" fill="#E7EDF4" text-anchor="end">01 / 10</text>
+  </g>
+</svg>

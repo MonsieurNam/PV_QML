@@ -1,0 +1,118 @@
+{
+  "total_dois": 11,
+  "verified": [
+    "10.1103/PhysRevApplied.8.024030",
+    "10.1038/s41534-023-00682-z",
+    "10.1038/s41467-024-51162-7",
+    "10.1007/s42484-025-00261-9",
+    "10.1021/acs.jcim.5c00958",
+    "10.1126/sciadv.ady7987",
+    "10.1038/s41566-026-01880-9",
+    "10.1038/s41534-026-01236-9",
+    "10.1038/s41534-026-01251-w",
+    "10.1038/s41534-026-01229-8",
+    "10.1103/r8ww-qw7j"
+  ],
+  "failed": [],
+  "metadata": {
+    "10.1103/PhysRevApplied.8.024030": {
+      "title": "Harnessing Disordered-Ensemble Quantum Dynamics for Machine Learning",
+      "authors": "Fujii, K., Nakajima, K.",
+      "year": "2017",
+      "journal": "Physical Review Applied",
+      "volume": "8",
+      "pages": "",
+      "doi": "10.1103/PhysRevApplied.8.024030"
+    },
+    "10.1038/s41534-023-00682-z": {
+      "title": "Time-series quantum reservoir computing with weak and projective measurements",
+      "authors": "Mujal, P., Mart\u00ednez-Pe\u00f1a, R., Giorgi, G., et al.",
+      "year": "2023",
+      "journal": "npj Quantum Information",
+      "volume": "9",
+      "pages": "",
+      "doi": "10.1038/s41534-023-00682-z"
+    },
+    "10.1038/s41467-024-51162-7": {
+      "title": "Overcoming the coherence time barrier in quantum machine learning on temporal data",
+      "authors": "Hu, F., Khan, S., Bronn, N., et al.",
+      "year": "2024",
+      "journal": "Nature Communications",
+      "volume": "15",
+      "pages": "",
+      "doi": "10.1038/s41467-024-51162-7"
+    },
+    "10.1007/s42484-025-00261-9": {
+      "title": "Optimal training of finitely sampled quantum reservoir computers for forecasting of chaotic dynamics",
+      "authors": "Ahmed, O., Tennie, F., Magri, L.",
+      "year": "2025",
+      "journal": "Quantum Machine Intelligence",
+      "volume": "7",
+      "pages": "",
+      "doi": "10.1007/s42484-025-00261-9"
+    },
+    "10.1021/acs.jcim.5c00958": {
+      "title": "Robust Quantum Reservoir Learning for Molecular Property Prediction",
+      "authors": "Beaulieu, D., Kornja\u010da, M., Krunic, Z., et al.",
+      "year": "2025",
+      "journal": "Journal of Chemical Information and Modeling",
+      "volume": "65",
+      "pages": "8475-8485",
+      "doi": "10.1021/acs.jcim.5c00958"
+    },
+    "10.1126/sciadv.ady7987": {
+      "title": "Quantum reservoir computing for photonic entanglement witnessing",
+      "authors": "Zia, D., Innocenti, L., Minati, G., et al.",
+      "year": "2025",
+      "journal": "Science Advances",
+      "volume": "11",
+      "pages": "",
+      "doi": "10.1126/sciadv.ady7987"
+    },
+    "10.1038/s41566-026-01880-9": {
+      "title": "Experimental memory control in continuous-variable optical quantum reservoir computing",
+      "authors": "Paparelle, I., Henaff, J., Garc\u00eda-Beni, J., et al.",
+      "year": "2026",
+      "journal": "Nature Photonics",
+      "volume": "20",
+      "pages": "413-420",
+      "doi": "10.1038/s41566-026-01880-9"
+    },
+    "10.1038/s41534-026-01236-9": {
+      "title": "Time-series forecasting with multiphoton quantum states and integrated photonics",
+      "authors": "Di Bartolo, R., Piacentini, S., Ceccarelli, F., et al.",
+      "year": "2026",
+      "journal": "npj Quantum Information",
+      "volume": "12",
+      "pages": "",
+      "doi": "10.1038/s41534-026-01236-9"
+    },
+    "10.1038/s41534-026-01251-w": {
+      "title": "Large-scale quantum reservoir computing using a Gaussian Boson Sampler",
+      "authors": "Cimini, V., Sohoni, M., Presutti, F., et al.",
+      "year": "2026",
+      "journal": "npj Quantum Information",
+      "volume": "12",
+      "pages": "",
+      "doi": "10.1038/s41534-026-01251-w"
+    },
+    "10.1038/s41534-026-01229-8": {
+      "title": "Quantum reservoir computing induced by controllable damping",
+      "authors": "Ricci, E., Monzani, F., Nigro, L., et al.",
+      "year": "2026",
+      "journal": "npj Quantum Information",
+      "volume": "12",
+      "pages": "",
+      "doi": "10.1038/s41534-026-01229-8"
+    },
+    "10.1103/r8ww-qw7j": {
+      "title": "High-Accuracy Temporal Prediction via Experimental Quantum Reservoir Computing in Correlated Spins",
+      "authors": "Hou, Y., Hua, J., Wu, Z., et al.",
+      "year": "2026",
+      "journal": "Physical Review Letters",
+      "volume": "136",
+      "pages": "",
+      "doi": "10.1103/r8ww-qw7j"
+    }
+  }
+}

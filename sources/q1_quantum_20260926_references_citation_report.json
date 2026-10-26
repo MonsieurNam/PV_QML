@@ -1,0 +1,228 @@
+{
+  "total_dois": 22,
+  "verified": [
+    "10.1038/s41586-024-08449-y",
+    "10.1038/s41586-024-08404-x",
+    "10.1038/s41586-024-08406-9",
+    "10.1126/sciadv.adu9991",
+    "10.1038/s41586-025-09224-3",
+    "10.1038/s41467-024-49287-w",
+    "10.1038/s41534-024-00902-0",
+    "10.1038/s41566-025-01682-5",
+    "10.1038/s41534-025-01099-6",
+    "10.1038/s41534-025-01162-2",
+    "10.1038/s41467-026-73693-x",
+    "10.1038/s41587-024-02526-3",
+    "10.1038/s41524-025-01806-z",
+    "10.1038/s41746-025-01597-z",
+    "10.22331/q-2025-10-02-1873",
+    "10.22331/q-2025-03-10-1658",
+    "10.1103/5m7p-kbf3",
+    "10.1088/1367-2630/adad0c",
+    "10.1021/acs.jcim.5c01019",
+    "10.1021/acs.jcim.5c00958",
+    "10.1021/acs.jctc.5c01872",
+    "10.1021/acsmedchemlett.5c00724"
+  ],
+  "failed": [],
+  "metadata": {
+    "10.1038/s41586-024-08449-y": {
+      "title": "Quantum error correction below the surface code threshold",
+      "authors": "Acharya, R., Abanin, D., et al.",
+      "year": "2025",
+      "journal": "Nature",
+      "volume": "638",
+      "pages": "920-926",
+      "doi": "10.1038/s41586-024-08449-y"
+    },
+    "10.1038/s41586-024-08404-x": {
+      "title": "Distributed quantum computing across an optical network link",
+      "authors": "Main, D., Drmota, P., Nadlinger, D., et al.",
+      "year": "2025",
+      "journal": "Nature",
+      "volume": "638",
+      "pages": "383-388",
+      "doi": "10.1038/s41586-024-08404-x"
+    },
+    "10.1038/s41586-024-08406-9": {
+      "title": "Scaling and networking a modular photonic quantum computer",
+      "authors": "Aghaee Rad, H., Ainsworth, T., Alexander, R., et al.",
+      "year": "2025",
+      "journal": "Nature",
+      "volume": "638",
+      "pages": "912-919",
+      "doi": "10.1038/s41586-024-08406-9"
+    },
+    "10.1126/sciadv.adu9991": {
+      "title": "Chemistry beyond the scale of exact diagonalization on a quantum-centric supercomputer",
+      "authors": "Robledo-Moreno, J., Motta, M., Haas, H., et al.",
+      "year": "2025",
+      "journal": "Science Advances",
+      "volume": "11",
+      "pages": "",
+      "doi": "10.1126/sciadv.adu9991"
+    },
+    "10.1038/s41586-025-09224-3": {
+      "title": "Hybrid quantum network for sensing in the acoustic frequency range",
+      "authors": "Novikov, V., Jia, J., Brasil, T., et al.",
+      "year": "2025",
+      "journal": "Nature",
+      "volume": "643",
+      "pages": "955-960",
+      "doi": "10.1038/s41586-025-09224-3"
+    },
+    "10.1038/s41467-024-49287-w": {
+      "title": "Exponential concentration in quantum kernel methods",
+      "authors": "Thanasilp, S., Wang, S., Cerezo, M., et al.",
+      "year": "2024",
+      "journal": "Nature Communications",
+      "volume": "15",
+      "pages": "",
+      "doi": "10.1038/s41467-024-49287-w"
+    },
+    "10.1038/s41534-024-00902-0": {
+      "title": "Trainability barriers and opportunities in quantum generative modeling",
+      "authors": "Rudolph, M., Lerch, S., Thanasilp, S., et al.",
+      "year": "2024",
+      "journal": "npj Quantum Information",
+      "volume": "10",
+      "pages": "",
+      "doi": "10.1038/s41534-024-00902-0"
+    },
+    "10.1038/s41566-025-01682-5": {
+      "title": "Experimental quantum-enhanced kernel-based machine learning on a photonic processor",
+      "authors": "Yin, Z., Agresti, I., de Felice, G., et al.",
+      "year": "2025",
+      "journal": "Nature Photonics",
+      "volume": "19",
+      "pages": "1020-1027",
+      "doi": "10.1038/s41566-025-01682-5"
+    },
+    "10.1038/s41534-025-01099-6": {
+      "title": "Training-efficient density quantum machine learning",
+      "authors": "Coyle, B., Raj, S., Mathur, N., et al.",
+      "year": "2025",
+      "journal": "npj Quantum Information",
+      "volume": "11",
+      "pages": "",
+      "doi": "10.1038/s41534-025-01099-6"
+    },
+    "10.1038/s41534-025-01162-2": {
+      "title": "Exponential quantum advantages in learning quantum observables from classical data",
+      "authors": "Molteni, R., Gyurik, C., Dunjko, V.",
+      "year": "2026",
+      "journal": "npj Quantum Information",
+      "volume": "12",
+      "pages": "",
+      "doi": "10.1038/s41534-025-01162-2"
+    },
+    "10.1038/s41467-026-73693-x": {
+      "title": "Noisy quantum learning theory",
+      "authors": "Cotler, J., Gong, W., Kannan, I.",
+      "year": "2026",
+      "journal": "Nature Communications",
+      "volume": "17",
+      "pages": "",
+      "doi": "10.1038/s41467-026-73693-x"
+    },
+    "10.1038/s41587-024-02526-3": {
+      "title": "Quantum-computing-enhanced algorithm unveils potential KRAS inhibitors",
+      "authors": "Ghazi Vakili, M., Gorgulla, C., Snider, J., et al.",
+      "year": "2025",
+      "journal": "Nature Biotechnology",
+      "volume": "43",
+      "pages": "1954-1959",
+      "doi": "10.1038/s41587-024-02526-3"
+    },
+    "10.1038/s41524-025-01806-z": {
+      "title": "Property-guided inverse design of metal-organic frameworks using quantum natural language processing",
+      "authors": "Kang, S., Kim, J.",
+      "year": "2025",
+      "journal": "npj Computational Materials",
+      "volume": "11",
+      "pages": "",
+      "doi": "10.1038/s41524-025-01806-z"
+    },
+    "10.1038/s41746-025-01597-z": {
+      "title": "A systematic review of quantum machine learning for digital health",
+      "authors": "Gupta, R., Wood, C., Engstrom, T., et al.",
+      "year": "2025",
+      "journal": "npj Digital Medicine",
+      "volume": "8",
+      "pages": "",
+      "doi": "10.1038/s41746-025-01597-z"
+    },
+    "10.22331/q-2025-10-02-1873": {
+      "title": "Backpropagation scaling in parameterised quantum circuits",
+      "authors": "Bowles, J., Wierichs, D., Park, C.",
+      "year": "2025",
+      "journal": "Quantum",
+      "volume": "9",
+      "pages": "1873",
+      "doi": "10.22331/q-2025-10-02-1873"
+    },
+    "10.22331/q-2025-03-10-1658": {
+      "title": "Approximation and Generalization Capacities of Parametrized Quantum Circuits for Functions in Sobolev Spaces",
+      "authors": "Manzano, A., Dechant, D., Tura, J., et al.",
+      "year": "2025",
+      "journal": "Quantum",
+      "volume": "9",
+      "pages": "1658",
+      "doi": "10.22331/q-2025-03-10-1658"
+    },
+    "10.1103/5m7p-kbf3": {
+      "title": "Out-of-Distribution Generalization for Learning Quantum Channels with Low-Energy Coherent States",
+      "authors": "Pereira, J., Zhuang, Q., Banchi, L.",
+      "year": "2025",
+      "journal": "PRX Quantum",
+      "volume": "6",
+      "pages": "",
+      "doi": "10.1103/5m7p-kbf3"
+    },
+    "10.1088/1367-2630/adad0c": {
+      "title": "Symmetry-invariant quantum machine learning force fields",
+      "authors": "Nha Minh Le, I., Kiss, O., Schuhmacher, J., et al.",
+      "year": "2025",
+      "journal": "New Journal of Physics",
+      "volume": "27",
+      "pages": "023015",
+      "doi": "10.1088/1367-2630/adad0c"
+    },
+    "10.1021/acs.jcim.5c01019": {
+      "title": "Quantum-Embedded Graph Neural Network Architecture for Molecular Property Prediction",
+      "authors": "Lu, M., Du, L., Cui, Z., et al.",
+      "year": "2025",
+      "journal": "Journal of Chemical Information and Modeling",
+      "volume": "65",
+      "pages": "8057-8065",
+      "doi": "10.1021/acs.jcim.5c01019"
+    },
+    "10.1021/acs.jcim.5c00958": {
+      "title": "Robust Quantum Reservoir Learning for Molecular Property Prediction",
+      "authors": "Beaulieu, D., Kornja\u010da, M., Krunic, Z., et al.",
+      "year": "2025",
+      "journal": "Journal of Chemical Information and Modeling",
+      "volume": "65",
+      "pages": "8475-8485",
+      "doi": "10.1021/acs.jcim.5c00958"
+    },
+    "10.1021/acs.jctc.5c01872": {
+      "title": "A Hardware-Feasible Quantum Machine Learning Framework for Structure-Based Virtual Screening",
+      "authors": "Yang, P.",
+      "year": "2026",
+      "journal": "Journal of Chemical Theory and Computation",
+      "volume": "22",
+      "pages": "1727-1735",
+      "doi": "10.1021/acs.jctc.5c01872"
+    },
+    "10.1021/acsmedchemlett.5c00724": {
+      "title": "Benchmarking\nClassical and Quantum Machine Learning\nfor Potency Prediction across Ten Therapeutically Relevant Targets",
+      "authors": "Garg, S., Garg, S.",
+      "year": "2026",
+      "journal": "ACS Medicinal Chemistry\nLetters",
+      "volume": "17",
+      "pages": "1736-1743",
+      "doi": "10.1021/acsmedchemlett.5c00724"
+    }
+  }
+}

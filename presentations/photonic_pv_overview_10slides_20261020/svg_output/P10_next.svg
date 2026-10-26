@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" font-family="Arial" data-pptx-page-role="ending">
+  <defs><marker id="tip" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M 0 0 L 8 4 L 0 8 Z" fill="#80C7C2"/></marker></defs>
+  <rect id="canvas" data-pptx-role="background" width="1280" height="720" fill="#F7F9FC"/><rect id="board" data-pptx-role="background" x="20" y="20" width="1240" height="680" fill="#14263D"/>
+  <g id="heading" data-pptx-bounds="72 62 1125 118"><text x="80" y="94" font-size="22" fill="#80C7C2">09 / THE NEXT DECISION</text><text x="80" y="155" font-size="50" font-weight="bold" fill="#F7F9FC">Earn the next stage with evidence</text></g>
+  <g id="next-experiment" data-pptx-bounds="75 219 1125 153">
+    <text x="85" y="270" font-size="38" font-weight="bold" fill="#80C7C2">1</text><text x="85" y="315" font-size="28" fill="#F7F9FC">Verify capacity</text>
+    <line x1="310" y1="289" x2="389" y2="289" stroke="#80C7C2" stroke-width="2.5" marker-end="url(#tip)"/>
+    <text x="443" y="270" font-size="38" font-weight="bold" fill="#80C7C2">2</text><text x="443" y="315" font-size="28" fill="#F7F9FC">Run frozen models</text><text x="443" y="353" font-size="22" fill="#E7EDF4">baselines + photonic controls</text>
+    <line x1="780" y1="289" x2="859" y2="289" stroke="#80C7C2" stroke-width="2.5" marker-end="url(#tip)"/>
+    <text x="905" y="270" font-size="38" font-weight="bold" fill="#E1BA82">3</text><text x="905" y="315" font-size="28" fill="#F7F9FC">Evaluate 2017</text><text x="905" y="353" font-size="22" fill="#E7EDF4">after selection is locked</text>
+  </g>
+  <g id="decision-rule" data-pptx-bounds="75 390 1125 97"><text x="85" y="430" font-size="28" fill="#E1BA82">GO / EXTEND / STOP</text><text x="483" y="430" font-size="28" fill="#E7EDF4">WIS · calibration · resources</text><text x="85" y="476" font-size="22" fill="#E7EDF4">Only then: finite shots and loss → hardware validation if justified.</text></g>
+  <g id="closing-takeaway" data-pptx-bounds="75 512 1125 108"><text x="85" y="555" font-size="38" font-weight="bold" fill="#F7F9FC">Test whether the quantum component</text><text x="85" y="605" font-size="38" font-weight="bold" fill="#80C7C2">earns its place.</text><path d="M 86 620 L 225 618 L 350 623" fill="none" stroke="#80C7C2" stroke-width="3" stroke-linecap="round"/></g>
+  <g id="footer" data-pptx-role="footer" data-pptx-bounds="72 641 1132 36"><text x="80" y="665" font-size="16" fill="#E7EDF4">Photonic PV Pilot · Research plan and next action, not a promise of quantum advantage</text><text x="1195" y="665" font-size="16" fill="#E7EDF4" text-anchor="end">10 / 10</text></g>
+</svg>

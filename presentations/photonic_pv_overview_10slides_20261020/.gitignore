@@ -1,0 +1,12 @@
+# Rebuildable previews, local sessions and duplicate exports.
+/.preview/
+/.review/
+/backup/
+/confirm_ui/
+/live_preview/
+/svg_final/
+/images/.review/
+/images/candidates/
+/exports/contact_sheet_*.jpg
+/exports/photonic_pv_overview_10slides_*.pptx
+/validation/workflow.log

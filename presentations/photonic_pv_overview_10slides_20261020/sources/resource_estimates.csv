@@ -1,0 +1,5 @@
+stage,estimated_hours,estimated_peak_gib,evidence_type
+train-baselines,71.81,11.92,profiling extrapolation
+build-photonic-features,7.01,14.38,profiling extrapolation
+benchmark,111.10,33.37,profiling extrapolation
+report,4.97,10.29,profiling extrapolation

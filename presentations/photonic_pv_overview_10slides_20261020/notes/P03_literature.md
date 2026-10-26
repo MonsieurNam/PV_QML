@@ -1,0 +1,5 @@
+Khảo sát literature dẫn đến ba thay đổi thiết kế. Thứ nhất, công trình Better than classical của Bowles và cộng sự nhấn mạnh việc dùng baseline cổ điển mạnh và đối chứng công bằng. Nếu chỉ so với một mô hình yếu thì kết quả tốt hơn chưa đủ nói lên vai trò của lượng tử.
+
+Thứ hai, các nghiên cứu photonic kernel năm hai nghìn không trăm hai mươi lăm và forecasting nhiều photon của Di Bartolo năm hai nghìn không trăm hai mươi sáu cho thấy cần tách đóng góp của giao thoa khỏi nguồn bộ nhớ. Bởi vậy thiết kế hiện tại phải có đối chứng photon phân biệt được và ghi rõ bộ nhớ nằm trong cửa sổ cổ điển.
+
+Thứ ba, Ahmed đã nghiên cứu finite sampling, còn Mills và Mezher đã nghiên cứu giảm ảnh hưởng mất photon. Những hướng này có tiền lệ, nên không thể coi quét shots hoặc thêm loss là novelty tự thân. Sagingalieva và cộng sự cũng đã công bố QML cho dự báo PV. Damping, topology và weak measurement đều đã có nghiên cứu trước. Các khảo sát ở đây có mục tiêu, không phải systematic review toàn ngành; danh mục đầy đủ được lưu trong sources/Photonic_PV_pilot_20260926_references.md của repository.

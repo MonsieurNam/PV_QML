@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" font-family="Arial" data-pptx-page-role="content">
+  <rect id="canvas" data-pptx-role="background" width="1280" height="720" fill="#F7F9FC"/><rect id="board" data-pptx-role="background" x="20" y="20" width="1240" height="680" fill="#14263D"/>
+  <g id="heading" data-pptx-bounds="72 62 1125 118"><text x="80" y="94" font-size="22" fill="#80C7C2">07 / MEASURED EVIDENCE</text><text x="80" y="155" font-size="50" font-weight="bold" fill="#F7F9FC">Data readiness passed its audit</text></g>
+  <g id="coverage-chart" data-pptx-bounds="75 187 817 417" data-pptx-replace-with="chart">
+    <metadata type="application/json">{"name":"coverage-chart","x":80,"y":190,"width":810,"height":415,"type":"column","categories":["Train 2015","Validation 2016","Test 2017"],"series":[{"name":"Canonical daylight","values":[98.87100107076437,97.32668441378276,97.57632691404415]},{"name":"Eligible samples","values":[96.56603986249132,89.02365865546849,82.3034288398309]}],"plot_area":{"x":160,"y":250,"width":690,"height":300},"style":{"colors":["#E7EDF4","#80C7C2"]}}</metadata>
+    <rect x="161" y="199" width="20" height="20" fill="#E7EDF4"/><text x="192" y="217" font-size="22" fill="#E7EDF4">Canonical daylight</text><rect x="483" y="199" width="20" height="20" fill="#80C7C2"/><text x="514" y="217" font-size="22" fill="#80C7C2">Eligible samples</text>
+    <g id="coverage-chart-chartArea">
+      <line x1="160" y1="550" x2="850" y2="550" stroke="#E7EDF4" stroke-width="1.5"/><line x1="160" y1="400" x2="850" y2="400" stroke="#E7EDF4" stroke-width="1" stroke-opacity="0.25"/><line x1="160" y1="250" x2="850" y2="250" stroke="#E7EDF4" stroke-width="1" stroke-opacity="0.25"/>
+      <!-- chart-plot-area: object=coverage-chart | 160,250,850,550 -->
+      <rect x="201" y="253.387" width="48" height="296.613" fill="#E7EDF4"/><rect x="267" y="260.302" width="48" height="289.698" fill="#80C7C2"/>
+      <rect x="431" y="258.020" width="48" height="291.980" fill="#E7EDF4"/><rect x="497" y="282.929" width="48" height="267.071" fill="#80C7C2"/>
+      <rect x="661" y="257.271" width="48" height="292.729" fill="#E7EDF4"/><rect x="727" y="303.090" width="48" height="246.910" fill="#80C7C2"/>
+    </g>
+    <text x="139" y="559" font-size="22" fill="#E7EDF4" text-anchor="end">0%</text><text x="139" y="409" font-size="22" fill="#E7EDF4" text-anchor="end">50%</text><text x="139" y="259" font-size="22" fill="#E7EDF4" text-anchor="end">100%</text>
+    <text x="225" y="242" font-size="22" fill="#E7EDF4" text-anchor="middle">98.9</text><text x="291" y="249" font-size="22" fill="#80C7C2" text-anchor="middle">96.6</text><text x="455" y="247" font-size="22" fill="#E7EDF4" text-anchor="middle">97.3</text><text x="521" y="272" font-size="22" fill="#80C7C2" text-anchor="middle">89.0</text><text x="685" y="246" font-size="22" fill="#E7EDF4" text-anchor="middle">97.6</text><text x="751" y="292" font-size="22" fill="#80C7C2" text-anchor="middle">82.3</text>
+    <text x="258" y="589" font-size="22" fill="#F7F9FC" text-anchor="middle">Train / 2015</text><text x="488" y="589" font-size="22" fill="#F7F9FC" text-anchor="middle">Validation / 2016</text><text x="718" y="589" font-size="22" fill="#F7F9FC" text-anchor="middle">Test / 2017</text>
+  </g>
+  <g id="test-support" data-pptx-bounds="928 207 273 388">
+    <text x="945" y="242" font-size="22" fill="#E1BA82">2017 TEST SUPPORT</text><text x="945" y="319" font-size="58" font-weight="bold" fill="#F7F9FC">157</text><text x="945" y="359" font-size="28" fill="#E7EDF4">usable days</text><text x="945" y="444" font-size="58" font-weight="bold" fill="#F7F9FC">35</text><text x="945" y="484" font-size="28" fill="#E7EDF4">usable weeks</text><text x="945" y="523" font-size="22" fill="#E7EDF4">non-overlapping</text><text x="945" y="577" font-size="28" font-weight="bold" fill="#80C7C2">AUDIT: PASS</text>
+  </g>
+  <g id="audit-interpretation" data-pptx-bounds="75 606 1125 38"><text x="85" y="631" font-size="22" fill="#E1BA82">Gates: canonical ≥90%; eligible ≥80%. This is data availability, not forecast quality.</text></g>
+  <g id="footer" data-pptx-role="footer" data-pptx-bounds="72 648 1132 30"><text x="80" y="669" font-size="16" fill="#E7EDF4">Source: authenticated NIST availability audit, 16 Oct 2026 · Day/week definitions and limits in notes</text><text x="1195" y="669" font-size="16" fill="#E7EDF4" text-anchor="end">08 / 10</text></g>
+</svg>

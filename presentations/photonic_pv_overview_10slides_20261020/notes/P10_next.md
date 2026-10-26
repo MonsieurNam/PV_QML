@@ -1,0 +1,3 @@
+Bước tiếp theo gồm xác minh capacity, chạy các mô hình và đối chứng đã khóa, rồi đánh giá năm hai nghìn không trăm mười bảy sau khi model selection hoàn tất. Sau đó mới ra quyết định GO, EXTEND hoặc STOP dựa đồng thời trên WIS, calibration và tài nguyên.
+
+Nếu bằng chứng đủ rõ và phù hợp ngân sách, giai đoạn sau mới kiểm tra finite shots và photon loss, rồi cân nhắc xác minh phần cứng. Nếu chỉ tốt hơn photon phân biệt nhưng không cạnh tranh với baseline mạnh thì chưa đủ lập luận cho ứng dụng. Nếu đặc trưng cổ điển giải thích được lợi ích với chi phí thấp hơn thì cần ghi nhận điều đó. Kết luận mong muốn của pilot là một câu trả lời đáng tin, dù dương, âm hay chưa phân định được. Thành phần lượng tử cần chứng minh rằng nó xứng đáng có mặt trong pipeline.

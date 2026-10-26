@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" font-family="Arial" data-pptx-page-role="content">
+  <rect id="canvas" data-pptx-role="background" width="1280" height="720" fill="#F7F9FC"/><rect id="board" data-pptx-role="background" x="20" y="20" width="1240" height="680" fill="#14263D"/>
+  <g id="heading" data-pptx-bounds="72 62 1125 118"><text x="80" y="94" font-size="22" fill="#80C7C2">06 / THE DATA CONTRACT</text><text x="80" y="155" font-size="50" font-weight="bold" fill="#F7F9FC">One site, three chronological years</text></g>
+  <g id="dataset-identity" data-pptx-bounds="75 177 1125 82"><text x="85" y="204" font-size="22" fill="#E7EDF4">NIST Roof · 75 kW AC metadata · Power + irradiance + temperature · 1-min source → 5-min means</text>
+    <text x="85" y="246" font-size="22" font-weight="bold" fill="#80C7C2">2015 TRAIN · 51,405</text><text x="470" y="246" font-size="22" font-weight="bold" fill="#80C7C2">2016 VALIDATION · 47,487</text><text x="912" y="246" font-size="22" font-weight="bold" fill="#E1BA82">2017 TEST · 43,806</text>
+  </g>
+  <g id="observed-data-example" data-pptx-bounds="75 260 1128 382"><image href="../images/nist_train_example.png" x="80" y="266" width="1120" height="337.809" preserveAspectRatio="xMidYMid meet"/><text x="85" y="631" font-size="22" fill="#E1BA82">Observed train example, not a forecast · Target mean (12:10,12:15]: 51.71 kW</text></g>
+  <g id="footer" data-pptx-role="footer" data-pptx-bounds="72 648 1132 30"><text x="80" y="669" font-size="16" fill="#E7EDF4">NIST canonical training data · No interpolation · Zero delay is an offline assumption · Fixed EST → UTC</text><text x="1195" y="669" font-size="16" fill="#E7EDF4" text-anchor="end">07 / 10</text></g>
+</svg>

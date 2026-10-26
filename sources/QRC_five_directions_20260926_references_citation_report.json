@@ -1,0 +1,148 @@
+{
+  "total_dois": 14,
+  "verified": [
+    "10.1038/s41598-023-35461-5",
+    "10.1038/s41534-026-01229-8",
+    "10.1038/s41534-026-01257-4",
+    "10.1103/gq9r-d5q8",
+    "10.1038/s41534-023-00682-z",
+    "10.1103/j7f9-hfsj",
+    "10.1103/PRXQuantum.5.040325",
+    "10.1103/PhysRevLett.127.260401",
+    "10.1103/PhysRevResearch.6.013211",
+    "10.1038/s41567-020-0932-7",
+    "10.1038/s41467-025-57349-w",
+    "10.1126/sciadv.ady7987",
+    "10.1007/s42484-025-00261-9",
+    "10.1103/PhysRevE.107.035306"
+  ],
+  "failed": [],
+  "metadata": {
+    "10.1038/s41598-023-35461-5": {
+      "title": "Taking advantage of noise in quantum reservoir computing",
+      "authors": "Domingo, L., Carlo, G., Borondo, F.",
+      "year": "2023",
+      "journal": "Scientific Reports",
+      "volume": "13",
+      "pages": "",
+      "doi": "10.1038/s41598-023-35461-5"
+    },
+    "10.1038/s41534-026-01229-8": {
+      "title": "Quantum reservoir computing induced by controllable damping",
+      "authors": "Ricci, E., Monzani, F., Nigro, L., et al.",
+      "year": "2026",
+      "journal": "npj Quantum Information",
+      "volume": "12",
+      "pages": "",
+      "doi": "10.1038/s41534-026-01229-8"
+    },
+    "10.1038/s41534-026-01257-4": {
+      "title": "Non-Markovianity and memory enhancement in quantum reservoir computing",
+      "authors": "Sannia, A., Rodr\u00edguez, R., Giorgi, G., et al.",
+      "year": "2026",
+      "journal": "npj Quantum Information",
+      "volume": "12",
+      "pages": "",
+      "doi": "10.1038/s41534-026-01257-4"
+    },
+    "10.1103/gq9r-d5q8": {
+      "title": "Quantum reservoir computing on random regular graphs",
+      "authors": "Ivaki, M., Lazarides, A., Ala-Nissila, T.",
+      "year": "2025",
+      "journal": "Physical Review A",
+      "volume": "112",
+      "pages": "",
+      "doi": "10.1103/gq9r-d5q8"
+    },
+    "10.1038/s41534-023-00682-z": {
+      "title": "Time-series quantum reservoir computing with weak and projective measurements",
+      "authors": "Mujal, P., Mart\u00ednez-Pe\u00f1a, R., Giorgi, G., et al.",
+      "year": "2023",
+      "journal": "npj Quantum Information",
+      "volume": "9",
+      "pages": "",
+      "doi": "10.1038/s41534-023-00682-z"
+    },
+    "10.1103/j7f9-hfsj": {
+      "title": "Harnessing Quantum Backaction for Time-Series Processing",
+      "authors": "Franceschetto, G., P\u0142odzie\u0144, M., Lewenstein, M., et al.",
+      "year": "2026",
+      "journal": "Physical Review X",
+      "volume": "16",
+      "pages": "",
+      "doi": "10.1103/j7f9-hfsj"
+    },
+    "10.1103/PRXQuantum.5.040325": {
+      "title": "Feedback-Driven Quantum Reservoir Computing for Time-Series Analysis",
+      "authors": "Kobayashi, K., Fujii, K., Yamamoto, N.",
+      "year": "2024",
+      "journal": "PRX Quantum",
+      "volume": "5",
+      "pages": "",
+      "doi": "10.1103/PRXQuantum.5.040325"
+    },
+    "10.1103/PhysRevLett.127.260401": {
+      "title": "Learning Temporal Quantum Tomography",
+      "authors": "Tran, Q., Nakajima, K.",
+      "year": "2021",
+      "journal": "Physical Review Letters",
+      "volume": "127",
+      "pages": "",
+      "doi": "10.1103/PhysRevLett.127.260401"
+    },
+    "10.1103/PhysRevResearch.6.013211": {
+      "title": "Estimating many properties of a quantum state via quantum reservoir processing",
+      "authors": "Li, Y., Ghosh, S., Shang, J., et al.",
+      "year": "2024",
+      "journal": "Physical Review Research",
+      "volume": "6",
+      "pages": "",
+      "doi": "10.1103/PhysRevResearch.6.013211"
+    },
+    "10.1038/s41567-020-0932-7": {
+      "title": "Predicting many properties of a quantum system from very few measurements",
+      "authors": "Huang, H., Kueng, R., Preskill, J.",
+      "year": "2020",
+      "journal": "Nature Physics",
+      "volume": "16",
+      "pages": "1050-1057",
+      "doi": "10.1038/s41567-020-0932-7"
+    },
+    "10.1038/s41467-025-57349-w": {
+      "title": "Demonstration of robust and efficient quantum property learning with shallow shadows",
+      "authors": "Hu, H., Gu, A., Majumder, S., et al.",
+      "year": "2025",
+      "journal": "Nature Communications",
+      "volume": "16",
+      "pages": "",
+      "doi": "10.1038/s41467-025-57349-w"
+    },
+    "10.1126/sciadv.ady7987": {
+      "title": "Quantum reservoir computing for photonic entanglement witnessing",
+      "authors": "Zia, D., Innocenti, L., Minati, G., et al.",
+      "year": "2025",
+      "journal": "Science Advances",
+      "volume": "11",
+      "pages": "",
+      "doi": "10.1126/sciadv.ady7987"
+    },
+    "10.1007/s42484-025-00261-9": {
+      "title": "Optimal training of finitely sampled quantum reservoir computers for forecasting of chaotic dynamics",
+      "authors": "Ahmed, O., Tennie, F., Magri, L.",
+      "year": "2025",
+      "journal": "Quantum Machine Intelligence",
+      "volume": "7",
+      "pages": "",
+      "doi": "10.1007/s42484-025-00261-9"
+    },
+    "10.1103/PhysRevE.107.035306": {
+      "title": "Quantum reservoir computing in finite dimensions",
+      "authors": "Mart\u00ednez-Pe\u00f1a, R., Ortega, J.",
+      "year": "2023",
+      "journal": "Physical Review E",
+      "volume": "107",
+      "pages": "",
+      "doi": "10.1103/PhysRevE.107.035306"
+    }
+  }
+}

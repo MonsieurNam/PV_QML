@@ -1,0 +1,14 @@
+{
+  "source": "D:\\RESEARCH\\Quantum_idea\\Hardware_QML_research\\artifacts\\nist\\pilot-amendment-1-2-approved\\20261016T105219Z-8ef9d07c\\validate-data\\canonical.parquet",
+  "source_sha256": "9cf3b6f585a467303bbe7e69e85de154c5640dffb8466f4e7815588327c7fcdb",
+  "csv_sha256": "709a68a76e429aac6849545f3208f1972fed2722fd192e0d6d898d8a7701b06e",
+  "selection": "Fixed calendar window 2015-06-01 11:00–13:00 fixed EST, chosen before viewing its trace; no performance-based selection.",
+  "split": "train",
+  "observed_bins": 25,
+  "interval_minutes": 5,
+  "target_kw": 51.71,
+  "issue_utc": "2015-06-01T17:00:00Z",
+  "target_interval_fixed_est": "2015-06-01 (12:10,12:15] UTC-05:00",
+  "model_predictions_used": false,
+  "holdout_loaded": false
+}

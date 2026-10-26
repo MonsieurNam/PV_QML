@@ -1,7 +1,19 @@
-# Photonic PV Pilot
+# PV_QML — Photonic PV Pilot
 
 This repository is a reproducible Python 3.12 pilot for studying photonic quantum
 machine-learning methods on photovoltaic data.
+
+## Research briefing
+
+The [10-slide research briefing](presentations/photonic_pv_overview_10slides_20261020/README.md)
+contains the editable PowerPoint, SVG sources, measured NIST training-data example,
+references, Vietnamese speaker notes and a detailed presentation script.
+The [architecture and metric explanation](presentations/photonic_pv_overview_10slides_20261020/notes/architecture_and_metrics_explained_vi.md)
+clarifies the fixed Fock input, data-dependent phase encoding, linear quantile heads,
+WIS calculation and canonical versus eligible data.
+
+Scientific execution status in that briefing is grounded in the 16 October 2026
+evidence snapshot; its architecture and evaluation criteria are not model results.
 
 ## Development setup
 

@@ -1,0 +1,21 @@
+{
+  "page": "P08",
+  "object": "coverage-chart",
+  "mode": "decomposable-calc",
+  "axis_range": [
+    0,
+    100
+  ],
+  "plot_area": [
+    160,
+    250,
+    850,
+    550
+  ],
+  "verified_bars": 6,
+  "maximum_error_px": 0.0002865194927039738,
+  "encoding": "height=3*percentage; y=550-height; categorical centers 258,488,718; series offsets -33,+33; bar width 48",
+  "calculator_result": "Both series matched y and height; categorical x positions independently checked (calculator uses its own automatic x packing).",
+  "source": "sources/audit_coverage.csv",
+  "status": "PASS"
+}

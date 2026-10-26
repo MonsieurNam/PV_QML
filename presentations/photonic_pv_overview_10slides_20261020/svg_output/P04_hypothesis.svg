@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" font-family="Arial" data-pptx-page-role="content">
+  <rect id="canvas" data-pptx-role="background" width="1280" height="720" fill="#F7F9FC"/><rect id="board" data-pptx-role="background" x="20" y="20" width="1240" height="680" fill="#14263D"/>
+  <g id="heading" data-pptx-bounds="72 62 1125 118"><text x="80" y="94" font-size="22" fill="#80C7C2">03 / THE SELECTED HYPOTHESIS</text><text x="80" y="155" font-size="50" font-weight="bold" fill="#F7F9FC">Why PV is a useful first test</text></g>
+  <g id="selection-reasons" data-pptx-bounds="75 206 1125 76">
+    <text x="85" y="246" font-size="28" fill="#80C7C2">Measured public data</text><text x="490" y="246" font-size="28" fill="#80C7C2">Clear target</text><text x="840" y="246" font-size="28" fill="#80C7C2">Strong baselines</text>
+    <path d="M 88 266 L 308 269 L 390 266 M 492 268 L 648 265 M 840 266 L 1057 270" fill="none" stroke="#80C7C2" stroke-width="2"/>
+  </g>
+  <g id="research-question" data-pptx-bounds="100 303 1080 210">
+    <text x="640" y="349" font-size="38" font-weight="bold" fill="#F7F9FC" text-anchor="middle">Do indistinguishable-photon features</text>
+    <text x="640" y="406" font-size="38" font-weight="bold" fill="#F7F9FC" text-anchor="middle">improve forecasts beyond classical</text>
+    <text x="640" y="463" font-size="38" font-weight="bold" fill="#E1BA82" text-anchor="middle">and distinguishable-photon controls?</text>
+    <path d="M 235 485 C 476 475 833 480 1080 485" fill="none" stroke="#E1BA82" stroke-width="3" stroke-linecap="round"/>
+  </g>
+  <g id="scope" data-pptx-bounds="75 540 1125 78"><text x="85" y="573" font-size="28" fill="#80C7C2">NOW: exact simulation · 2 photons · 4 modes</text><text x="85" y="611" font-size="22" fill="#E7EDF4">LATER: finite shots · photon loss · site shift · hardware validation</text></g>
+  <g id="footer" data-pptx-role="footer" data-pptx-bounds="72 635 1132 42"><text x="80" y="659" font-size="16" fill="#E7EDF4">Source: Photonic PV pilot review and approved NIST configuration · Hypothesis, not a demonstrated benefit</text><text x="1195" y="659" font-size="16" fill="#E7EDF4" text-anchor="end">04 / 10</text></g>
+</svg>

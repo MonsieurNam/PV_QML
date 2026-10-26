@@ -1,0 +1,30 @@
+{
+  "status": "PASS",
+  "verified_at_utc": "2026-10-23T02:47:34.520129+00:00",
+  "delivery": "D:\\RESEARCH\\Quantum_idea\\Hardware_QML_research\\presentations\\photonic_pv_overview_10slides_20261020\\exports\\Photonic_PV_Project_Overview_10slides.pptx",
+  "source_export": "D:\\RESEARCH\\Quantum_idea\\Hardware_QML_research\\presentations\\photonic_pv_overview_10slides_20261020\\exports\\photonic_pv_overview_10slides_20261023_094647.pptx",
+  "sha256": "ec761b09d6da099dae55828863cdff92a376ced03a05fbd57d98999a72041916",
+  "slides": 10,
+  "nonempty_notes": 10,
+  "pictures": 2,
+  "native_shapes": 213,
+  "architecture_native_shapes": 40,
+  "changed_slides": [
+    5,
+    6
+  ],
+  "unchanged_slide_xml_verified": [
+    1,
+    2,
+    3,
+    4,
+    7,
+    8,
+    9,
+    10
+  ],
+  "architecture_content_checked": true,
+  "metrics_content_checked": true,
+  "visual_review": "P05 and P06 rendered and inspected; no visible clipping or overlaps",
+  "scientific_scope": "Architecture and registered evaluation criteria; no model results added"
+}
